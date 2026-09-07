@@ -1,0 +1,20 @@
+[project]
+name = "studypilot-backend"
+version = "0.1.0"
+description = "Local AI study assistant - WorkBuddy-style architecture (modes/skills/experts/connectors/project spaces)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "pymupdf>=1.24",
+    "sentence-transformers>=3.0",
+    "numpy>=1.26",
+    "python-multipart>=0.0.9",
+    "pywebview>=5.1",
+]
+
+[tool.uv]
+package = false
