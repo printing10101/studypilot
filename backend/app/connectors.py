@@ -8,7 +8,7 @@ import os
 
 import httpx
 
-from . import db, rag
+from . import db, ingest, rag
 from .config import settings
 
 # ---------- local_folder 连接器 ----------
@@ -19,7 +19,7 @@ def import_local_folder(space_id: str, folder: str) -> list[dict]:
     results = []
     for root, _dirs, files in os.walk(folder):
         for fn in files:
-            if not fn.lower().endswith((".pdf", ".txt", ".md", ".markdown")):
+            if not fn.lower().endswith(ingest.DOC_EXTS + ingest.IMAGE_EXTS):
                 continue
             path = os.path.join(root, fn)
             did = db.add_document(space_id, fn, path)
@@ -36,8 +36,8 @@ def import_local_folder(space_id: str, folder: str) -> list[dict]:
 class McpClient:
     """最小 MCP 客户端（stdio 传输），用于挂载外部工具 server。
 
-    通过 `studypilot mcp add <name> -- <command>` 方式配置后，
-    list_tools / call_tool 可调用外部 MCP server 暴露的工具。
+    通过 `POST /api/connectors/mcp` 注册后，list_tools / call_tool 可调用
+    外部 MCP server 暴露的工具；答疑专家会在需要时调用（注册持久化到 meta 表）。
     """
 
     def __init__(self, name: str, command: list[str]):
@@ -45,6 +45,7 @@ class McpClient:
         self.command = command
         self._proc = None
         self._req_id = 0
+        self._inited = False
 
     def start(self):
         import subprocess
@@ -53,13 +54,17 @@ class McpClient:
                 self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 text=True, encoding="utf-8", shell=False)
 
+    def _send(self, payload: dict) -> None:
+        assert self._proc and self._proc.stdin
+        self._proc.stdin.write(json.dumps(payload) + "\n")
+        self._proc.stdin.flush()
+
     def _rpc(self, method: str, params: dict | None = None) -> dict:
         self.start()
-        assert self._proc and self._proc.stdin and self._proc.stdout
+        assert self._proc and self._proc.stdout
         self._req_id += 1
         req = {"jsonrpc": "2.0", "id": self._req_id, "method": method, "params": params or {}}
-        self._proc.stdin.write(json.dumps(req) + "\n")
-        self._proc.stdin.flush()
+        self._send(req)
         while True:
             line = self._proc.stdout.readline()
             if not line:
@@ -77,20 +82,77 @@ class McpClient:
             "clientInfo": {"name": "studypilot", "version": "0.1.0"},
         })
 
+    def ensure_init(self) -> None:
+        if not self._inited:
+            self.initialize()
+            # initialized 通知无 id、无响应，直接发送即可
+            self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            self._inited = True
+
     def list_tools(self) -> list:
-        result = self._rpc("tools/list")
-        return result.get("tools", [])
+        self.ensure_init()
+        return self._rpc("tools/list").get("tools", [])
 
     def call_tool(self, tool: str, arguments: dict) -> dict:
+        self.ensure_init()
         return self._rpc("tools/call", {"name": tool, "arguments": arguments})
 
 
-# 已注册的 MCP server（name -> command），可由 API 注册
+# 已注册的 MCP server（name -> command），注册持久化在 meta 表，重启后自动恢复
 _mcp_servers: dict[str, McpClient] = {}
+_MCP_META_KEY = "mcp_servers"
+
+
+def load_persisted() -> None:
+    try:
+        reg = json.loads(db.get_meta(_MCP_META_KEY) or "{}")
+    except ValueError:
+        reg = {}
+    for name, command in reg.items():
+        if name not in _mcp_servers and isinstance(command, list):
+            _mcp_servers[name] = McpClient(name, command)
 
 
 def register_mcp(name: str, command: list[str]) -> None:
     _mcp_servers[name] = McpClient(name, command)
+    db.set_meta(_MCP_META_KEY, json.dumps(
+        {n: c.command for n, c in _mcp_servers.items()}, ensure_ascii=False))
+
+
+def remove_mcp(name: str) -> bool:
+    if name not in _mcp_servers:
+        return False
+    client = _mcp_servers.pop(name)
+    try:
+        if client._proc:
+            client._proc.terminate()
+    except Exception:
+        pass
+    db.set_meta(_MCP_META_KEY, json.dumps(
+        {n: c.command for n, c in _mcp_servers.items()}, ensure_ascii=False))
+    return True
+
+
+def all_tools() -> list[dict]:
+    """汇总所有已注册 server 的工具清单：[{server, name, description}]，单个失败不影响整体。"""
+    tools = []
+    for client in _mcp_servers.values():
+        try:
+            for t in client.list_tools():
+                tools.append({"server": client.name, "name": t.get("name", ""),
+                              "description": (t.get("description") or "")[:200]})
+        except Exception:
+            continue
+    return tools
+
+
+def call_mcp_tool(server: str, tool: str, arguments: dict) -> str:
+    client = _mcp_servers.get(server)
+    if not client:
+        raise ValueError(f"MCP server {server} 未注册")
+    result = client.call_tool(tool, arguments)
+    texts = [c.get("text", "") for c in result.get("content", []) if isinstance(c, dict)]
+    return "\n".join(t for t in texts if t) or str(result)[:1000]
 
 
 def list_connectors() -> dict:

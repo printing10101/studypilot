@@ -53,6 +53,6 @@ if __name__ == "__main__":
         width=1400,
         height=880,
         min_size=(1080, 700),
-        background_color="#070b14",
+        background_color="#0f1322",
     )
     webview.start(gui="edgechromium")

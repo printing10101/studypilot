@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from typing import Any
@@ -66,18 +67,172 @@ CREATE TABLE IF NOT EXISTS vectors(
 );
 CREATE INDEX IF NOT EXISTS idx_vec_space ON vectors(space_id);
 CREATE INDEX IF NOT EXISTS idx_msg_space ON messages(space_id);
+CREATE TABLE IF NOT EXISTS books(
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  author TEXT DEFAULT '',
+  subject TEXT DEFAULT '',
+  publisher TEXT DEFAULT '',
+  license TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  pdf_url TEXT DEFAULT '',         -- 官方直链（可自动获取）
+  source_url TEXT DEFAULT '',      -- 官方页面外链
+  status TEXT DEFAULT 'catalog',   -- catalog 仅书目 / external 官方可获取 / local 已有文件
+  path TEXT DEFAULT '',
+  error TEXT DEFAULT '',
+  created_at REAL
+);
+CREATE TABLE IF NOT EXISTS book_documents(
+  book_id TEXT NOT NULL,
+  space_id TEXT NOT NULL,
+  document_id TEXT NOT NULL,
+  created_at REAL,
+  PRIMARY KEY(book_id, space_id)
+);
+CREATE TABLE IF NOT EXISTS feedback(
+  id TEXT PRIMARY KEY,
+  space_id TEXT NOT NULL,
+  message_id TEXT DEFAULT '',      -- 关联的助手消息
+  rating TEXT DEFAULT '',          -- helpful / unhelpful
+  understood INTEGER DEFAULT -1,   -- 1 听懂了 / 0 没听懂 / -1 未表态
+  confusion TEXT DEFAULT '',       -- 用户补充说明（哪里没懂）
+  created_at REAL
+);
+CREATE TABLE IF NOT EXISTS mastery(
+  id TEXT PRIMARY KEY,
+  space_id TEXT NOT NULL,
+  point TEXT NOT NULL,             -- 知识点
+  score REAL DEFAULT 0.5,          -- 0..1 掌握度
+  attempts INTEGER DEFAULT 0,
+  correct INTEGER DEFAULT 0,
+  wrong INTEGER DEFAULT 0,
+  box INTEGER DEFAULT 1,           -- 1..5 复习盒（Leitner 间隔复习）
+  due_at REAL DEFAULT 0,           -- 下次应复习的时间戳
+  status TEXT DEFAULT 'learning',  -- weak / learning / mastered
+  updated_at REAL,
+  UNIQUE(space_id, point)
+);
+CREATE TABLE IF NOT EXISTS meta(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS handbooks(
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  profile TEXT DEFAULT '[]',       -- json 用户档案
+  space_id TEXT DEFAULT '',
+  content TEXT NOT NULL,           -- markdown 手册正文
+  created_at REAL
+);
+CREATE TABLE IF NOT EXISTS flashcards(
+  id TEXT PRIMARY KEY,
+  space_id TEXT NOT NULL,
+  front TEXT NOT NULL,             -- 卡面（问题/提示）
+  back TEXT NOT NULL,              -- 答案
+  point TEXT DEFAULT '',           -- 关联知识点
+  box INTEGER DEFAULT 1,           -- 1..5 Leitner 复习盒
+  due_at REAL DEFAULT 0,           -- 下次应复习时间戳
+  created_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_fc_space ON flashcards(space_id);
+CREATE TABLE IF NOT EXISTS mastery_history(
+  id TEXT PRIMARY KEY,
+  space_id TEXT NOT NULL,
+  point TEXT NOT NULL,
+  score REAL NOT NULL,
+  verdict TEXT DEFAULT '',         -- correct/partial/wrong/confused/progress
+  created_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_mh_space ON mastery_history(space_id);
+CREATE TABLE IF NOT EXISTS plan_tasks(
+  id TEXT PRIMARY KEY,
+  space_id TEXT NOT NULL,
+  phase TEXT DEFAULT '',           -- 阶段名（含时间范围）
+  content TEXT NOT NULL,           -- 行动项
+  accept TEXT DEFAULT '',          -- 验收标准
+  points TEXT DEFAULT '[]',        -- 涉及知识点 json
+  due_date TEXT DEFAULT '',        -- 截止日期 YYYY-MM-DD（今日学习页排期用）
+  done INTEGER DEFAULT 0,
+  done_at REAL DEFAULT 0,
+  created_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_pt_space ON plan_tasks(space_id);
+CREATE TABLE IF NOT EXISTS student_profile(
+  id INTEGER PRIMARY KEY CHECK (id=1),  -- 单用户档案，固定一行
+  current_school TEXT DEFAULT '',
+  major TEXT DEFAULT '',
+  year TEXT DEFAULT '',
+  rank_hint TEXT DEFAULT '',
+  flags TEXT DEFAULT '[]',         -- 情况标签 json（重修/跨考…）
+  goal_type TEXT DEFAULT '考研',
+  target_school TEXT DEFAULT '',
+  target_major TEXT DEFAULT '',
+  timeline TEXT DEFAULT '',
+  notes TEXT DEFAULT '',
+  updated_at REAL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS concept_edges(
+  space_id TEXT NOT NULL,
+  from_point TEXT NOT NULL,        -- 前置知识点
+  to_point TEXT NOT NULL,          -- 后继知识点（依赖前置）
+  source TEXT DEFAULT 'llm',       -- llm=讲义抽取 / curriculum=内置课程图谱
+  created_at REAL,
+  UNIQUE(space_id, from_point, to_point)
+);
+CREATE INDEX IF NOT EXISTS idx_ce_space ON concept_edges(space_id);
+CREATE TABLE IF NOT EXISTS course_schedule(
+  id TEXT PRIMARY KEY,
+  term TEXT DEFAULT '',            -- 学期（如 2025-2026-1）
+  day INTEGER DEFAULT 1,           -- 1..7 = 周一..周日
+  period TEXT DEFAULT '',          -- 节次（如 1-2）
+  course TEXT NOT NULL,            -- 课程名
+  teacher TEXT DEFAULT '',
+  room TEXT DEFAULT '',
+  weeks TEXT DEFAULT '',           -- 周次说明（1-16周/单周…）
+  kind TEXT DEFAULT '',            -- 课程性质（必修/选修/实验）
+  created_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_cs_term ON course_schedule(term);
+CREATE TABLE IF NOT EXISTS career_plans(
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  school TEXT DEFAULT '',
+  major TEXT DEFAULT '',
+  goal_type TEXT DEFAULT '',       -- 保研/考研/就业/竞赛/出国/期末
+  target TEXT DEFAULT '',          -- 目标院校专业/岗位
+  term TEXT DEFAULT '',            -- 当前学期
+  horizon TEXT DEFAULT '',         -- 规划跨度（本学期/本学年/至毕业）
+  summary TEXT DEFAULT '',         -- 总方针
+  tasks TEXT NOT NULL,             -- json [{id,phase,content,accept,course,done,done_at}]
+  markdown TEXT DEFAULT '',        -- 渲染后的计划全文
+  created_at REAL
+);
+CREATE TABLE IF NOT EXISTS syllabus_custom(
+  school TEXT NOT NULL,            -- 学校名（与 schools.json 对齐）
+  major TEXT NOT NULL,             -- 专业名
+  data TEXT NOT NULL,              -- json 结构化培养方案（与 programs 模板同构）
+  source TEXT DEFAULT '',          -- 来源说明（导入文件名等）
+  updated_at REAL,
+  PRIMARY KEY(school, major)
+);
 """
 
-_conn: sqlite3.Connection | None = None
+_local = threading.local()  # 线程本地连接：FastAPI 线程池并发共享单连接会触发 sqlite3 InterfaceError
 
 
 def get_conn() -> sqlite3.Connection:
-    global _conn
-    if _conn is None:
-        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.executescript(SCHEMA)
-    return _conn
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+        # 轻量迁移：老库没有的列在此补齐
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_tasks)")}
+        if "due_date" not in cols:
+            conn.execute("ALTER TABLE plan_tasks ADD COLUMN due_date TEXT DEFAULT ''")
+            conn.commit()
+        _local.conn = conn
+    return conn
 
 
 def new_id() -> str:
@@ -196,6 +351,11 @@ def update_quiz(qid: str, answers: list) -> None:
     get_conn().commit()
 
 
+def set_quiz_topic(qid: str, topic: str) -> None:
+    get_conn().execute("UPDATE quiz_records SET topic=? WHERE id=?", (topic, qid))
+    get_conn().commit()
+
+
 def list_quizzes(space_id: str) -> list[dict[str, Any]]:
     rows = rows_to_dicts(get_conn().execute(
         "SELECT * FROM quiz_records WHERE space_id=? ORDER BY created_at DESC", (space_id,)).fetchall())
@@ -271,3 +431,660 @@ def search_vectors(space_id: str, query_emb: list[float], top_k: int = 6) -> lis
 def doc_filename(document_id: str) -> str:
     r = get_conn().execute("SELECT filename FROM documents WHERE id=?", (document_id,)).fetchone()
     return r["filename"] if r else "unknown"
+
+
+# ---------- 教材书库 ----------
+
+def add_book(title: str, author: str = "", subject: str = "", publisher: str = "",
+             license: str = "", note: str = "", pdf_url: str = "", source_url: str = "",
+             status: str = "catalog", path: str = "", error: str = "") -> str:
+    c = get_conn()
+    bid = new_id()
+    c.execute("INSERT INTO books(id,title,author,subject,publisher,license,note,"
+              "pdf_url,source_url,status,path,error,created_at) "
+              "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              (bid, title, author, subject, publisher, license, note,
+               pdf_url, source_url, status, path, error, now()))
+    c.commit()
+    return bid
+
+
+def list_books(query: str = "", subject: str = "") -> list[dict[str, Any]]:
+    like = f"%{query}%"
+    if query and subject:
+        rows = get_conn().execute(
+            "SELECT * FROM books WHERE subject=? AND (title LIKE ? OR author LIKE ? OR note LIKE ?)"
+            " ORDER BY subject,created_at", (subject, like, like, like)).fetchall()
+    elif query:
+        rows = get_conn().execute(
+            "SELECT * FROM books WHERE title LIKE ? OR author LIKE ? OR note LIKE ?"
+            " ORDER BY subject,created_at", (like, like, like)).fetchall()
+    elif subject:
+        rows = get_conn().execute(
+            "SELECT * FROM books WHERE subject=? ORDER BY subject,created_at", (subject,)).fetchall()
+    else:
+        rows = get_conn().execute("SELECT * FROM books ORDER BY subject,created_at").fetchall()
+    return rows_to_dicts(rows)
+
+
+def get_book(bid: str) -> dict[str, Any] | None:
+    r = get_conn().execute("SELECT * FROM books WHERE id=?", (bid,)).fetchone()
+    return dict(r) if r else None
+
+
+def find_book_by_title(title: str) -> dict[str, Any] | None:
+    r = get_conn().execute("SELECT * FROM books WHERE title=?", (title,)).fetchone()
+    return dict(r) if r else None
+
+
+def update_book_file(bid: str, status: str, path: str = "", error: str = "") -> None:
+    c = get_conn()
+    c.execute("UPDATE books SET status=?, path=?, error=? WHERE id=?", (status, path, error, bid))
+    c.commit()
+
+
+def delete_book(bid: str) -> None:
+    c = get_conn()
+    c.execute("DELETE FROM book_documents WHERE book_id=?", (bid,))
+    c.execute("DELETE FROM books WHERE id=?", (bid,))
+    c.commit()
+
+
+def list_subjects() -> list[str]:
+    rows = get_conn().execute("SELECT DISTINCT subject FROM books WHERE subject!='' ORDER BY subject").fetchall()
+    return [r["subject"] for r in rows]
+
+
+def get_book_document(bid: str, sid: str) -> str:
+    r = get_conn().execute(
+        "SELECT document_id FROM book_documents WHERE book_id=? AND space_id=?", (bid, sid)).fetchone()
+    return r["document_id"] if r else ""
+
+
+def add_book_document(bid: str, sid: str, did: str) -> None:
+    c = get_conn()
+    c.execute("INSERT OR REPLACE INTO book_documents(book_id,space_id,document_id,created_at) VALUES(?,?,?,?)",
+              (bid, sid, did, now()))
+    c.commit()
+
+
+def list_book_spaces(bid: str) -> list[dict[str, Any]]:
+    rows = get_conn().execute(
+        "SELECT s.id, s.name FROM book_documents bd JOIN spaces s ON s.id=bd.space_id WHERE bd.book_id=?",
+        (bid,)).fetchall()
+    return rows_to_dicts(rows)
+
+
+# ---------- 用户反馈 ----------
+
+def add_feedback(space_id: str, message_id: str, rating: str,
+                 understood: int, confusion: str) -> str:
+    c = get_conn()
+    fid = new_id()
+    c.execute("INSERT INTO feedback(id,space_id,message_id,rating,understood,confusion,created_at) "
+              "VALUES(?,?,?,?,?,?,?)",
+              (fid, space_id, message_id, rating, understood, confusion, now()))
+    c.commit()
+    return fid
+
+
+def list_feedback(space_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    rows = get_conn().execute(
+        "SELECT * FROM feedback WHERE space_id=? ORDER BY created_at DESC LIMIT ?",
+        (space_id, limit)).fetchall()
+    return rows_to_dicts(rows)
+
+
+def get_message(mid: str) -> dict[str, Any] | None:
+    r = get_conn().execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
+    return dict(r) if r else None
+
+
+# ---------- 知识点掌握度（BKT 知识追踪 + Leitner 间隔复习 + 缺陷依赖图） ----------
+
+_BOX_DELAYS = {1: 1800.0, 2: 86400.0, 3: 259200.0, 4: 604800.0, 5: 1209600.0}
+# 复习间隔：盒1=30分钟 盒2=1天 盒3=3天 盒4=7天 盒5=14天
+
+# ---- 贝叶斯知识追踪（BKT）参数 ----
+# prior: 初始先验 P(已掌握)；learn: 每次练习后的学习转移概率 P(T)
+# slip: 已掌握但做错的概率 P(S)；guess: 未掌握但蒙对的概率 P(G)
+_BKT_PRIOR = 0.35
+_BKT_LEARN = 0.13
+_BKT_SLIP = 0.10
+_DEFAULT_GUESS = 0.15
+
+# 各类证据对"掌握"的支持强度（软观测，按强度混合两个方向的贝叶斯后验）
+_EVIDENCE_STRENGTH = {"correct": 1.0, "progress": 0.6, "partial": 0.5, "confused": 0.15, "wrong": 0.0}
+
+
+def _bkt_posterior(p: float, obs_correct: bool, guess: float) -> float:
+    """单次观测的贝叶斯后验 P(K|obs)。"""
+    if obs_correct:
+        lik_k, lik_notk = 1.0 - _BKT_SLIP, guess
+    else:
+        lik_k, lik_notk = _BKT_SLIP, 1.0 - guess
+    denom = lik_k * p + lik_notk * (1 - p)
+    return (lik_k * p) / denom if denom > 0 else p
+
+
+def _bkt_update(p: float, evidence: float, guess: float) -> float:
+    """软观测 BKT：按证据强度混合对/错两个后验，再做学习转移。"""
+    p1 = _bkt_posterior(p, True, guess)
+    p0 = _bkt_posterior(p, False, guess)
+    p_obs = evidence * p1 + (1 - evidence) * p0
+    return min(0.98, p_obs + (1 - p_obs) * _BKT_LEARN)
+
+
+def estimate_retention(p_known: float, box: int, updated_at: float, at: float | None = None) -> float:
+    """按 Ebbinghaus 指数遗忘估算当前留存率：R = 0.5^(Δt/半衰期)，半衰期随复习盒加长。"""
+    at = at if at is not None else time.time()
+    delay_h = _BOX_DELAYS.get(box, 1800.0) / 3600.0
+    half_life_h = delay_h * 1.2 + 4.0
+    dt_h = max(0.0, (at - updated_at) / 3600.0)
+    return round(0.5 ** (dt_h / half_life_h), 4)
+
+
+def _mastery_status(score: float) -> str:
+    if score < 0.35:
+        return "weak"
+    if score < 0.75:
+        return "learning"
+    return "mastered"
+
+
+def _find_mastery(space_id: str, point: str) -> dict[str, Any] | None:
+    """精确匹配，再按字符相似度匹配（LLM 对同一知识点的表述会有差异）。"""
+    import difflib
+    r = get_conn().execute("SELECT * FROM mastery WHERE space_id=? AND point=?",
+                           (space_id, point)).fetchone()
+    if r:
+        return dict(r)
+    rows = rows_to_dicts(get_conn().execute(
+        "SELECT * FROM mastery WHERE space_id=?", (space_id,)).fetchall())
+    best, best_ratio = None, 0.0
+    for row in rows:
+        ratio = difflib.SequenceMatcher(None, row["point"], point).ratio()
+        if ratio > best_ratio:
+            best, best_ratio = row, ratio
+    return best if best and best_ratio >= 0.5 else None
+
+
+def adjust_mastery(space_id: str, point: str, verdict: str, guess: float | None = None) -> dict[str, Any] | None:
+    """按证据更新知识点掌握度（BKT）并调度 Leitner 复习盒。
+
+    verdict: correct / partial / wrong / confused / progress
+    guess: 该次观测的蒙对概率（未给则按默认；选择/判断题应由调用方传更高值）
+    """
+    point = point.strip()[:80]
+    if not point:
+        return None
+    evidence = _EVIDENCE_STRENGTH.get(verdict)
+    if evidence is None:
+        return None
+    row = _find_mastery(space_id, point)
+    if row:
+        score, attempts, correct, wrong, box = (row["score"], row["attempts"],
+                                                row["correct"], row["wrong"], row["box"])
+    else:
+        score, attempts, correct, wrong, box = _BKT_PRIOR, 0, 0, 0, 1
+    score = _bkt_update(score, evidence, _DEFAULT_GUESS if guess is None else min(max(guess, 0.01), 0.6))
+    attempts += 1
+    if verdict == "correct":
+        correct += 1
+        box = min(box + 1, 5)
+    elif verdict == "wrong":
+        wrong += 1
+        box = 1
+    elif verdict == "confused":
+        box = 1
+    elif verdict in ("partial", "progress"):
+        box = min(box + 1, 5)
+    due = now() + _BOX_DELAYS[box]
+    c = get_conn()
+    c.execute("INSERT INTO mastery(id,space_id,point,score,attempts,correct,wrong,box,due_at,status,updated_at) "
+              "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+              "ON CONFLICT(space_id,point) DO UPDATE SET score=excluded.score, attempts=excluded.attempts, "
+              "correct=excluded.correct, wrong=excluded.wrong, box=excluded.box, due_at=excluded.due_at, "
+              "status=excluded.status, updated_at=excluded.updated_at",
+              (new_id(), space_id, point, round(score, 4), attempts, correct, wrong,
+               box, due, _mastery_status(score), now()))
+    add_mastery_history(space_id, point, round(score, 4), verdict)
+    c.commit()
+    return get_mastery_point(space_id, point)
+
+
+def add_mastery_history(space_id: str, point: str, score: float, verdict: str = "") -> None:
+    c = get_conn()
+    c.execute("INSERT INTO mastery_history(id,space_id,point,score,verdict,created_at) VALUES(?,?,?,?,?,?)",
+              (new_id(), space_id, point, score, verdict, now()))
+    c.commit()
+
+
+def list_mastery_history(space_id: str) -> list[dict[str, Any]]:
+    return rows_to_dicts(get_conn().execute(
+        "SELECT point,score,verdict,created_at FROM mastery_history WHERE space_id=? ORDER BY created_at",
+        (space_id,)).fetchall())
+
+
+def get_mastery_point(space_id: str, point: str) -> dict[str, Any] | None:
+    row = _find_mastery(space_id, point)
+    return row
+
+
+def list_mastery(space_id: str) -> list[dict[str, Any]]:
+    return rows_to_dicts(get_conn().execute(
+        "SELECT * FROM mastery WHERE space_id=? ORDER BY score ASC, updated_at DESC", (space_id,)).fetchall())
+
+
+def weak_points(space_id: str, limit: int = 8) -> list[dict[str, Any]]:
+    rows = get_conn().execute(
+        "SELECT * FROM mastery WHERE space_id=? AND status!='mastered' "
+        "ORDER BY score ASC, wrong DESC LIMIT ?", (space_id, limit)).fetchall()
+    return rows_to_dicts(rows)
+
+
+def due_points(space_id: str) -> list[dict[str, Any]]:
+    return rows_to_dicts(get_conn().execute(
+        "SELECT * FROM mastery WHERE space_id=? AND status!='mastered' AND due_at<=? "
+        "ORDER BY due_at ASC", (space_id, now())).fetchall())
+
+
+# ---------- 错题本 ----------
+
+def wrong_questions(space_id: str) -> list[dict[str, Any]]:
+    """跨测验聚合错题（按测验时间倒序），附带判卷分析、用户答案与知识点。"""
+    out = []
+    for q in list_quizzes(space_id):
+        if not q["answers"]:
+            continue
+        graded = {a.get("qid"): a for a in q["answers"]}
+        for question in q["questions"]:
+            g = graded.get(question["id"])
+            if not g or g.get("verdict") == "对":
+                continue
+            out.append({**question, "verdict": g.get("verdict", ""),
+                        "analysis": g.get("analysis", ""),
+                        "user_answer": g.get("user_answer", ""),
+                        "quiz_id": q["id"], "quiz_topic": q["topic"],
+                        "quiz_created_at": q["created_at"]})
+    return out
+
+
+# ---------- 闪卡（Leitner 复用掌握度的复习盒间隔） ----------
+
+def add_flashcards(space_id: str, cards: list[dict]) -> list[dict]:
+    c = get_conn()
+    saved = []
+    for card in cards:
+        fid = new_id()
+        c.execute("INSERT INTO flashcards(id,space_id,front,back,point,box,due_at,created_at) "
+                  "VALUES(?,?,?,?,?,1,?,?)",
+                  (fid, space_id, (card.get("front") or "").strip(),
+                   (card.get("back") or "").strip(), (card.get("point") or "").strip()[:80],
+                   now(), now()))
+        saved.append({"id": fid, "front": card.get("front", ""), "back": card.get("back", ""),
+                      "point": card.get("point", ""), "box": 1, "due_at": now()})
+    c.commit()
+    return saved
+
+
+def list_flashcards(space_id: str, due_only: bool = False, limit: int = 30) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM flashcards WHERE space_id=?"
+    params: list[Any] = [space_id]
+    if due_only:
+        sql += " AND due_at<=?"
+        params.append(now())
+    sql += " ORDER BY due_at ASC LIMIT ?"
+    params.append(limit)
+    rows = get_conn().execute(sql, params).fetchall()
+    return rows_to_dicts(rows)
+
+
+def flashcard_stats(space_id: str) -> dict[str, int]:
+    c = get_conn()
+    total = c.execute("SELECT COUNT(*) AS n FROM flashcards WHERE space_id=?", (space_id,)).fetchone()["n"]
+    due = c.execute("SELECT COUNT(*) AS n FROM flashcards WHERE space_id=? AND due_at<=?",
+                    (space_id, now())).fetchone()["n"]
+    return {"total": total, "due": due}
+
+
+def grade_flashcard(space_id: str, fid: str, know: bool) -> dict[str, Any] | None:
+    """刷卡自评：记得 → 推进复习盒；忘了 → 回到盒1（10 分钟后重现）。"""
+    c = get_conn()
+    r = c.execute("SELECT * FROM flashcards WHERE id=? AND space_id=?", (fid, space_id)).fetchone()
+    if not r:
+        return None
+    if know:
+        box = min(r["box"] + 1, 5)
+        due = now() + _BOX_DELAYS[box]
+    else:
+        box, due = 1, now() + 600.0
+    c.execute("UPDATE flashcards SET box=?, due_at=? WHERE id=?", (box, due, fid))
+    c.commit()
+    return {"id": fid, "box": box, "due_at": due}
+
+
+def clear_flashcards(space_id: str) -> None:
+    c = get_conn()
+    c.execute("DELETE FROM flashcards WHERE space_id=?", (space_id,))
+    c.commit()
+
+
+# ---------- 学习计划任务 ----------
+
+def replace_plan_tasks(space_id: str, tasks: list[dict]) -> None:
+    """重新生成计划时整体替换（含已完成历史，生成即代表重开一版计划）。"""
+    c = get_conn()
+    c.execute("DELETE FROM plan_tasks WHERE space_id=?", (space_id,))
+    for t in tasks:
+        c.execute("INSERT INTO plan_tasks(id,space_id,phase,content,accept,points,due_date,created_at) "
+                  "VALUES(?,?,?,?,?,?,?,?)",
+                  (new_id(), space_id, (t.get("phase") or "").strip()[:80],
+                   (t.get("content") or "").strip(), (t.get("accept") or "").strip(),
+                   json.dumps(t.get("points") or [], ensure_ascii=False),
+                   (t.get("due_date") or "").strip()[:10], now()))
+    c.commit()
+
+
+def list_plan_tasks(space_id: str) -> list[dict[str, Any]]:
+    rows = rows_to_dicts(get_conn().execute(
+        "SELECT * FROM plan_tasks WHERE space_id=? ORDER BY created_at", (space_id,)).fetchall())
+    for t in rows:
+        t["points"] = json.loads(t["points"])
+    return rows
+
+
+def set_plan_task_date(space_id: str, task_id: str, due_date: str) -> dict[str, Any] | None:
+    """设置/清除任务截止日期（YYYY-MM-DD，空串清除）。"""
+    due_date = (due_date or "").strip()[:10]
+    if due_date:
+        try:
+            time.strptime(due_date, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("日期格式应为 YYYY-MM-DD")
+    c = get_conn()
+    r = c.execute("SELECT id FROM plan_tasks WHERE id=? AND space_id=?", (task_id, space_id)).fetchone()
+    if not r:
+        return None
+    c.execute("UPDATE plan_tasks SET due_date=? WHERE id=?", (due_date, task_id))
+    c.commit()
+    return {"id": task_id, "due_date": due_date}
+
+
+def today_snapshot(space_id: str) -> dict[str, Any]:
+    """今日学习视图聚合：到期复习点 + 到期闪卡 + 今日/未排期计划任务 + 今日完成。"""
+    today = time.strftime("%Y-%m-%d")
+    tasks = list_plan_tasks(space_id)
+
+    def _day(ts: float) -> str:
+        return time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else ""
+
+    due = due_points(space_id)
+    flash = flashcard_stats(space_id)
+    return {
+        "date": today,
+        "due_points": due[:20],
+        "due_total": len(due),
+        "flash_due": flash["due"],
+        "flash_total": flash["total"],
+        "tasks_today": [t for t in tasks if not t["done"] and t["due_date"] and t["due_date"] <= today],
+        "tasks_unscheduled": [t for t in tasks if not t["done"] and not t["due_date"]][:20],
+        "done_today": [t for t in tasks if t["done"] and _day(t["done_at"]) == today],
+        "wrong_count": len(wrong_questions(space_id)),
+    }
+
+
+def toggle_plan_task(space_id: str, task_id: str, done: bool) -> dict[str, Any] | None:
+    c = get_conn()
+    r = c.execute("SELECT id FROM plan_tasks WHERE id=? AND space_id=?", (task_id, space_id)).fetchone()
+    if not r:
+        return None
+    c.execute("UPDATE plan_tasks SET done=?, done_at=? WHERE id=?",
+              (1 if done else 0, now() if done else 0, task_id))
+    c.commit()
+    return {"id": task_id, "done": done}
+
+
+# ---------- 通用元数据 ----------
+
+def get_meta(key: str) -> str:
+    r = get_conn().execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else ""
+
+
+def set_meta(key: str, value: str) -> None:
+    c = get_conn()
+    c.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+              "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    c.commit()
+
+
+# ---------- 成长手册 ----------
+
+def save_handbook(title: str, profile: dict, content: str, space_id: str = "") -> str:
+    c = get_conn()
+    hid = new_id()
+    c.execute("INSERT INTO handbooks(id,title,profile,space_id,content,created_at) VALUES(?,?,?,?,?,?)",
+              (hid, title, json.dumps(profile, ensure_ascii=False), space_id, content, now()))
+    c.commit()
+    return hid
+
+
+def list_handbooks() -> list[dict[str, Any]]:
+    rows = get_conn().execute(
+        "SELECT id,title,space_id,created_at FROM handbooks ORDER BY created_at DESC").fetchall()
+    return rows_to_dicts(rows)
+
+
+def get_handbook(hid: str) -> dict[str, Any] | None:
+    r = get_conn().execute("SELECT * FROM handbooks WHERE id=?", (hid,)).fetchone()
+    if not r:
+        return None
+    d = dict(r)
+    d["profile"] = json.loads(d["profile"])
+    return d
+
+
+def delete_handbook(hid: str) -> None:
+    get_conn().execute("DELETE FROM handbooks WHERE id=?", (hid,))
+    get_conn().commit()
+
+
+# ---------- 个人学生档案（单用户，一行） ----------
+
+_PROFILE_FIELDS = ("current_school", "major", "year", "rank_hint",
+                   "goal_type", "target_school", "target_major", "timeline", "notes")
+
+
+def get_student_profile() -> dict[str, Any]:
+    r = get_conn().execute("SELECT * FROM student_profile WHERE id=1").fetchone()
+    if not r:
+        empty = {k: "" for k in _PROFILE_FIELDS}
+        empty.update({"flags": [], "updated_at": 0})
+        return empty
+    d = dict(r)
+    try:
+        d["flags"] = json.loads(d["flags"] or "[]")
+    except ValueError:
+        d["flags"] = []
+    return d
+
+
+def save_student_profile(fields: dict) -> dict[str, Any]:
+    """整行覆盖保存（前端表单总是提交完整档案）。"""
+    clean = {k: (fields.get(k) or "").strip()[:120] for k in _PROFILE_FIELDS}
+    flags = json.dumps([str(f).strip()[:40] for f in (fields.get("flags") or []) if str(f).strip()],
+                       ensure_ascii=False)
+    c = get_conn()
+    c.execute(
+        "INSERT INTO student_profile(id,current_school,major,year,rank_hint,flags,goal_type,"
+        "target_school,target_major,timeline,notes,updated_at) "
+        "VALUES(1,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(id) DO UPDATE SET current_school=excluded.current_school, major=excluded.major, "
+        "year=excluded.year, rank_hint=excluded.rank_hint, flags=excluded.flags, "
+        "goal_type=excluded.goal_type, target_school=excluded.target_school, "
+        "target_major=excluded.target_major, timeline=excluded.timeline, notes=excluded.notes, "
+        "updated_at=excluded.updated_at",
+        (clean["current_school"], clean["major"], clean["year"], clean["rank_hint"], flags,
+         clean["goal_type"] or "考研", clean["target_school"], clean["target_major"],
+         clean["timeline"], clean["notes"], now()))
+    c.commit()
+    return get_student_profile()
+
+
+# ---------- 知识点依赖图（缺陷传播用） ----------
+
+def set_space_edges(space_id: str, edges: list[dict], source: str) -> int:
+    """整体替换某来源（llm / curriculum）的依赖边。edge: {from, to}。"""
+    c = get_conn()
+    c.execute("DELETE FROM concept_edges WHERE space_id=? AND source=?", (space_id, source))
+    n = 0
+    for e in edges:
+        f, t = (e.get("from") or "").strip()[:80], (e.get("to") or "").strip()[:80]
+        if not f or not t or f == t:
+            continue
+        c.execute("INSERT OR IGNORE INTO concept_edges(space_id,from_point,to_point,source,created_at) "
+                  "VALUES(?,?,?,?,?)", (space_id, f, t, source, now()))
+        n += 1
+    c.commit()
+    return n
+
+
+def list_edges(space_id: str) -> list[dict[str, Any]]:
+    return rows_to_dicts(get_conn().execute(
+        "SELECT from_point, to_point, source FROM concept_edges WHERE space_id=?", (space_id,)).fetchall())
+
+
+# ---------- 课程表（学涯规划） ----------
+
+def replace_schedule(term: str, courses: list[dict]) -> int:
+    """整体替换某学期的课程表（导入/编辑保存都走这条路径，简单且不会重复）。"""
+    c = get_conn()
+    c.execute("DELETE FROM course_schedule WHERE term=?", (term,))
+    n = 0
+    for t in courses:
+        name = (t.get("course") or "").strip()
+        if not name:
+            continue
+        try:
+            day = max(1, min(7, int(t.get("day") or 1)))
+        except (TypeError, ValueError):
+            day = 1
+        c.execute(
+            "INSERT INTO course_schedule(id,term,day,period,course,teacher,room,weeks,kind,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (new_id(), term, day, (t.get("period") or "").strip()[:20], name[:80],
+             (t.get("teacher") or "").strip()[:40], (t.get("room") or "").strip()[:40],
+             (t.get("weeks") or "").strip()[:40], (t.get("kind") or "").strip()[:12], now()))
+        n += 1
+    c.commit()
+    return n
+
+
+def list_schedule(term: str) -> list[dict[str, Any]]:
+    return rows_to_dicts(get_conn().execute(
+        "SELECT * FROM course_schedule WHERE term=? ORDER BY day, period, course", (term,)).fetchall())
+
+
+def list_schedule_terms() -> list[dict[str, Any]]:
+    return rows_to_dicts(get_conn().execute(
+        "SELECT term, COUNT(*) AS courses FROM course_schedule GROUP BY term ORDER BY term DESC").fetchall())
+
+
+def delete_schedule(term: str) -> None:
+    get_conn().execute("DELETE FROM course_schedule WHERE term=?", (term,))
+    get_conn().commit()
+
+
+# ---------- 学涯规划（目标导向学习计划） ----------
+
+def save_career_plan(title: str, meta: dict, summary: str, tasks: list[dict], markdown: str) -> str:
+    c = get_conn()
+    pid = new_id()
+    c.execute(
+        "INSERT INTO career_plans(id,title,school,major,goal_type,target,term,horizon,summary,tasks,markdown,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (pid, title[:120], (meta.get("school") or "")[:60], (meta.get("major") or "")[:60],
+         (meta.get("goal_type") or "")[:20], (meta.get("target") or "")[:120],
+         (meta.get("term") or "")[:20], (meta.get("horizon") or "")[:20],
+         summary[:200], json.dumps(tasks, ensure_ascii=False), markdown, now()))
+    c.commit()
+    return pid
+
+
+def list_career_plans() -> list[dict[str, Any]]:
+    rows = get_conn().execute(
+        "SELECT id,title,school,major,goal_type,target,term,horizon,summary,created_at "
+        "FROM career_plans ORDER BY created_at DESC").fetchall()
+    return rows_to_dicts(rows)
+
+
+def get_career_plan(pid: str) -> dict[str, Any] | None:
+    r = get_conn().execute("SELECT * FROM career_plans WHERE id=?", (pid,)).fetchone()
+    if not r:
+        return None
+    d = dict(r)
+    try:
+        d["tasks"] = json.loads(d["tasks"])
+    except ValueError:
+        d["tasks"] = []
+    return d
+
+
+def toggle_career_task(pid: str, task_id: str, done: bool) -> dict[str, Any] | None:
+    plan = get_career_plan(pid)
+    if not plan:
+        return None
+    hit = None
+    for t in plan["tasks"]:
+        if t.get("id") == task_id:
+            t["done"] = bool(done)
+            t["done_at"] = now() if done else 0
+            hit = t
+    if not hit:
+        return None
+    c = get_conn()
+    c.execute("UPDATE career_plans SET tasks=? WHERE id=?",
+              (json.dumps(plan["tasks"], ensure_ascii=False), pid))
+    c.commit()
+    return hit
+
+
+def delete_career_plan(pid: str) -> None:
+    get_conn().execute("DELETE FROM career_plans WHERE id=?", (pid,))
+    get_conn().commit()
+
+
+# ---------- 自定义培养方案（导入本校培养手册解析入库） ----------
+
+def save_syllabus_custom(school: str, major: str, data: dict, source: str = "") -> None:
+    get_conn().execute(
+        "INSERT INTO syllabus_custom(school,major,data,source,updated_at) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(school,major) DO UPDATE SET data=excluded.data, "
+        "source=excluded.source, updated_at=excluded.updated_at",
+        (school[:60], major[:80], json.dumps(data, ensure_ascii=False), source[:200], now()))
+    get_conn().commit()
+
+
+def get_syllabus_custom(school: str, major: str) -> dict[str, Any] | None:
+    r = get_conn().execute("SELECT * FROM syllabus_custom WHERE school=? AND major=?",
+                           (school, major)).fetchone()
+    if not r:
+        return None
+    d = dict(r)
+    try:
+        d["data"] = json.loads(d["data"])
+    except ValueError:
+        d["data"] = {}
+    return d
+
+
+def list_syllabus_custom(school: str = "") -> list[dict[str, Any]]:
+    if school:
+        rows = get_conn().execute(
+            "SELECT school,major,source,updated_at FROM syllabus_custom WHERE school=? "
+            "ORDER BY major", (school,)).fetchall()
+    else:
+        rows = get_conn().execute(
+            "SELECT school,major,source,updated_at FROM syllabus_custom ORDER BY school, major").fetchall()
+    return rows_to_dicts(rows)
