@@ -5,8 +5,7 @@ import pathlib
 import shutil
 import tempfile
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -14,7 +13,22 @@ from . import connectors, db, defects, experts, export, handbook, ingest, librar
 from .config import settings
 
 app = FastAPI(title="StudyPilot", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# 本机服务防 drive-by：浏览器发起的跨站请求必带 Origin 头，白名单之外一律 403
+# （桌面端同源页面、curl 脚本不带 Origin，不受影响）。前端与后端同源部署
+# （桌面端 FastAPI 托管 / 开发模式 vite proxy），无需 CORS 放行。
+ALLOWED_ORIGINS = {
+    "http://127.0.0.1:8178", "http://localhost:8178",
+    "http://127.0.0.1:5173", "http://localhost:5173",  # 开发模式 vite
+}
+
+
+@app.middleware("http")
+async def _origin_guard(request: Request, call_next):
+    origin = request.headers.get("origin")
+    if origin and origin not in ALLOWED_ORIGINS:
+        return PlainTextResponse("Forbidden origin", status_code=403)
+    return await call_next(request)
 
 UPLOAD_ROOT = pathlib.Path(settings.upload_dir).resolve()
 
@@ -132,7 +146,7 @@ def api_profile_overview():
             "mastered": sum(1 for p in points if p["status"] == "mastered"),
             "avg": round(sum(p["score"] for p in points) / len(points), 3) if points else 0.0,
             "due": len(db.due_points(sid)),
-            "quizzes": len(db.list_quizzes(sid)),
+            "quizzes": db.count_quizzes(sid),
             "flash_due": db.flashcard_stats(sid)["due"],
         })
     return {"spaces": out}
@@ -305,17 +319,11 @@ def api_chat_stream(sid: str, body: ChatIn):
     def gen():
         yield "data: " + json.dumps({"type": "meta"}) + "\n\n"
         full = []
-        expert_key = "qa" if body.mode != "ask" else experts.route_expert(body.message)
+        # 与非流式共用 prompt 组装（专家路由 + 上下文预算 + 记忆注入），避免两条路径行为漂移
+        system, _expert_key, hits = experts.build_prompt(sid, body.mode, body.message, guide=body.guide)
+        expert_key = _expert_key
         expert_name = experts.EXPERTS.get(expert_key, experts.EXPERTS["qa"])["name"]
-        hits = rag.retrieve(sid, body.message)
-        context = rag.build_context(hits) if hits else "（知识库暂无相关内容）"
-        memory_ctx = experts.build_memory_context(sid)
-        system = experts.MODE_SYSTEM.get(body.mode, experts.MODE_SYSTEM["ask"])
-        if body.guide:
-            system += experts.GUIDE_SUFFIX
-        if memory_ctx:
-            system += "\n\n学生记忆档案：\n" + memory_ctx
-        messages = [{"role": "system", "content": system + f"\n\n【讲义检索片段】\n{context}"},
+        messages = [{"role": "system", "content": system},
                     {"role": "user", "content": body.message}]
         for delta in llm.chat_stream(messages):
             full.append(delta)
@@ -325,7 +333,8 @@ def api_chat_stream(sid: str, body: ChatIn):
                       "snippet": h["text"][:120]} for i, h in enumerate(hits)]
         db.add_message(sid, body.mode, "user", body.message)
         assistant_mid = db.add_message(sid, body.mode, "assistant", reply, expert=expert_name, citations=citations)
-        experts.maybe_update_memory(sid)
+        # 学习分析后台化：done 事件不被 3 次串行 LLM 调用推迟
+        experts.maybe_update_memory_async(sid)
         yield "data: " + json.dumps({"type": "done", "expert": expert_name, "citations": citations,
                                      "assistant_message_id": assistant_mid},
                                     ensure_ascii=False) + "\n\n"
@@ -848,7 +857,10 @@ def api_connectors():
 
 @app.post("/api/connectors/mcp")
 def api_register_mcp(body: McpIn):
-    connectors.register_mcp(body.name, body.command)
+    try:
+        connectors.register_mcp(body.name, body.command)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return {"ok": True}
 
 

@@ -1828,7 +1828,7 @@ function HandbookView({ spaces, currentSid }: { spaces: Space[]; currentSid: str
   const [current, setCurrent] = useState<Handbook | null>(null)
   const [busy, setBusy] = useState(false)
   const [form, setForm] = useState({
-    current_school: '示例大学', major: '', year: '', rank_hint: '',
+    current_school: '', major: '', year: '', rank_hint: '',
     flags: [] as string[], goal_type: '考研',
     target_school: '', target_major: '', timeline: '', notes: '',
   })

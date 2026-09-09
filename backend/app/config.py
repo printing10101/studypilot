@@ -26,7 +26,5 @@ class Settings(BaseSettings):
                                   #   cloud=全云端（失败自动回退本地）
     max_context_chars: int = 12000  # 单次请求的 prompt 字符预算，防止超上下文被截断导致降智
 
-    chat_base_url: str = ""  # 前端跨机访问时后端对外地址，留空则同源
-
 
 settings = Settings()

@@ -1,6 +1,8 @@
 """专家团 + 三层记忆（L1 镜像 / L2 摘要 / L3 长期综合）+ 模式(Ask/Plan/Craft)编排。"""
 import json
 import re
+import sys
+import threading
 
 from . import connectors, db, llm, rag
 from .config import settings
@@ -97,16 +99,7 @@ def record_feedback(space_id: str, message_id: str, rating: str,
 
     # 负反馈：定位相关知识并削弱
     msg = db.get_message(message_id) if message_id else None
-    question = ""
-    if msg:
-        msgs = db.list_messages(space_id, 200)
-        for i, m in enumerate(msgs):
-            if m.get("id") == message_id:
-                for prev in reversed(msgs[:i]):
-                    if prev["role"] == "user":
-                        question = prev["content"]
-                        break
-                break
+    question = db.previous_user_message(space_id, message_id) if msg else ""
     ctx_parts = []
     if question:
         ctx_parts.append(f"学生提问：{question[:300]}")
@@ -219,11 +212,29 @@ def answer(space_id: str, mode: str, question: str,
 
     user_mid = db.add_message(space_id, mode, "user", question)
     assistant_mid = db.add_message(space_id, mode, "assistant", reply, expert=expert_name, citations=citations)
-    maybe_update_memory(space_id)
+    maybe_update_memory_async(space_id)
     return reply, citations, expert_name, user_mid, assistant_mid
 
 
 # ---------- 三层记忆 ----------
+
+_analysis_lock = threading.Lock()  # 学习分析串行化：避免并发对话触发两次分析互踩
+
+
+def maybe_update_memory_async(space_id: str) -> None:
+    """把学习分析放入后台线程：3 次串行 LLM 调用不再阻塞回答返回与流式 done 事件。"""
+    threading.Thread(target=_analysis_worker, args=(space_id,),
+                     daemon=True, name=f"memory-analysis-{space_id}").start()
+
+
+def _analysis_worker(space_id: str) -> None:
+    try:
+        with _analysis_lock:
+            maybe_update_memory(space_id)
+    except Exception as e:
+        # 后台分析失败不影响已返回的回答，只记录现场供排查
+        print(f"[studypilot] 学习分析失败（space={space_id}）: {e}", file=sys.stderr)
+
 
 def maybe_update_memory(space_id: str, every_n_msgs: int = 8) -> None:
     """学习分析：新消息累计达到阈值时运行（用 meta 记录分析位置，不会因技能消息跳跃而漏触发）。
@@ -242,13 +253,15 @@ def maybe_update_memory(space_id: str, every_n_msgs: int = 8) -> None:
     l1 = _l1_block(space_id)
     if not l1:
         return
-    db.set_meta(marker, str(n))
 
     # 1) L2 摘要
     summary = llm.chat([
         {"role": "system", "content": "把以下学习对话压缩成不超过200字的中文事实摘要，只保留知识点、易错点、学习进度。直接输出摘要。"},
         {"role": "user", "content": l1},
     ], temperature=0.2, task="analyze")
+
+    # 分析位点在摘要成功后才推进：中途失败下次还能覆盖这批消息
+    db.set_meta(marker, str(n))
     db.clear_memory(space_id, level=2)
     db.add_memory(space_id, 2, summary, kind="summary")
 

@@ -109,11 +109,23 @@ def load_persisted() -> None:
     except ValueError:
         reg = {}
     for name, command in reg.items():
-        if name not in _mcp_servers and isinstance(command, list):
+        # 与 register_mcp 同一校验：跳过 meta 表里的空/畸形条目
+        if (name not in _mcp_servers and isinstance(command, list)
+                and name.strip() and command
+                and all(isinstance(a, str) and a.strip() for a in command)):
             _mcp_servers[name] = McpClient(name, command)
 
 
 def register_mcp(name: str, command: list[str]) -> None:
+    # 入参校验：注册的 command 会被本机 subprocess 执行，拒绝空值/超长/空参数
+    name = (name or "").strip()[:60]
+    command = [str(a).strip()[:512] for a in (command or []) if str(a).strip()]
+    if not name:
+        raise ValueError("server 名称不能为空")
+    if not command:
+        raise ValueError("启动命令不能为空")
+    if len(command) > 32:
+        raise ValueError("启动命令参数过多（上限 32 个）")
     _mcp_servers[name] = McpClient(name, command)
     db.set_meta(_MCP_META_KEY, json.dumps(
         {n: c.command for n, c in _mcp_servers.items()}, ensure_ascii=False))

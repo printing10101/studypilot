@@ -225,6 +225,7 @@ def get_conn() -> sqlite3.Connection:
     if conn is None:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")  # 多线程并发写友好（读写不互斥）
         conn.executescript(SCHEMA)
         # 轻量迁移：老库没有的列在此补齐
         cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_tasks)")}
@@ -269,7 +270,20 @@ def get_space(sid: str) -> dict[str, Any] | None:
 
 def delete_space(sid: str) -> None:
     c = get_conn()
-    for t in ("documents", "messages", "quiz_records", "memory", "vectors"):
+    # 先删该空间文档对应的磁盘文件（路径须在上传目录内，防误删）
+    upload_root = os.path.realpath(settings.upload_dir)
+    for r in c.execute("SELECT path FROM documents WHERE space_id=?", (sid,)).fetchall():
+        p = r["path"]
+        if not p:
+            continue
+        try:
+            if os.path.realpath(p).startswith(upload_root + os.sep):
+                os.remove(p)
+        except OSError:
+            pass  # 文件可能已被移动/删除，不阻塞空间清理
+    for t in ("documents", "messages", "quiz_records", "memory", "vectors",
+              "feedback", "mastery", "mastery_history", "flashcards",
+              "plan_tasks", "concept_edges", "book_documents"):
         c.execute(f"DELETE FROM {t} WHERE space_id=?", (sid,))
     c.execute("DELETE FROM spaces WHERE id=?", (sid,))
     c.commit()
@@ -365,6 +379,11 @@ def list_quizzes(space_id: str) -> list[dict[str, Any]]:
     return rows
 
 
+def count_quizzes(space_id: str) -> int:
+    return get_conn().execute(
+        "SELECT COUNT(*) AS n FROM quiz_records WHERE space_id=?", (space_id,)).fetchone()["n"]
+
+
 # ---------- 记忆 ----------
 
 def add_memory(space_id: str, level: int, content: str, kind: str = "") -> str:
@@ -399,33 +418,31 @@ def latest_l2(space_id: str) -> str:
 # ---------- 向量 ----------
 
 def insert_vectors(rows: list[tuple[str, str, int, str, list[float]]]) -> None:
-    """(space_id, document_id, chunk_index, text, embedding)"""
+    """(space_id, document_id, chunk_index, text, embedding)。嵌入写入前已 L2 归一化。"""
     import struct
     c = get_conn()
-    for sid, did, idx, text, emb in rows:
-        blob = struct.pack(f"{len(emb)}f", *emb)
-        c.execute("INSERT OR REPLACE INTO vectors(id,space_id,document_id,chunk_index,text,embedding) VALUES(?,?,?,?,?,?)",
-                  (new_id(), sid, did, idx, text, blob))
+    c.executemany(
+        "INSERT OR REPLACE INTO vectors(id,space_id,document_id,chunk_index,text,embedding) VALUES(?,?,?,?,?,?)",
+        [(new_id(), sid, did, idx, text, struct.pack(f"{len(emb)}f", *emb))
+         for sid, did, idx, text, emb in rows])
     c.commit()
 
 
 def search_vectors(space_id: str, query_emb: list[float], top_k: int = 6) -> list[dict[str, Any]]:
-    import struct
     import numpy as np
     rows = get_conn().execute(
         "SELECT id,document_id,chunk_index,text,embedding FROM vectors WHERE space_id=?", (space_id,)).fetchall()
     if not rows:
         return []
-    q = np.array(query_emb, dtype=np.float32)
+    # 库内嵌入写入时已归一化，点积即余弦相似度；整块矩阵乘替代逐行 Python 循环
+    q = np.asarray(query_emb, dtype=np.float32)
     q = q / (np.linalg.norm(q) + 1e-9)
-    scored = []
-    for r in rows:
-        v = np.frombuffer(r["embedding"], dtype=np.float32)
-        v = v / (np.linalg.norm(v) + 1e-9)
-        scored.append((float(q @ v), r))
-    scored.sort(key=lambda x: -x[0])
-    return [{"id": r["id"], "document_id": r["document_id"], "chunk_index": r["chunk_index"],
-             "text": r["text"], "score": s} for s, r in scored[:top_k]]
+    mat = np.stack([np.frombuffer(r["embedding"], dtype=np.float32) for r in rows])
+    scores = mat @ q
+    top = np.argsort(-scores)[:top_k]
+    return [{"id": rows[i]["id"], "document_id": rows[i]["document_id"],
+             "chunk_index": rows[i]["chunk_index"], "text": rows[i]["text"],
+             "score": float(scores[i])} for i in top]
 
 
 def doc_filename(document_id: str) -> str:
@@ -540,6 +557,18 @@ def get_message(mid: str) -> dict[str, Any] | None:
     return dict(r) if r else None
 
 
+def previous_user_message(space_id: str, before_id: str) -> str:
+    """直查某条消息之前最近的一条用户提问（免加载整段对话）。"""
+    msg = get_message(before_id) if before_id else None
+    if not msg:
+        return ""
+    r = get_conn().execute(
+        "SELECT content FROM messages WHERE space_id=? AND role='user' AND id!=? "
+        "AND created_at<=? ORDER BY created_at DESC LIMIT 1",
+        (space_id, before_id, msg["created_at"])).fetchone()
+    return r["content"] if r else ""
+
+
 # ---------- 知识点掌握度（BKT 知识追踪 + Leitner 间隔复习 + 缺陷依赖图） ----------
 
 _BOX_DELAYS = {1: 1800.0, 2: 86400.0, 3: 259200.0, 4: 604800.0, 5: 1209600.0}
@@ -625,6 +654,9 @@ def adjust_mastery(space_id: str, point: str, verdict: str, guess: float | None 
     if row:
         score, attempts, correct, wrong, box = (row["score"], row["attempts"],
                                                 row["correct"], row["wrong"], row["box"])
+        # 模糊命中的是同义表述（如"高数"→"高等数学"）：归并到既有名称，
+        # 否则 upsert 会按新名字另开一行，同一知识点分裂成多行各自演化
+        point = row["point"]
     else:
         score, attempts, correct, wrong, box = _BKT_PRIOR, 0, 0, 0, 1
     score = _bkt_update(score, evidence, _DEFAULT_GUESS if guess is None else min(max(guess, 0.01), 0.6))
@@ -708,6 +740,19 @@ def wrong_questions(space_id: str) -> list[dict[str, Any]]:
                         "quiz_id": q["id"], "quiz_topic": q["topic"],
                         "quiz_created_at": q["created_at"]})
     return out
+
+
+def wrong_question_count(space_id: str) -> int:
+    """错题数：只解析 answers JSON 计数（today 徽标用，免加载全部题目）。"""
+    n = 0
+    for r in get_conn().execute(
+            "SELECT answers FROM quiz_records WHERE space_id=? AND answers!='[]'", (space_id,)).fetchall():
+        try:
+            answers = json.loads(r["answers"])
+        except ValueError:
+            continue
+        n += sum(1 for a in answers if isinstance(a, dict) and a.get("verdict") not in (None, "", "对"))
+    return n
 
 
 # ---------- 闪卡（Leitner 复用掌握度的复习盒间隔） ----------
@@ -830,7 +875,7 @@ def today_snapshot(space_id: str) -> dict[str, Any]:
         "tasks_today": [t for t in tasks if not t["done"] and t["due_date"] and t["due_date"] <= today],
         "tasks_unscheduled": [t for t in tasks if not t["done"] and not t["due_date"]][:20],
         "done_today": [t for t in tasks if t["done"] and _day(t["done_at"]) == today],
-        "wrong_count": len(wrong_questions(space_id)),
+        "wrong_count": wrong_question_count(space_id),
     }
 
 
