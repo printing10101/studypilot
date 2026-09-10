@@ -62,14 +62,26 @@ def _match_point(concept: str, points: list[str], cache: dict) -> str | None:
 
 
 def match_curriculum_edges(space_id: str) -> int:
-    """把内置课程图谱与空间知识点模糊匹配，落入 curriculum 来源的依赖边。幂等。"""
+    """把内置课程图谱与空间知识点模糊匹配，落入 curriculum 来源的依赖边。幂等。
+
+    空间名（即课程空间名）能与某学科图谱对上时只用该学科的图谱，
+    避免跨学科 0.55 模糊阈值把不相关概念误配成依赖边。"""
     points = [p["point"] for p in db.list_mastery(space_id)]
     if not points:
         return 0
     cache: dict = {}
     edges = []
     seen = set()
-    for info in list_curriculums():
+    curriculums = list_curriculums()
+    space_name = (db.get_space(space_id) or {}).get("name") or ""
+    if space_name:
+        import difflib
+        matched = [c for c in curriculums
+                   if difflib.SequenceMatcher(None, c["course"], space_name).ratio() >= 0.4
+                   or c["course"] in space_name or space_name in c["course"]]
+        if matched:
+            curriculums = matched
+    for info in curriculums:
         data = load_curriculum(info["file"])
         for con in data.get("concepts", []):
             to = _match_point(con.get("point", ""), points, cache)
@@ -144,7 +156,8 @@ def diagnose(space_id: str) -> dict:
         ups = [u for u in prereqs.get(name, []) if u in eff]
         inherited = (1.0 - min(eff[u] for u in ups)) if ups else 0.0
         p_known = p["score"]
-        retention = db.estimate_retention(p_known, p["box"], p["updated_at"], t)
+        retention = db.estimate_retention(p_known, p["box"], p["updated_at"], t,
+                                          p.get("stability") or 0.0, p.get("last_review") or 0.0)
         risk = 1.0 - p_known * (1 - _PREREQ_CONTAGION * inherited)
         weak_ups = [{"point": u, "p_known": by_name[u]["score"], "status": by_name[u]["status"],
                      "eff": round(eff[u], 3)} for u in ups if eff[u] < 0.75]

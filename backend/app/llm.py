@@ -19,9 +19,8 @@ import httpx
 
 from .config import settings
 
-# 模型已缓存本地后无需联网校验，避免网络问题拖慢嵌入
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# 嵌入模型的离线开关延后到首次加载时决定（见 _configure_embed_offline）：
+# 新环境模型还没缓存时不能强制离线，否则下载被禁、聊天/出题/索引全瘫痪
 
 # 任务权重：auto 策略下这些任务优先走云端（重推理、长输出、结构化生成）
 HEAVY_TASKS = {"quiz", "grade", "analyze", "plan", "extract"}
@@ -89,6 +88,9 @@ def _save_runtime_config() -> None:
 def update_runtime_config(cloud_base_url: str | None = None, cloud_api_key: str | None = None,
                           cloud_model: str | None = None, routing: str | None = None) -> None:
     _ensure_runtime()
+    if routing is not None and routing not in ("local", "auto", "cloud"):
+        # 先整体校验再动手，避免非法 routing 导致前序字段改了内存却没落盘
+        raise ValueError("routing 必须是 local / auto / cloud")
     with _cfg_lock:
         if cloud_base_url is not None:
             _runtime["cloud_base_url"] = cloud_base_url.strip()
@@ -97,8 +99,6 @@ def update_runtime_config(cloud_base_url: str | None = None, cloud_api_key: str 
         if cloud_model is not None:
             _runtime["cloud_model"] = cloud_model.strip()
         if routing is not None:
-            if routing not in ("local", "auto", "cloud"):
-                raise ValueError("routing 必须是 local / auto / cloud")
             _runtime["routing"] = routing
         _save_runtime_config()
         for client in _clients.values():
@@ -148,6 +148,14 @@ def _pick_profile(task: str) -> str:
     return "local"
 
 
+def _fallback_order(primary: str) -> list[str]:
+    """通道尝试顺序。routing=local 是用户明确的"全部本地"承诺，
+    失败也绝不能把请求（含对话内容）发往云端；cloud/auto 保持自动回退。"""
+    if _routing() == "local":
+        return ["local"]
+    return [primary] + [p for p in ("local", "cloud") if p != primary]
+
+
 def _get_client(profile: str) -> httpx.Client:
     with _cfg_lock:
         client = _clients.get(profile)
@@ -181,9 +189,8 @@ def _strip_think(text: str) -> str:
 
 def chat(messages: list[dict], temperature: float = 0.6, max_tokens: int = 2048,
          task: str = "chat") -> str:
-    """带通道路由与回退的补全：首选通道失败时自动回退本地。"""
-    primary = _pick_profile(task)
-    order = [primary] + [p for p in ("local", "cloud") if p != primary]
+    """带通道路由与回退的补全：首选通道失败时自动回退（routing=local 时只用本地）。"""
+    order = _fallback_order(_pick_profile(task))
     last_err: Exception | None = None
     for profile in order:
         try:
@@ -203,18 +210,60 @@ def chat(messages: list[dict], temperature: float = 0.6, max_tokens: int = 2048,
     raise RuntimeError(f"LLM 调用失败（本地/云端均不可用）: {last_err}") from last_err
 
 
+class _ThinkFilter:
+    """跨 chunk 剥离 <think>…</think> 段（标签可能被切分在任意 delta 边界）。"""
+
+    _OPEN, _CLOSE = "<think>", "</think>"
+
+    def __init__(self):
+        self.in_think = False
+        self.tail = ""  # 末尾可能是被切断的半个标签，留到下个 chunk 再判
+
+    def feed(self, delta: str) -> str:
+        buf = self.tail + delta
+        self.tail = ""
+        out: list[str] = []
+        while buf:
+            tag = self._CLOSE if self.in_think else self._OPEN
+            i = buf.find(tag)
+            if i != -1:
+                if not self.in_think:
+                    out.append(buf[:i])
+                buf = buf[i + len(tag):]
+                self.in_think = not self.in_think
+                continue
+            # 没有完整标签：末尾若是标签前缀则留下次拼接，其余立即输出/丢弃
+            keep = 0
+            for k in range(min(len(buf), len(tag) - 1), 0, -1):
+                if tag.startswith(buf[-k:]):
+                    keep = k
+                    break
+            if keep:
+                self.tail = buf[-keep:]
+                buf = buf[:-keep]
+            if not self.in_think and buf:
+                out.append(buf)
+            buf = ""
+        return "".join(out)
+
+    def flush(self) -> str:
+        rest, self.tail = self.tail, ""
+        return "" if self.in_think else rest
+
+
 def chat_stream(messages: list[dict], temperature: float = 0.6, max_tokens: int = 2048,
                 task: str = "chat") -> Iterator[str]:
-    """流式补全：云端连接在出首个字节前失败时回退本地。"""
-    primary = _pick_profile(task)
-    order = [primary] + [p for p in ("local", "cloud") if p != primary]
+    """流式补全：出首个可见内容前失败时回退备用通道；已开始输出后失败直接抛错，
+    避免换通道重发导致回答前半截重复拼接。"""
+    order = _fallback_order(_pick_profile(task))
     last_err: Exception | None = None
     for profile in order:
+        filt = _ThinkFilter()
+        emitted = False
         try:
             body = {"model": _model_of(profile), "messages": messages, "temperature": temperature,
                     "stream": True, "max_tokens": max_tokens}
             client = _get_client(profile)
-            in_think = False
             with client.stream("POST", "/chat/completions", json=body) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
@@ -229,15 +278,19 @@ def chat_stream(messages: list[dict], temperature: float = 0.6, max_tokens: int 
                         continue
                     if not delta:
                         continue
-                    if "<think>" in delta:
-                        in_think = True
-                    if "</think>" in delta:
-                        in_think = False
-                        continue
-                    if not in_think:
-                        yield delta
+                    piece = filt.feed(delta)
+                    if piece:
+                        emitted = True
+                        yield piece
+                tail = filt.flush()
+                if tail:
+                    yield tail
+                if not emitted and not tail:
+                    raise ValueError("模型未返回可见内容（thinking 段未闭合或输出为空）")
                 return
         except Exception as e:
+            if emitted:
+                raise  # 前半段已发给用户，重发只会拼接出重复内容
             last_err = e
             if profile == order[-1]:
                 break
@@ -265,7 +318,13 @@ def chat_json(messages: list[dict], temperature: float = 0.4, max_tokens: int = 
 
 
 def _extract_json(raw: str):
-    for open_ch, close_ch in (("[", "]"), ("{", "}")):
+    # 优先整体解析，再按 {} -> [] 截取：对象里常嵌套数组（如 {"missed":[],"wrong":[]}），
+    # 若先截 [] 会把内层数组误当解析结果返回，调用方拿到的类型就错了
+    try:
+        return json.loads(raw.strip())
+    except ValueError:
+        pass
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
         start = raw.find(open_ch)
         end = raw.rfind(close_ch)
         if start != -1 and end > start:
@@ -274,6 +333,39 @@ def _extract_json(raw: str):
             except ValueError:
                 continue
     return None
+
+
+def _configure_embed_offline() -> None:
+    """嵌入模型已在本地（目录或 HF 缓存）时才强制离线，避免每次加载联网校验拖慢；
+    未缓存的新环境保持在线以便首次下载。"""
+    model = settings.embed_model
+    cached = os.path.isdir(model)
+    if not cached:
+        try:
+            from huggingface_hub import snapshot_download
+            try:
+                snapshot_download(model, local_files_only=True)
+                cached = True
+            except Exception:
+                cached = False
+        except ImportError:
+            cached = False
+    if cached:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        # HF 库的 constants 在 import 时固化环境变量；若此刻库已被加载（如测试进程、
+        # 懒加载晚于首轮 import），改环境变量无效，直接改常量兜底，
+        # 否则断网/证书异常环境下每个配置文件都要吃 5 次退避重试（首聊卡 2-3 分钟）
+        try:
+            import huggingface_hub.constants as _hf_constants
+            _hf_constants.HF_HUB_OFFLINE = True
+        except Exception:
+            pass
+
+
+# 在本模块被 import 时（早于任何 sentence_transformers/transformers 导入）先判定缓存，
+# 让 HF_HUB_OFFLINE 在 HF 库首次加载前生效
+_configure_embed_offline()
 
 
 def embed(texts: list[str]) -> list[list[float]]:
@@ -286,6 +378,7 @@ _emb_model = None
 
 class Embedder:
     def __init__(self):
+        _configure_embed_offline()
         from sentence_transformers import SentenceTransformer
         global _emb_model
         with _emb_lock:

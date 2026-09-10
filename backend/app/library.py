@@ -10,6 +10,7 @@
 并经 realpath 前缀包含校验的路径，杜绝目录逃逸。
 """
 import ipaddress
+import json
 import os
 import shutil
 import socket
@@ -19,6 +20,7 @@ import urllib.request
 
 from . import db, ingest, rag
 from .config import settings
+from .library_example import SEED_BOOKS_EXAMPLE
 
 ALLOWED_EXT = ingest.UPLOAD_EXTS  # PDF/PPTX/TXT/Markdown/图片/zip
 MAX_BOOK_BYTES = 300 * 1024 * 1024  # 单本上限 300MB
@@ -272,18 +274,40 @@ SEED_BOOKS = [
     dict(title="肖秀荣精讲精练 + 1000 题 / 肖四肖八", author="肖秀荣", subject="考研公共课",
          publisher="—", status="catalog",
          note="2028.07 起集中备考；需自备正版文件导入"),
+    # ---- 示例大学·机械工程学院培养方案配套（按官网课程映射的 catalog 条目） ----
+    *SEED_BOOKS_EXAMPLE,
 ]
 
 
+def _deleted_presets() -> list:
+    try:
+        return json.loads(db.get_meta("library_deleted_presets") or "[]")
+    except ValueError:
+        return []
+
+
 def seed() -> int:
-    """幂等预置书目：按标题去重。"""
+    """幂等预置书目：按标题去重；用户主动删除过的预置书不再复活。"""
+    deleted = _deleted_presets()
     n = 0
     for b in SEED_BOOKS:
-        if db.find_book_by_title(b["title"]):
+        if b["title"] in deleted or db.find_book_by_title(b["title"]):
             continue
         db.add_book(**b)
         n += 1
     return n
+
+
+def delete_book(bid: str) -> dict:
+    """删除书目（含挂载文档/向量/文件）。预置书目记录删除标记，重启后不再重新预置。"""
+    book = db.get_book(bid)
+    db.delete_book(bid)
+    if book and any(b["title"] == book["title"] for b in SEED_BOOKS):
+        deleted = _deleted_presets()
+        if book["title"] not in deleted:
+            deleted.append(book["title"])
+            db.set_meta("library_deleted_presets", json.dumps(deleted, ensure_ascii=False))
+    return {"ok": True}
 
 
 # ---------- 上传登记 ----------
@@ -293,13 +317,12 @@ def register_upload(title: str, ext: str, src_fileobj) -> str:
 
     前端用文件夹选择器（webkitdirectory）批量选中文件逐个上传，
     服务端不接触任何用户提供的文件系统路径。
+    同名上传一律新建条目而非静默丢弃——旧版本直接返回已有 id，导致
+    用户上传修订版时以为替换成功，实际 RAG 一直用旧文件。重复条目可自行删除。
     """
     ext = ext.lower()
     if ext not in ALLOWED_EXT:
         raise ValueError("仅支持 PDF / TXT / Markdown / PPTX / 图片 / zip（老版 .ppt 请先另存为 .pptx）")
-    existing = db.find_book_by_title(title)
-    if existing:
-        return existing["id"]
     f, dst = _new_book_file(ext)
     with f:
         shutil.copyfileobj(src_fileobj, f)
@@ -328,10 +351,7 @@ def register_zip(title: str, src_fileobj) -> list[dict]:
     out = []
     for name, path in members:
         btitle = os.path.splitext(name)[0][:100]
-        existing = db.find_book_by_title(btitle)
-        if existing:
-            out.append({"id": existing["id"], "title": btitle, "status": "existing"})
-            continue
+        # 同名成员也一律新建（不再静默跳过）；文件夹/压缩包批量导入的重复可自行删除
         bid = db.add_book(title=btitle, subject="我的教材", status="local", path=path,
                           note=f"来自压缩包「{title[:60]}」")
         out.append({"id": bid, "title": btitle, "status": "local"})
@@ -384,11 +404,20 @@ def fetch_pdf(bid: str) -> dict:
     except Exception as e:
         if os.path.exists(dst):
             os.remove(dst)
-        db.update_book_file(bid, status="external", error=str(e)[:300])
+        # 已下载到本地的书目重试失败时保持 local 状态与文件记录，只记错误；
+        # 不能把 path 清空（否则本地文件成孤儿、attach 直接不可用）
+        cur = db.get_book(bid) or {}
+        if cur.get("status") == "local" and cur.get("path"):
+            db.update_book_file(bid, status="local", path=cur["path"],
+                                error=f"重试下载失败: {str(e)[:200]}")
+        else:
+            db.update_book_file(bid, status="external", error=str(e)[:300])
         raise ValueError(f"下载失败（官方源可能需要代理）: {e}") from e
     if total < 1024:
         os.remove(dst)
-        db.update_book_file(bid, status="external", error="下载内容过小，疑似非 PDF")
+        cur = db.get_book(bid) or {}
+        if not (cur.get("status") == "local" and cur.get("path")):
+            db.update_book_file(bid, status="external", error="下载内容过小，疑似非 PDF")
         raise ValueError("下载内容过小，疑似非 PDF")
     db.update_book_file(bid, status="local", path=dst, error="")
     return {"id": bid, "status": "local", "bytes": total}
@@ -449,9 +478,15 @@ def import_url(url: str, title: str = "") -> dict:
     """抓取公开网页正文，存为 local 书目（可像教材一样挂载到空间参与 RAG）。"""
     url = _safe_url(url.strip())
     req = urllib.request.Request(url, headers={"User-Agent": "StudyPilot/0.1 (local study assistant)"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        ctype = (resp.headers.get("Content-Type") or "").lower()
-        raw = resp.read(MAX_PAGE_BYTES + 1)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            raw = resp.read(MAX_PAGE_BYTES + 1)
+    except ValueError:
+        raise  # _safe_url 的 SSRF 校验拒绝，保持原语义
+    except Exception as e:
+        # DNS 失败/超时/拒连等网络异常不是 ValueError，不接住会裸 500
+        raise ValueError(f"网页抓取失败（检查网络或地址）：{str(e)[:200]}") from e
     if len(raw) > MAX_PAGE_BYTES:
         raise ValueError("网页超过 5MB 上限")
     if "pdf" in ctype or raw[:4] == b"%PDF":
@@ -474,9 +509,9 @@ def import_url(url: str, title: str = "") -> dict:
     if len(text.strip()) < 50:
         raise ValueError("未能抽取到有效正文（页面可能是纯脚本渲染）")
     name = (title or page_title or urllib.parse.urlparse(url).netloc).strip()[:100]
-    existing = db.find_book_by_title(f"网页：{name}")
-    if existing:
-        raise ValueError(f"该网页已在书库：《{name}》，请勿重复导入")
+    # 按 URL 判重（同标题不同页是两篇内容；同 URL 换标题重复剪藏才是真重复）
+    if db.find_book_by_url(url):
+        raise ValueError(f"该网页已在书库（URL 相同）：《{name}》")
     f, dst = _new_book_file(".txt")
     with f:
         f.write(f"来源: {url}\n\n{text}".encode("utf-8"))
@@ -514,6 +549,8 @@ def attach(bid: str, space_id: str) -> dict:
     try:
         n = rag.index_document(space_id, did)
     except Exception as e:
+        # 只回滚文档记录，不删文件（该路径是书库文件本身，可能被多个空间的挂载共享）
+        db.delete_document(did, remove_file=False)
         raise ValueError(f"索引失败: {e}") from e
     db.add_book_document(bid, space_id, did)
     return {"document_id": did, "status": "ready", "chunks": n}

@@ -35,9 +35,15 @@ function App() {
   const [dueCount, setDueCount] = useState(0)
 
   const refreshSpaces = () => api.listSpaces().then(setSpaces).catch(() => {})
+  const refreshHealth = () => api.health().then(setHealth).catch(() => setHealth({ llm: false, model: '未连接' }))
   useEffect(() => {
     refreshSpaces()
-    api.health().then(setHealth).catch(() => setHealth({ llm: false, model: '未连接' }))
+    refreshHealth()
+    // 先开应用后启动 llama-server 是常见顺序：健康状态定期复查，不再只在启动时查一次
+    const t = setInterval(refreshHealth, 60 * 1000)
+    const onVis = () => { if (document.visibilityState === 'visible') refreshHealth() }
+    document.addEventListener('visibilitychange', onVis)
+    return () => { clearInterval(t); document.removeEventListener('visibilitychange', onVis) }
   }, [])
 
   // 到期复习提醒：切空间/每 5 分钟检查一次，到期数变化时尝试系统通知
@@ -58,6 +64,14 @@ function App() {
     const t = setInterval(check, 5 * 60 * 1000)
     return () => { stop = true; clearInterval(t) }
   }, [sid])
+
+  const enableNotifications = async () => {
+    if (!('Notification' in window)) { alert('当前环境不支持系统通知'); return }
+    const p = await Notification.requestPermission()
+    if (p === 'granted') {
+      try { new Notification('StudyPilot 复习提醒已开启', { body: '知识点到期时会在这里提醒你' }) } catch { /* 忽略 */ }
+    }
+  }
 
   const newSpace = async () => {
     const name = prompt('课程空间名称（如：清华普通物理）')
@@ -141,8 +155,13 @@ function App() {
             <div className="card" style={{ margin: '14px 18px 0', padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12, borderColor: 'var(--orange)' }}>
               <span className="badge expert">⏰ 间隔复习</span>
               <b>{dueCount} 个知识点到了复习时间</b>
-              <span className="sub">按 Leitner 记忆曲线，现在复习留存率最高</span>
+              <span className="sub">按 FSRS 记忆曲线，现在复习留存率最高</span>
               <div style={{ flex: 1 }} />
+              {'Notification' in window && Notification.permission === 'default' && (
+                <button className="btn small" onClick={enableNotifications} title="授权系统通知后，到期提醒可在应用外弹出">
+                  🔔 开启系统通知
+                </button>
+              )}
               <button className="btn small" onClick={() => setTab('today')}>去看今日清单</button>
             </div>
           )}
@@ -326,6 +345,16 @@ function ChatView({ sid }: { sid: string }) {
     if (!text || busy) return
     setInput(''); setNote(''); setBusy(true)
     setMsgs((m) => [...m, { role: 'user', mode, content: text }, { role: 'assistant', mode, content: '' }])
+    const fail = (msg: string) => {
+      setBusy(false)
+      setMsgs((m) => {
+        const copy = [...m]
+        // 失败时移除空的助手占位气泡，保留用户提问（服务端已先落库）
+        if (copy.length && copy[copy.length - 1].role === 'assistant' && !copy[copy.length - 1].content) copy.pop()
+        return copy
+      })
+      alert(msg)
+    }
     chatStream(sid, mode, text,
       (t) => setMsgs((m) => {
         const copy = [...m]; copy[copy.length - 1] = { ...copy[copy.length - 1], content: copy[copy.length - 1].content + t }
@@ -339,6 +368,7 @@ function ChatView({ sid }: { sid: string }) {
         })
       },
       guide,
+      fail,
     )
   }
 
@@ -347,8 +377,13 @@ function ChatView({ sid }: { sid: string }) {
     if (understood === 0) {
       confusion = prompt('哪里没懂？描述一下可以帮助教更准地记住薄弱点（可留空）') || ''
     }
-    setFbGiven((f) => ({ ...f, [mid]: understood === 1 ? 'helpful' : 'unhelpful' }))
-    try { await api.sendFeedback(sid, mid, rating, understood, confusion) } catch { /* 反馈失败不打断学习 */ }
+    try {
+      await api.sendFeedback(sid, mid, rating, understood, confusion)
+      setFbGiven((f) => ({ ...f, [mid]: understood === 1 ? 'helpful' : 'unhelpful' }))
+    } catch (e: any) {
+      // 提交失败必须让用户知道：负反馈驱动掌握度更新，静默丢反馈=数据丢失
+      alert('反馈提交失败：' + (e.message || '未知错误'))
+    }
   }
 
   const makeNote = async () => {
@@ -456,6 +491,19 @@ function ChatView({ sid }: { sid: string }) {
   )
 }
 
+// 间隔秒数 → 人话（FSRS 刷卡按钮的间隔预告用）
+function fmtInterval(sec?: number): string {
+  if (!sec || sec <= 0) return ''
+  const m = sec / 60
+  if (m < 60) return `${Math.max(1, Math.round(m))}分钟`
+  const h = m / 60
+  if (h < 24) return `${Math.round(h)}小时`
+  const d = h / 24
+  if (d < 31) return `${Math.round(d)}天`
+  if (d < 365) return `${(d / 30.4).toFixed(1)}个月`
+  return `${(d / 365).toFixed(1)}年`
+}
+
 function CardsView({ sid }: { sid: string }) {
   const [cards, setCards] = useState<Flashcard[]>([])
   const [stats, setStats] = useState<{ total: number; due: number }>({ total: 0, due: 0 })
@@ -471,8 +519,9 @@ function CardsView({ sid }: { sid: string }) {
   ]).then(([dueRes, all]) => {
     setCards(dueRes.cards); setStats(all.stats)
     setCur(dueRes.cards[0] || null); setRevealed(false)
-  }).finally(() => setLoaded(true))
-  useEffect(() => { refresh() }, [sid])
+  }).catch(() => alert('闪卡加载失败，请检查服务是否正常'))
+    .finally(() => setLoaded(true))
+  useEffect(() => { refresh() }, [sid]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const generate = async () => {
     setBusy(true)
@@ -484,9 +533,18 @@ function CardsView({ sid }: { sid: string }) {
     setBusy(false)
   }
 
-  const grade = async (know: boolean) => {
+  const clearAll = async () => {
+    if (!stats.total) return
+    if (!confirm(`清空全部 ${stats.total} 张闪卡？此操作不可恢复。`)) return
+    try {
+      await api.clearFlashcards(sid)
+      await refresh()
+    } catch (e: any) { alert('清空失败：' + (e.message || '未知错误')) }
+  }
+
+  const grade = async (rating: number) => {
     if (!cur) return
-    try { await api.gradeFlashcard(sid, cur.id, know) } catch { /* 单卡评分失败不阻塞 */ }
+    try { await api.gradeFlashcard(sid, cur.id, rating) } catch { /* 单卡评分失败不阻塞 */ }
     refresh()
   }
 
@@ -495,7 +553,8 @@ function CardsView({ sid }: { sid: string }) {
       <div className="card" style={{ marginBottom: 18 }}>
         <h3>闪卡 · 间隔记忆</h3>
         <p className="sub">
-          从讲义生成问答卡，按 Leitner 记忆盒调度：记得 → 间隔翻倍；忘了 → 10 分钟后重现。
+          从讲义生成问答卡，按 FSRS 记忆算法调度间隔（目标记住率 90%，随你的评分历史自适应）：
+          新卡先经分钟级学习步进，答对毕业进入天级间隔，答错很快重现。
           不填主题时自动优先覆盖薄弱知识点。
         </p>
         <div style={{ display: 'flex', gap: 12, marginTop: 12, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -505,6 +564,11 @@ function CardsView({ sid }: { sid: string }) {
           </button>
           <span className="badge">共 {stats.total} 张</span>
           <span className={`badge ${stats.due > 0 ? 'expert' : ''}`}>待复习 {stats.due}</span>
+          {stats.total > 0 && (
+            <button className="btn danger small" onClick={clearAll} style={{ flex: 'none' }}>
+              <Icon name="trash" size={12} /> 清空闪卡
+            </button>
+          )}
         </div>
       </div>
 
@@ -517,9 +581,11 @@ function CardsView({ sid }: { sid: string }) {
           {revealed ? (
             <>
               <div className="md" style={{ fontSize: 15, margin: '0 auto 22px', maxWidth: 560, color: 'var(--green)' }}><Md>{cur.back}</Md></div>
-              <div style={{ display: 'flex', gap: 14, justifyContent: 'center' }}>
-                <button className="btn" onClick={() => grade(true)}>😮 记得（间隔加长）</button>
-                <button className="btn ghost" onClick={() => grade(false)}>😰 忘了（10 分钟后重现）</button>
+              <div style={{ display: 'flex', gap: 10, justifyContent: 'center', flexWrap: 'wrap' }}>
+                <button className="btn danger small" onClick={() => grade(1)}>😰 忘了 · {fmtInterval(cur.preview?.['1'])}</button>
+                <button className="btn ghost small" onClick={() => grade(2)}>😖 困难 · {fmtInterval(cur.preview?.['2'])}</button>
+                <button className="btn small" onClick={() => grade(3)}>🙂 良好 · {fmtInterval(cur.preview?.['3'])}</button>
+                <button className="btn small" onClick={() => grade(4)}>😎 轻松 · {fmtInterval(cur.preview?.['4'])}</button>
               </div>
             </>
           ) : (
@@ -556,7 +622,9 @@ function PlanView({ sid }: { sid: string }) {
   }
 
   const toggle = async (t: PlanTask) => {
-    await api.togglePlanTask(sid, t.id, !t.done)
+    try {
+      await api.togglePlanTask(sid, t.id, !t.done)
+    } catch (e: any) { alert('打卡失败：' + (e.message || '未知错误')) }
     refresh()
   }
 
@@ -624,8 +692,8 @@ function PlanView({ sid }: { sid: string }) {
 function DocsView({ sid }: { sid: string }) {
   const [docs, setDocs] = useState<Doc[]>([])
   const [busy, setBusy] = useState(false)
-  const refresh = () => api.listDocs(sid).then(setDocs)
-  useEffect(() => { refresh() }, [sid])
+  const refresh = () => api.listDocs(sid).then(setDocs).catch(() => setDocs([]))
+  useEffect(() => { refresh() }, [sid]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const upload = async (files: FileList | null) => {
     if (!files?.length) return
@@ -646,6 +714,14 @@ function DocsView({ sid }: { sid: string }) {
     if (errors.length) alert(`导入完成：成功 ${ok} 个\n失败：\n${errors.join('\n')}`)
   }
 
+  const removeDoc = async (d: Doc) => {
+    if (!confirm(`删除文档《${d.filename}》？\n向量与其上传文件会一并清理；若是挂载的教材，将解除该空间的挂载（书库条目保留）。`)) return
+    try {
+      await api.deleteDoc(sid, d.id)
+      refresh()
+    } catch (e: any) { alert('删除失败：' + (e.message || '未知错误')) }
+  }
+
   return (
     <div className="content">
       <div className="card">
@@ -664,7 +740,7 @@ function DocsView({ sid }: { sid: string }) {
           {busy && <span className="sub"><span className="spin" /> 正在解析并向量化…（首次运行会下载嵌入模型）</span>}
         </div>
         <table className="quiz" style={{ marginTop: 12 }}>
-          <thead><tr><th>文件</th><th>状态</th><th>分块</th><th>错误</th></tr></thead>
+          <thead><tr><th>文件</th><th>状态</th><th>分块</th><th>错误</th><th></th></tr></thead>
           <tbody>
             {docs.map((d) => (
               <tr key={d.id}>
@@ -672,6 +748,9 @@ function DocsView({ sid }: { sid: string }) {
                 <td>{d.status === 'ready' ? <span className="status-ok">✓ 已索引</span> : d.status === 'error' ? <span className="status-err">✗ 失败</span> : <span className="status-wait"><span className="spin" /> 处理中</span>}</td>
                 <td>{d.chunks}</td>
                 <td style={{ color: 'var(--red)' }}>{d.error}</td>
+                <td>
+                  <button className="btn danger small" onClick={() => removeDoc(d)}>删除</button>
+                </td>
               </tr>
             ))}
           </tbody>
@@ -687,24 +766,33 @@ function QuizView({ sid }: { sid: string }) {
   const [busy, setBusy] = useState(false)
   const [userAnswers, setUserAnswers] = useState<Record<string, Record<string, string>>>({})
   const [sub, setSub] = useState<'practice' | 'wrong' | 'teach'>('practice')
-  const [examStarts, setExamStarts] = useState<Record<string, number>>({})
   const [now, setNow] = useState(Date.now())
   const refresh = () => api.quizzes(sid).then(setQuizzes)
-  useEffect(() => { refresh(); setSub('practice') }, [sid])
+  useEffect(() => { refresh(); setSub('practice') }, [sid]) // eslint-disable-line react-hooks/exhaustive-deps
   const examLive = quizzes.filter((q) => q.topic === '模拟考试' && !q.answers.length)
+  // 限时起点/时长持久化到 localStorage：切页/刷新不再重置倒计时；时间到自动交卷
   useEffect(() => {
     examLive.forEach((q) => {
-      if (!examStarts[q.id]) setExamStarts((s) => ({ ...s, [q.id]: Date.now() }))
+      if (!localStorage.getItem(`exam_start_${q.id}`)) {
+        localStorage.setItem(`exam_start_${q.id}`, String(Date.now()))
+      }
     })
     if (!examLive.length) return
     const t = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(t)
   }, [quizzes]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  const examMinutes = (quizId: string) => Number(localStorage.getItem(`exam_minutes_${quizId}`)) || 30
+
   const generate = async (skill: string, params: object) => {
     setBusy(true)
     try {
-      await api.runSkill(sid, skill, params)
+      const r: any = await api.runSkill(sid, skill, params)
+      // 记下本场考试的限时，供倒计时与自动交卷使用（后端 exam_minutes 字段此前被忽略）
+      const made = Array.isArray(r) ? r[0] : r
+      if (skill === 'exam.mock' && made?.quiz_id) {
+        localStorage.setItem(`exam_minutes_${made.quiz_id}`, String(made.exam_minutes || 30))
+      }
       await refresh(); setSub('practice')
     } catch (e: any) { alert(e.message) }
     setBusy(false)
@@ -715,16 +803,28 @@ function QuizView({ sid }: { sid: string }) {
     setBusy(true)
     try {
       await api.runSkill(sid, 'quiz.grade', { quiz_id: quiz.id, answers })
+      localStorage.removeItem(`exam_start_${quiz.id}`)
+      localStorage.removeItem(`exam_minutes_${quiz.id}`)
       await refresh()
     } catch (e: any) { alert(e.message) }
     setBusy(false)
   }
 
   const examRemaining = (quiz: QuizRecord) => {
-    const start = examStarts[quiz.id]
-    if (!start) return 30 * 60
-    return 30 * 60 - Math.floor((now - start) / 1000)
+    const start = Number(localStorage.getItem(`exam_start_${quiz.id}`)) || Date.now()
+    return examMinutes(quiz.id) * 60 - Math.floor((now - start) / 1000)
   }
+
+  // 到时自动交卷（此前只提示不禁用，可以无限续时作答）
+  useEffect(() => {
+    if (busy) return
+    for (const q of examLive) {
+      if (examRemaining(q) <= 0) {
+        const quiz = quizzes.find((x) => x.id === q.id)
+        if (quiz) { submit(quiz); break }
+      }
+    }
+  }, [now]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // 已判卷测验的知识点小结：每点对几题
   const pointSummary = (quiz: QuizRecord) => {
@@ -856,8 +956,10 @@ function WrongBook({ sid, onRedone }: { sid: string; onRedone: () => void }) {
   const variants = async (qids?: string[]) => {
     setBusy(true)
     try {
-      const r = await api.runSkill(sid, 'wrong.variants', { qids: qids || [] })
-      alert(`已生成 ${r.variant_count} 道变式题（同知识点换数字/换情境/换问法），请到「练习」页作答`)
+      const r: any = await api.runSkill(sid, 'wrong.variants', { qids: qids || [] })
+      // 该技能返回数组（每卷一项），取第一项读 variant_count
+      const made = Array.isArray(r) ? r[0] : r
+      alert(`已生成 ${made?.variant_count ?? '?'} 道变式题（同知识点换数字/换情境/换问法），请到「练习」页作答`)
       onRedone()
     } catch (e: any) { alert(e.message) }
     setBusy(false)
@@ -1236,11 +1338,11 @@ function MemoryView({ sid, onGoto }: { sid: string; onGoto: (t: Tab) => void }) 
   const [history, setHistory] = useState<MasteryHistoryPoint[]>([])
   const [busy, setBusy] = useState(false)
   const refresh = () => {
-    api.memory(sid).then(setMem)
+    api.memory(sid).then(setMem).catch(() => setMem({ l1_count: 0, l2: [], l3: [] }))
     api.mastery(sid).then(setMastery).catch(() => {})
     api.masteryHistory(sid).then(setHistory).catch(() => {})
   }
-  useEffect(() => { refresh() }, [sid])
+  useEffect(() => { refresh() }, [sid]) // eslint-disable-line react-hooks/exhaustive-deps
   if (!mem) return <div className="empty"><span className="spin" /> 加载中…</div>
 
   const makeReview = async () => {
@@ -1350,7 +1452,13 @@ function MemoryView({ sid, onGoto }: { sid: string; onGoto: (t: Tab) => void }) 
                 </div>
               ))}
             </div>
-            <button className="btn ghost small" style={{ marginTop: 14 }} onClick={async () => { await api.clearMemory(sid, 3); refresh() }}>
+            <button className="btn ghost small" style={{ marginTop: 14 }} onClick={async () => {
+              // 一键永久删除全部长期学习档案（错题沉淀/薄弱点），必须有二次确认
+              if (!confirm('清空 L3 长期档案？错题沉淀与薄弱点记录将永久删除，且不可恢复。')) return
+              try {
+                await api.clearMemory(sid, 3); refresh()
+              } catch (e: any) { alert('清空失败：' + (e.message || '未知错误')) }
+            }}>
               <Icon name="trash" size={12} /> 清空 L3 档案
             </button>
           </div>
@@ -1383,9 +1491,17 @@ function LibraryView({ spaces, currentSid }: { spaces: Space[]; currentSid: stri
   const [busy, setBusy] = useState('')
   const [done, setDone] = useState(0)
   const [pageUrl, setPageUrl] = useState('')
+  const [mounted, setMounted] = useState<Record<string, string[]>>({})
   const refresh = () => {
-    api.library(query, subject).then(setBooks)
-    api.librarySubjects().then(setSubjects)
+    api.library(query, subject).then(async (bs) => {
+      setBooks(bs)
+      // 每本书已挂载到哪些课程空间：本地书目可能有挂载，外部/仅书目必然为空
+      const entries = await Promise.all(bs.map(async (b) => {
+        try { return [b.id, (await api.bookSpaces(b.id)).map((s) => s.name)] as const } catch { return [b.id, []] as const }
+      }))
+      setMounted(Object.fromEntries(entries))
+    }).catch(() => setBooks([]))
+    api.librarySubjects().then(setSubjects).catch(() => {})
   }
   useEffect(() => { refresh() }, [query, subject]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1393,9 +1509,10 @@ function LibraryView({ spaces, currentSid }: { spaces: Space[]; currentSid: stri
     if (!files?.length) return
     setBusy(tag); setDone(0)
     let ok = 0
+    let skipped = 0
     for (const f of Array.from(files)) {
       const low = f.name.toLowerCase()
-      if (!['.pdf', '.pptx', '.txt', '.md', '.markdown', '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.zip'].some((ext) => low.endsWith(ext))) continue
+      if (!['.pdf', '.pptx', '.txt', '.md', '.markdown', '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.zip'].some((ext) => low.endsWith(ext))) { skipped++; continue }
       try {
         const r: any = await api.uploadBook(f)
         if (r.batch) ok += r.batch.length
@@ -1405,6 +1522,7 @@ function LibraryView({ spaces, currentSid }: { spaces: Space[]; currentSid: stri
     }
     setBusy(''); refresh()
     if (ok) alert(`已入库 ${ok} 本教材，可在「挂载到空间」后用于答疑引用`)
+    else if (skipped) alert(`没有可导入的文件（跳过了 ${skipped} 个不支持的文件）\n支持：PDF / PPTX / TXT / Markdown / 图片 / zip`)
   }
 
   const fetchPdf = async (b: Book) => {
@@ -1435,6 +1553,9 @@ function LibraryView({ spaces, currentSid }: { spaces: Space[]; currentSid: stri
       sid = spaces[idx - 1]?.id
     }
     if (!sid) return
+    // 明确告知挂到哪个空间，避免"随手点挂载、书进了自己遗忘的旧空间"
+    const target = spaces.find((s) => s.id === sid)
+    if (!confirm(`将《${b.title}》挂载到课程空间「${target?.name || sid}」？`)) return
     setBusy(b.id)
     try {
       const r = await api.attachBook(b.id, sid)
@@ -1444,8 +1565,10 @@ function LibraryView({ spaces, currentSid }: { spaces: Space[]; currentSid: stri
   }
 
   const remove = async (b: Book) => {
-    if (!confirm(`从书库移除《${b.title}》？（不影响已挂载空间的索引）`)) return
-    await api.deleteBook(b.id); refresh()
+    if (!confirm(`从书库移除《${b.title}》？\n各空间中该书的挂载索引与已下载文件会一并清理（预置书目删除后不会再自动恢复）。`)) return
+    try {
+      await api.deleteBook(b.id); refresh()
+    } catch (e: any) { alert('删除失败：' + (e.message || '未知错误')) }
   }
 
   const statusBadge = (b: Book) => b.status === 'local'
@@ -1509,6 +1632,11 @@ function LibraryView({ spaces, currentSid }: { spaces: Space[]; currentSid: stri
                 <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 3 }}>
                   {b.author}{b.publisher && b.publisher !== '—' ? ` · ${b.publisher}` : ''}
                 </div>
+                {mounted[b.id]?.length ? (
+                  <div className="sub" style={{ fontSize: 12, marginTop: 3, color: 'var(--green)' }}>
+                    已挂载：{mounted[b.id].join('、')}
+                  </div>
+                ) : null}
               </td>
               <td><span className="badge">{b.subject}</span></td>
               <td>{statusBadge(b)}{b.error && <div style={{ color: 'var(--red)', fontSize: 11 }}>{b.error}</div>}</td>
@@ -1559,11 +1687,14 @@ function ProfileView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSpace: (i
     api.schools().then(setSchoolList).catch(() => {})
   }, [])
 
-  // 选中 985/211 学校后，专业输入给到培养方案候选
+  // 选中 985/211 学校后，专业输入给到培养方案候选（300ms 防抖，避免每击键一个请求竞态）
   useEffect(() => {
     if (!form.current_school) { setMajorList([]); return }
-    api.majorsForSchool(form.current_school).then((m) =>
-      setMajorList([...m.custom_majors, ...m.template_majors, ...m.strong])).catch(() => setMajorList([]))
+    const t = setTimeout(() => {
+      api.majorsForSchool(form.current_school).then((m) =>
+        setMajorList([...m.custom_majors, ...m.template_majors, ...m.strong])).catch(() => setMajorList([]))
+    }, 300)
+    return () => clearTimeout(t)
   }, [form.current_school])
 
   const set = (k: string, v: unknown) => setForm((f) => ({ ...f, [k]: v }))
@@ -1690,6 +1821,9 @@ function SettingsView() {
   const [mcps, setMcps] = useState<{ name: string; command: string[] }[]>([])
   const [mcpName, setMcpName] = useState('')
   const [mcpCmd, setMcpCmd] = useState('')
+  const [experts, setExperts] = useState<{ id: string; name: string; description: string }[]>([])
+  const [skills, setSkills] = useState<{ id: string; name: string }[]>([])
+  const [curricula, setCurricula] = useState<{ file: string; course: string; concepts: number }[]>([])
 
   const refreshMcp = () => api.connectors().then((c) => setMcps(c.mcp)).catch(() => {})
   useEffect(() => {
@@ -1697,6 +1831,9 @@ function SettingsView() {
       setStatus(s); setRouting(s.routing); setBaseUrl(s.cloud.base_url); setModel(s.cloud.model)
     }).catch(() => {})
     refreshMcp()
+    api.listExperts().then(setExperts).catch(() => {})
+    api.listSkills().then(setSkills).catch(() => {})
+    api.curriculums().then(setCurricula).catch(() => {})
   }, [])
 
   const addMcp = async () => {
@@ -1711,7 +1848,9 @@ function SettingsView() {
   }
 
   const delMcp = async (name: string) => {
-    await api.removeMcp(name); refreshMcp()
+    try {
+      await api.removeMcp(name); refreshMcp()
+    } catch (e: any) { alert('删除失败：' + (e.message || '未知错误')) }
   }
 
   const save = async () => {
@@ -1819,6 +1958,33 @@ function SettingsView() {
           </table>
         )}
       </div>
+
+      <div className="card">
+        <h3>专家团 · 技能 · 内置课程图谱</h3>
+        <p className="sub">
+          答疑按问题内容自动路由到对应专家；技能由各功能页的按钮触发（出题、判卷、闪卡、讲义总结…）；
+          构建知识图谱时，讲义抽取的前置关系会与内置课程图谱合并。
+        </p>
+        <b style={{ fontSize: 13 }}>专家团（{experts.length} 位）</b>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '8px 0 14px' }}>
+          {experts.map((e) => (
+            <span key={e.id} className="badge" title={e.description}>{e.name}</span>
+          ))}
+        </div>
+        <b style={{ fontSize: 13 }}>技能（{skills.length} 项）</b>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '8px 0 14px' }}>
+          {skills.map((s) => (
+            <span key={s.id} className="badge" title={s.id}>{s.name}</span>
+          ))}
+        </div>
+        <b style={{ fontSize: 13 }}>内置课程图谱（{curricula.length} 门）</b>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '8px 0 0' }}>
+          {curricula.map((c) => (
+            <span key={c.file} className="badge">{c.course} · {c.concepts} 个知识点</span>
+          ))}
+          {!curricula.length && <span className="sub">暂无内置课程图谱数据</span>}
+        </div>
+      </div>
     </div>
   )
 }
@@ -1868,13 +2034,18 @@ function HandbookView({ spaces, currentSid }: { spaces: Space[]; currentSid: str
     setBusy(false)
   }
 
-  const open = async (id: string) => { setCurrent(await api.handbook(id)) }
+  const open = async (id: string) => {
+    try { setCurrent(await api.handbook(id)) } catch (e: any) { alert('打开失败：' + (e.message || '未知错误')) }
+  }
   const remove = async (id: string) => {
     if (!confirm('删除该手册？')) return
-    await api.deleteHandbook(id)
-    if (current?.id === id) setCurrent(null)
-    refresh()
+    try {
+      await api.deleteHandbook(id)
+      if (current?.id === id) setCurrent(null)
+      refresh()
+    } catch (e: any) { alert('删除失败：' + (e.message || '未知错误')) }
   }
+  const exportHandbook = () => downloadMd('成长手册', current?.content || '')
 
   return (
     <div className="content">
@@ -1926,7 +2097,12 @@ function HandbookView({ spaces, currentSid }: { spaces: Space[]; currentSid: str
         <div className="card" style={{ marginBottom: 18 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <h3 style={{ margin: 0 }}>{current.title}</h3>
-            <button className="btn ghost small" onClick={() => setCurrent(null)}>收起</button>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn ghost small" onClick={exportHandbook}>
+                <Icon name="book" size={12} /> 导出 Markdown
+              </button>
+              <button className="btn ghost small" onClick={() => setCurrent(null)}>收起</button>
+            </div>
           </div>
           <Md>{current.content}</Md>
         </div>

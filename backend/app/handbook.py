@@ -179,9 +179,13 @@ def generate(space_id: str, profile: dict) -> dict:
 
     query = " ".join([current_school, year, " ".join(flags), target_school, target_major,
                       goal_type, "重修 推免 招生 复试 竞赛 科研"])
-    hits = retrieve_policy(query, top_k=10)
+    try:
+        hits = retrieve_policy(query, top_k=10)
+    except Exception:
+        hits = []  # 嵌入模型不可用时降级为无政策上下文，不阻塞手册生成
     policy_ctx = "\n\n".join(
-        f"[政策{i}｜来源: {h['source']}]\n{h['text']}" for i, h in enumerate(hits, 1))
+        f"[政策{i}｜来源: {h['source']}]\n{h['text']}" for i, h in enumerate(hits, 1)) \
+        or "（政策库检索暂不可用，政策相关结论请自行核实官方来源）"
     situations = _pick_situations({"flags": flags, "rank_hint": rank_hint, "goal_type": goal_type})
     skeleton = "\n".join(f"【{t['label']}】骨架：\n{t['skeleton']}" for t in situations)
     weak_ctx = _weak_context(space_id)

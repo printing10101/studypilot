@@ -1,8 +1,17 @@
-"""RAG 管线：PDF/PPTX/图片/文本解析 → 分块 → 向量化 → 检索（带引用）。"""
+"""RAG 管线：PDF/PPTX/图片/文本解析 → 分块 → 向量化 → 混合检索（带引用）。
+
+检索为双通道：向量（语义）+ BM25（词法，中文按字 bigram），RRF 融合排序——
+专有名词、公式符号、章节标题等"词面精确匹配"场景向量检索常漏召，词法通道补齐；
+可选 cross-encoder 精排（settings.rerank_model 配置后启用）。
+"""
+import math
 import os
 import re
+import threading
+from collections import Counter
 
 from . import db, ingest, llm
+from .config import settings
 
 CHUNK_SIZE = 500      # 字符
 CHUNK_OVERLAP = 80
@@ -172,17 +181,168 @@ def index_document(space_id: str, document_id: str) -> int:
         raise
 
 
+# ---------- 混合检索：向量通道 + BM25 词法通道，RRF 融合 ----------
+
+_RRF_K = 60          # Reciprocal Rank Fusion 常数（论文经验值，平滑排名差异）
+_FETCH_MULT = 3      # 每通道超采倍数：先取 top(3k) 再融合截到 top_k
+_BM25_K1 = 1.5
+_BM25_B = 0.75
+
+_bm25_lock = threading.Lock()  # 仅保护 _bm25_cache 的并发写（索引重建幂等，竞争无害但避免重复劳动）
+_bm25_cache: dict[str, tuple[tuple, dict]] = {}   # space_id -> (行签名, 索引)
+_reranker = None
+_reranker_lock = threading.Lock()
+
+
+def _tokenize(text: str) -> list[str]:
+    """中文检索分词（零依赖）：连续拉丁/数字按整词，CJK 连续段拆 字+二元组。
+    单字与二元组都入索引——常用单字（的/是）由 BM25 的 IDF 自然降权。"""
+    tokens: list[str] = []
+    for m in re.finditer(r"[a-z0-9_]+|[\u4e00-\u9fff]+", text.lower()):
+        run = m.group(0)
+        if run[0].isascii():
+            tokens.append(run)
+            continue
+        tokens.extend(run)                      # 单字
+        tokens.extend(run[i:i + 2] for i in range(len(run) - 1))  # 二元组
+    return tokens
+
+
+def _bm25_index(texts: list[str]) -> dict:
+    tfs, lens, df = [], [], Counter()
+    for t in texts:
+        tf = Counter(_tokenize(t))
+        tfs.append(tf)
+        lens.append(sum(tf.values()))
+        df.update(tf.keys())
+    n = max(1, len(texts))
+    idf = {term: math.log(1.0 + (n - d + 0.5) / (d + 0.5)) for term, d in df.items()}
+    return {"tfs": tfs, "lens": lens, "idf": idf, "avgdl": (sum(lens) / n) or 1.0}
+
+
+def _bm25_scores(space_id: str, rows: list[dict], query: str) -> list[tuple[int, float]]:
+    """BM25 打分，返回 [(rows 下标, 得分)] 按分降序。索引按空间缓存（行集合变了才重建）。"""
+    sig = (len(rows), hash(tuple(r["id"] for r in rows)))
+    cached = _bm25_cache.get(space_id)
+    if cached and cached[0] == sig:
+        index = cached[1]
+    else:
+        index = _bm25_index([r["text"] for r in rows])
+        with _bm25_lock:
+            _bm25_cache[space_id] = (sig, index)
+    q_terms = {t for t in _tokenize(query) if t in index["idf"]}
+    if not q_terms:
+        return []
+    out = []
+    for i, (tf, dl) in enumerate(zip(index["tfs"], index["lens"])):
+        s = 0.0
+        for t in q_terms:
+            f = tf.get(t, 0)
+            if f:
+                s += index["idf"][t] * f * (_BM25_K1 + 1.0) / (
+                    f + _BM25_K1 * (1.0 - _BM25_B + _BM25_B * dl / index["avgdl"]))
+        if s > 0:
+            out.append((i, s))
+    out.sort(key=lambda x: -x[1])
+    return out
+
+
+def _vector_scores(rows: list[dict], qvec: list[float]) -> list[tuple[int, float]]:
+    """余弦相似度打分（写入时已归一化，点积即余弦），跳过维度不一致的旧向量。"""
+    import numpy as np
+    q = np.asarray(qvec, dtype=np.float32)
+    q = q / (np.linalg.norm(q) + 1e-9)
+    out = []
+    for i, r in enumerate(rows):
+        v = np.frombuffer(r["embedding"], dtype=np.float32)
+        if v.shape[0] == q.shape[0]:
+            out.append((i, float(v @ q)))
+    out.sort(key=lambda x: -x[1])
+    return out
+
+
+def _get_reranker():
+    """懒加载 cross-encoder 精排模型（settings.rerank_model），加载失败返回 None。"""
+    global _reranker
+    if not settings.rerank_model:
+        return None
+    if _reranker is None:
+        with _reranker_lock:
+            if _reranker is None:
+                try:
+                    from sentence_transformers import CrossEncoder
+                    _reranker = CrossEncoder(settings.rerank_model, max_length=512)
+                except Exception:
+                    return None  # 模型下载失败/无网络等：静默回退融合序，不阻塞答疑
+    return _reranker
+
+
+def _rerank(query: str, hits: list[dict]) -> list[dict]:
+    """cross-encoder 精排：对融合后的候选重打分（sigmoid 到 0..1），失败保持原序。"""
+    if len(hits) < 2:
+        return hits
+    model = _get_reranker()
+    if model is None:
+        return hits
+    try:
+        import numpy as np
+        pairs = [(query, h["text"][:1500]) for h in hits]
+        logits = np.asarray(model.predict(pairs), dtype=np.float64)
+        scores = 1.0 / (1.0 + np.exp(-logits))  # sigmoid 压到 0..1 作展示相关度
+        order = np.argsort(-scores)
+        return [{**hits[i], "score": round(float(scores[i]), 3)} for i in order]
+    except Exception:
+        return hits
+
+
 def retrieve(space_id: str, query: str, top_k: int = 6) -> list[dict]:
-    """返回 [{text, score, source, chunk_index}]"""
-    qvec = llm.embed([query])[0]
-    hits = db.search_vectors(space_id, qvec, top_k=top_k)
+    """混合检索：向量（语义）+ BM25（词法）RRF 融合，可选精排。
+    返回 [{text, score, source, chunk_index}]；score 为展示用相关度
+    （纯向量=余弦值；融合=RRF 归一化 Top1=1.0；精排=sigmoid）。"""
+    rows = db.space_chunks(space_id)
+    if not rows:
+        return []
+    fetch_k = max(top_k * _FETCH_MULT, 12)
+    vec_ranked = _vector_scores(rows, llm.embed([query])[0])[:fetch_k]
+    if not settings.hybrid_search:
+        ranked = vec_ranked[:top_k]
+        hits = [{"id": rows[i]["id"], "document_id": rows[i]["document_id"],
+                 "chunk_index": rows[i]["chunk_index"], "text": rows[i]["text"],
+                 "score": round(s, 4)} for i, s in ranked]
+    else:
+        fused: dict[int, float] = {}
+        for rank, (i, _s) in enumerate(vec_ranked):
+            fused[i] = fused.get(i, 0.0) + 1.0 / (_RRF_K + rank + 1)
+        for rank, (i, _s) in enumerate(_bm25_scores(space_id, rows, query)[:fetch_k]):
+            fused[i] = fused.get(i, 0.0) + 1.0 / (_RRF_K + rank + 1)
+        order = sorted(fused.items(), key=lambda kv: -kv[1])[:top_k]
+        top_score = order[0][1] if order else 0.0
+        hits = [{"id": rows[i]["id"], "document_id": rows[i]["document_id"],
+                 "chunk_index": rows[i]["chunk_index"], "text": rows[i]["text"],
+                 "score": round(f / top_score, 3) if top_score else 0.0} for i, f in order]
+        hits = _rerank(query, hits)
     for h in hits:
         h["source"] = db.doc_filename(h["document_id"])
     return hits
 
 
+def select_hits(hits: list[dict], budget: int | None = None) -> list[dict]:
+    """按字符预算筛出实际会进入上下文的片段（丢弃从相关度最低的开始），
+    供引用列表与 prompt 内容对齐。"""
+    kept = list(hits)
+
+    def _join(ps):
+        return "\n\n".join(f"[片段{i}｜来源: {h['source']}\n{h['text']}]" for i, h in enumerate(ps, 1))
+
+    ctx = _join(kept)
+    while budget and len(ctx) > budget and len(kept) > 1:
+        kept.pop()
+        ctx = _join(kept)
+    return kept
+
+
 def build_context(hits: list[dict], budget: int | None = None) -> str:
-    """拼接检索片段；超过字符预算时从相关度最低的片段开始丢弃。"""
+    """拼接检索片段；超过字符预算时从相关度最低的片段开始丢弃（单个超长片段截断到预算）。"""
     parts = []
     for i, h in enumerate(hits, 1):
         parts.append(f"[片段{i}｜来源: {h['source']}\n{h['text']}]")
@@ -190,4 +350,6 @@ def build_context(hits: list[dict], budget: int | None = None) -> str:
     while budget and len(ctx) > budget and len(parts) > 1:
         parts.pop()
         ctx = "\n\n".join(parts)
+    if budget and len(ctx) > budget:
+        ctx = ctx[:budget]
     return ctx

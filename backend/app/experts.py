@@ -88,14 +88,27 @@ def record_feedback(space_id: str, message_id: str, rating: str,
     db.add_feedback(space_id, message_id, rating, understood, confusion)
     negative = rating == "unhelpful" or understood == 0
     if not negative:
-        # 正反馈：给该回答涉及的既有薄弱点轻微加分（若能匹配上）
+        # 正反馈：给该回答涉及的既有知识点轻微加分。
+        # 只匹配已存在的知识点——引用片段/回答正文是自然语言，不能拿片段当知识点名新建，
+        # 否则会污染掌握度表并流入薄弱点排行与知识图谱。
         msg = db.get_message(message_id) if message_id else None
-        if msg and msg.get("citations"):
-            for c in msg["citations"][:2]:
-                snippet_point = (c.get("snippet") or "").strip()
-                if snippet_point:
-                    db.adjust_mastery(space_id, snippet_point[:40], "progress")
-        return {"ok": True, "points": []}
+        matched: list[str] = []
+        if msg:
+            existing = db.list_mastery(space_id)
+            if existing:
+                haystack = msg.get("content") or ""
+                for c in (msg.get("citations") or [])[:3]:
+                    if isinstance(c, dict):
+                        haystack += "\n" + (c.get("snippet") or "")
+                for row in existing:
+                    name = (row.get("point") or "").strip()
+                    if len(name) >= 4 and name in haystack and name not in matched:
+                        matched.append(name)
+                    if len(matched) >= 3:
+                        break
+        for p in matched:
+            db.adjust_mastery(space_id, p, "progress")
+        return {"ok": True, "points": matched}
 
     # 负反馈：定位相关知识并削弱
     msg = db.get_message(message_id) if message_id else None
@@ -153,7 +166,12 @@ def build_prompt(space_id: str, mode: str, question: str,
     hits = rag.retrieve(space_id, question)
     # 上下文预算：讲义片段总量不超过剩余字符预算，防止 prompt 超长被截断降智
     budget = max(2000, settings.max_context_chars - len(system) - 1200)
-    context = rag.build_context(hits, budget=budget) if hits else "（知识库暂无相关内容，可提示用户先上传讲义）"
+    if hits:
+        # 只保留真正进入 prompt 的片段：引用列表与模型看到的内容保持一致
+        hits = rag.select_hits(hits, budget=budget)
+        context = rag.build_context(hits, budget=budget)
+    else:
+        context = "（知识库暂无相关内容，可提示用户先上传讲义）"
     return system + f"\n\n【讲义检索片段】\n{context}", expert_key, hits
 
 
@@ -184,7 +202,13 @@ def _chat_with_tools(messages: list[dict]) -> str:
             call = data["tool_call"]
         if not call or not call.get("tool"):
             return raw
-        if round_no == 3:  # 轮次用尽，避免无限工具循环
+        if round_no == 3:  # 轮次用尽：要求模型放弃工具直接作答，而不是把 tool_call JSON 当回答返回
+            convo.append({"role": "user", "content":
+                          "工具调用轮次已达上限，不要再请求调用工具。请基于已获得的信息直接给出最终回答。"})
+            raw = llm.chat(convo, task="chat")
+            data = llm._extract_json(raw)
+            if isinstance(data, dict) and isinstance(data.get("tool_call"), dict):
+                return "（工具调用轮次已达上限，未能获取更多信息。）请换个问法重试，或在模型设置页检查 MCP 服务是否可用。"
             return raw
         try:
             result = connectors.call_mcp_tool(call.get("server", ""), call["tool"],
@@ -205,12 +229,12 @@ def answer(space_id: str, mode: str, question: str,
     system, expert_key, hits = build_prompt(space_id, mode, question, guide=guide)
     expert_name = EXPERTS.get(expert_key, EXPERTS["qa"])["name"]
     messages = [{"role": "system", "content": system}, {"role": "user", "content": question}]
+    # 先落库用户提问：模型调用失败时问题不丢失（可刷新后重问）
+    user_mid = db.add_message(space_id, mode, "user", question)
     reply = _chat_with_tools(messages)
-
     citations = [{"index": i + 1, "source": h["source"], "score": round(h["score"], 3),
                   "snippet": h["text"][:120]} for i, h in enumerate(hits)]
 
-    user_mid = db.add_message(space_id, mode, "user", question)
     assistant_mid = db.add_message(space_id, mode, "assistant", reply, expert=expert_name, citations=citations)
     maybe_update_memory_async(space_id)
     return reply, citations, expert_name, user_mid, assistant_mid

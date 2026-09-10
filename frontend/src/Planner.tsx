@@ -1,10 +1,16 @@
 // 学涯规划页：院校/专业选择 → 培养方案 → 本学期课表 → 目标导向学习计划
 import { useEffect, useMemo, useState } from 'react'
-import { api, CareerPlan, CourseEntry, Program, ScheduleData, Space, StudentProfile, SyllabusFulltext, SyllabusMajors, SyllabusSchool } from './api'
+import { api, CareerPlan, CourseEntry, Program, ScheduleData, Space, StudentProfile, SyllabusFulltext, SyllabusMajors, SyllabusOfficial, SyllabusSchool, SyllabusStats } from './api'
 import { downloadMd } from './ui'
 
 const DAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
 const GOALS = ['保研', '考研', '就业', '竞赛', '出国', '期末', '毕业']
+// 个人档案页的目标词表（"推免/保研"等）映射到规划页词表，避免同一档案在两页显示不一致
+const goalAlias = (g: string) => {
+  if (GOALS.includes(g)) return g
+  if (/推免|保研/.test(g)) return '保研'
+  return '考研'
+}
 const HORIZONS = ['本学期', '本学年', '至毕业']
 const PERIOD_ORDER = ['1-2', '3-4', '5-6', '7-8', '9-10', '11-12']
 
@@ -26,6 +32,8 @@ export function PlannerView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
   const [majorsInfo, setMajorsInfo] = useState<SyllabusMajors | null>(null)
   const [program, setProgram] = useState<Program | null>(null)
   const [fulltext, setFulltext] = useState<SyllabusFulltext | null>(null)
+  const [stats, setStats] = useState<SyllabusStats | null>(null)
+  const [official, setOfficial] = useState<SyllabusOfficial[]>([])
 
   // 课程表
   const [schedule, setSchedule] = useState<ScheduleData | null>(null)
@@ -42,6 +50,9 @@ export function PlannerView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
   const [openPlan, setOpenPlan] = useState('')
   const [busy, setBusy] = useState('')
   const [err, setErr] = useState('')
+  // 培养手册文本导入：window.prompt 是单行输入框，多行手册文本放不进来，改用页内弹层
+  const [hbPasteOpen, setHbPasteOpen] = useState(false)
+  const [hbPasteText, setHbPasteText] = useState('')
 
   useEffect(() => {
     api.profile().then((p) => {
@@ -49,23 +60,28 @@ export function PlannerView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
       setSchool(p.current_school || '')
       setMajor(p.major || '')
       setYear(p.year || '')
-      setGoalType(['保研', '考研', '就业', '竞赛', '出国', '期末', '毕业'].includes(p.goal_type) ? p.goal_type : '考研')
+      setGoalType(goalAlias(p.goal_type))
       setTarget([p.target_school, p.target_major].filter(Boolean).join(' '))
     }).catch(() => {})
-    api.syllabusStats().catch(() => {})
+    api.syllabusStats().then(setStats).catch(() => {})
+    api.officialSources().then(setOfficial).catch(() => {})
     api.schools().then(setSchools).catch(() => {})
-    api.careerPlans().then(loadPlans).catch(() => {})
+    loadPlans()
     api.schedule().then((s) => { setSchedule(s); setDraft(s.courses) }).catch(() => {})
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    if (school) api.majorsForSchool(school).then(setMajorsInfo).catch(() => setMajorsInfo(null))
-    else setMajorsInfo(null)
+    // 300ms 防抖：学校/专业每击键一个请求会造成响应竞态
+    if (!school) { setMajorsInfo(null); return }
+    const t = setTimeout(() => api.majorsForSchool(school).then(setMajorsInfo).catch(() => setMajorsInfo(null)), 300)
+    return () => clearTimeout(t)
   }, [school])
 
   useEffect(() => {
     if (school && major) {
-      api.program(school, major).then((p) => { setProgram(p); setFulltext(null) }).catch(() => setProgram(null))
+      const t = setTimeout(() =>
+        api.program(school, major).then((p) => { setProgram(p); setFulltext(null) }).catch(() => setProgram(null)), 300)
+      return () => clearTimeout(t)
     } else { setProgram(null); setFulltext(null) }
   }, [school, major])
 
@@ -76,10 +92,12 @@ export function PlannerView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
 
   const saveMySchool = async () => {
     if (!profile) return
-    const p = await api.saveProfile({ ...profile, current_school: school, major, year })
-    setProfile(p)
-    setScheduleMsg('✓ 已写入个人档案')
-    setTimeout(() => setScheduleMsg(''), 2000)
+    try {
+      const p = await api.saveProfile({ ...profile, current_school: school, major, year })
+      setProfile(p)
+      setScheduleMsg('✓ 已写入个人档案')
+      setTimeout(() => setScheduleMsg(''), 2000)
+    } catch (e: any) { alert('保存档案失败：' + (e.message || '未知错误')) }
   }
 
   // ---------- 课程表操作 ----------
@@ -149,13 +167,15 @@ export function PlannerView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
   }
 
   const importHandbookText = async () => {
+    const text = hbPasteText.trim()
+    if (!text) { alert('请先粘贴培养手册/培养方案文本'); return }
     setBusy('syllabus')
     try {
-      const r = await api.importSyllabusText(school, major, prompt('粘贴本校培养手册/培养方案文本（PDF 里复制即可）') || '')
-      if (!r) return
+      const r = await api.importSyllabusText(school, major, text)
       const p = await api.program(r.school, r.major)
       setProgram(p)
       setScheduleMsg(`✓ 培养方案已导入并校准（抽取到 ${r.fields_found.length} 类字段）`)
+      setHbPasteOpen(false); setHbPasteText('')
     } catch (e: any) { alert(e.message) }
     setBusy('')
   }
@@ -176,9 +196,11 @@ export function PlannerView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
   }
 
   const toggleTask = async (pid: string, taskId: string, done: boolean) => {
-    await api.toggleCareerTask(pid, taskId, done)
-    const full = await api.careerPlan(pid)
-    setPlans((ps) => ps.map((p) => (p.id === pid ? full : p)))
+    try {
+      await api.toggleCareerTask(pid, taskId, done)
+      const full = await api.careerPlan(pid)
+      setPlans((ps) => ps.map((p) => (p.id === pid ? full : p)))
+    } catch (e: any) { alert('打卡失败：' + (e.message || '未知错误')) }
   }
 
   const pushPlan = async (pid: string) => {
@@ -189,15 +211,18 @@ export function PlannerView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
     if (isNaN(idx) || !spaces[idx]) return
     try {
       const r = await api.pushCareerPlan(pid, spaces[idx].id)
-      alert(`已同步 ${r.synced} 条任务到「${spaces[idx].name}」的学习计划`)
+      alert(`已同步 ${r.synced} 条任务到「${spaces[idx].name}」的学习计划\n（同一计划重复同步不会产生重复任务，已完成状态会保留）`)
       onOpenSpace(spaces[idx].id)
     } catch (e: any) { alert(e.message) }
   }
 
   const removePlan = async (pid: string) => {
-    if (!confirm('删除该计划？')) return
-    await api.deleteCareerPlan(pid)
-    setPlans((ps) => ps.filter((p) => p.id !== pid))
+    if (!confirm('删除该计划？\n已同步到课程空间的该计划任务会一并移除。')) return
+    try {
+      const r: any = await api.deleteCareerPlan(pid)
+      setPlans((ps) => ps.filter((p) => p.id !== pid))
+      if (r?.removed_pushed_tasks) alert(`已删除计划，并移除课程空间中来自该计划的 ${r.removed_pushed_tasks} 条任务`)
+    } catch (e: any) { alert('删除失败：' + (e.message || '未知错误')) }
   }
 
   const planTotal = plans.reduce((a, p) => a + p.tasks.filter((t) => !t.done).length, 0)
@@ -208,6 +233,31 @@ export function PlannerView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
       <div className="card" style={{ marginBottom: 18 }}>
         <h3>① 我的学校与专业</h3>
         <p className="sub">收录全国 985/211 高校（可搜简称如「示例大学」「华科」）；专业覆盖 21 个主流培养方案框架，未覆盖的专业可导入本校培养手册校准。</p>
+        {stats && (
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+            <span className="badge">985/211 院校 {stats.schools} 所（985 {stats.schools_985}）</span>
+            <span className="badge">培养方案 {stats.programs} 套</span>
+            <span className="badge">官方政策层 {stats.official} 份</span>
+            <span className="badge">本校导入 {stats.custom} 份</span>
+          </div>
+        )}
+        {official.length > 0 && (
+          <details style={{ marginTop: 8 }}>
+            <summary className="sub" style={{ cursor: 'pointer' }}>
+              已收录官方政策层的学校专业（{official.length} 项，点击展开看来源）
+            </summary>
+            <div style={{ display: 'grid', gap: 4, marginTop: 6, marginBottom: 6 }}>
+              {official.map((o) => (
+                <span key={`${o.school}-${o.major}`} className="sub">
+                  <b>{o.school}</b> · {o.major} · {o.source_version}
+                  {o.source_url && (
+                    <a href={o.source_url} target="_blank" rel="noreferrer" style={{ marginLeft: 6 }}>原文 ↗</a>
+                  )}
+                </span>
+              ))}
+            </div>
+          </details>
+        )}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 12 }}>
           <div>
             <input type="text" list="sp-schools" placeholder="选择/输入学校（如 示例大学、华科）"
@@ -234,7 +284,7 @@ export function PlannerView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
             {majorsInfo.tier && <span className="badge">{majorsInfo.tier} 院校</span>}
             {majorsInfo.official_majors.length > 0 &&
               <span className="badge" style={{ borderColor: 'var(--green)', color: 'var(--green)' }}>
-                官方方案全文已收录：{majorsInfo.official_majors.join('、')}</span>}
+                官方方案层已收录：{majorsInfo.official_majors.join('、')}（全文可按来源 URL 获取）</span>}
             {majorsInfo.custom_majors.length > 0 &&
               <span className="badge" style={{ borderColor: 'var(--green)', color: 'var(--green)' }}>
                 已导入本校方案 {majorsInfo.custom_majors.length} 个</span>}
@@ -359,12 +409,29 @@ export function PlannerView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
                   onClick={() => document.getElementById('syllabus-file')?.click()}>
                   {busy === 'syllabus' ? '解析中…' : '导入本校培养手册（PDF/截图）校准'}
                 </button>
-                <button className="btn ghost small" disabled={busy === 'syllabus' || !school} onClick={importHandbookText}>
+                <button className="btn ghost small" disabled={busy === 'syllabus' || !school}
+                  onClick={() => setHbPasteOpen((o) => !o)}>
                   粘贴文本导入
                 </button>
                 <input id="syllabus-file" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp,.bmp,.txt,.md" hidden
                   onChange={(e) => { const f = e.target.files?.[0]; if (f) importHandbookFile(f); e.target.value = '' }} />
               </div>
+              {hbPasteOpen && (
+                <div style={{ marginTop: 10 }}>
+                  <textarea
+                    placeholder="把本校培养手册/培养方案文本粘贴到这里（PDF 里全选复制即可，支持多行长文本）"
+                    style={{ width: '100%', minHeight: 160 }}
+                    value={hbPasteText}
+                    onChange={(e) => setHbPasteText(e.target.value)} />
+                  <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' }}>
+                    <button className="btn small" disabled={busy === 'syllabus' || !hbPasteText.trim()} onClick={importHandbookText}>
+                      {busy === 'syllabus' ? '抽取中…' : '开始抽取导入'}
+                    </button>
+                    <button className="btn ghost small" onClick={() => { setHbPasteOpen(false); setHbPasteText('') }}>取消</button>
+                    <span className="sub">文本需至少 80 字，系统只抽取手册中明确出现的信息</span>
+                  </div>
+                </div>
+              )}
             </>
           )}
         </div>
@@ -391,7 +458,9 @@ export function PlannerView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
           {schedule && schedule.term && (
             <button className="btn danger ghost small" onClick={async () => {
               if (!confirm(`清空「${schedule.term}」的课程表？`)) return
-              await api.deleteSchedule(schedule.term); await reloadSchedule(schedule.term)
+              try {
+                await api.deleteSchedule(schedule.term); await reloadSchedule(schedule.term)
+              } catch (e: any) { alert('清空失败：' + (e.message || '未知错误')) }
             }}>清空本学期</button>
           )}
         </div>

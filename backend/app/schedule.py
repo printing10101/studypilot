@@ -63,6 +63,9 @@ def parse_cell(text: str, day: int | None = None, period_hint: str = "") -> dict
         rest = rest[:r_m.start()] + rest[r_m.end():]
 
     kind = next((k for k in KINDS if k in rest), "")
+    if kind:
+        # 课程性质词从行文中移除，避免被下面的教师名正则误认领（"数据结构 必修 王伟"）
+        rest = rest.replace(kind, "", 1)
 
     # 剩余部分按空格分词：课程名取最长的有效词；教师名取另一段 2~4 字中文
     rest = rest.strip(" ,;，；.。:：/、|-")
@@ -80,7 +83,7 @@ def parse_cell(text: str, day: int | None = None, period_hint: str = "") -> dict
         return None
     teacher = ""
     for tok in tokens:
-        if tok == name or len(tok) < 2:
+        if tok == name or len(tok) < 2 or any(n in tok for n in NOISE) or tok in KINDS:
             continue
         if re.fullmatch(r"[\u4e00-\u9fa5]{2,4}(?:老师|教授)?", tok):
             teacher = tok
@@ -99,14 +102,8 @@ def parse_text(text: str) -> list[dict]:
         if DAY_RE.search(_norm_line(raw)):
             last_day = item["day"]
         out.append(item)
-    # 去重（同课程同天同节次视为一条）
-    seen, uniq = set(), []
-    for it in out:
-        key = (it["course"], it["day"], it["period"])
-        if key not in seen:
-            seen.add(key)
-            uniq.append(it)
-    return uniq
+    # 去重键含周次：单双周同节次的同名课是两条安排，不能合并（与 _dedupe 口径一致）
+    return _dedupe(out)
 
 
 # ---------- Excel / CSV 网格 ----------
@@ -208,7 +205,7 @@ def _llm_parse(text: str) -> list[dict]:
         if not isinstance(r, dict) or not (r.get("course") or "").strip():
             continue
         try:
-            day = max(1, min(7, int(r.get("day") or 0)))
+            day = min(7, max(0, int(r.get("day") or 0)))  # 0 = 星期未定，与规则解析口径一致
         except (TypeError, ValueError):
             day = 0
         out.append({"course": str(r["course"]).strip()[:80], "day": day,

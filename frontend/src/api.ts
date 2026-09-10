@@ -8,11 +8,12 @@ export interface Msg {
 }
 export interface QuizQ {
   id: string; type: string; question: string; options: string[]
-  answer: string; knowledge_point: string
+  answer?: string; knowledge_point: string  // 判卷前服务端会剥离 answer
 }
 export interface QuizRecord {
   id: string; topic: string; questions: QuizQ[]
-  answers: { qid: string; verdict: string; analysis: string; knowledge_point: string }[]
+  answers: { qid: string; verdict: string; analysis: string; knowledge_point: string
+    user_answer?: string; correct_answer?: string }[]
 }
 export interface MemoryData {
   l1_count: number
@@ -55,6 +56,8 @@ export interface WrongQ {
 export interface Flashcard {
   id: string; front: string; back: string; point: string
   box: number; due_at: number
+  state?: number; stability?: number; reps?: number; lapses?: number
+  preview?: Record<string, number>  // FSRS 四档评分的下次间隔（秒），仅到期复习流附带
 }
 export interface PlanTask {
   id: string; phase: string; content: string; accept: string
@@ -104,6 +107,7 @@ export interface DefectDiag {
   has_graph: boolean; edge_count: number
   repair_order: string[]; chains: string[][]; points: DefectPoint[]
 }
+export interface CurriculumMeta { file: string; course: string; concepts: number }
 
 // ---- 学涯规划 ----
 export interface SyllabusSchool {
@@ -167,18 +171,28 @@ async function j<T>(res: Promise<Response>): Promise<T> {
   return r.json()
 }
 
+// 写操作统一走状态检查：裸 fetch 对 HTTP 400/404/500 会当成功 resolve，
+// 导致删除/打卡失败时界面毫无反应
+async function ok(res: Promise<Response>): Promise<{ ok: boolean }> {
+  const r = await res
+  if (!r.ok) throw new Error((await r.json().catch(() => ({ detail: r.statusText }))).detail || '请求失败')
+  return r.json().catch(() => ({ ok: true }))
+}
+
 export const api = {
   health: () => j<{ status: string; llm: boolean; model: string }>(fetch(`${BASE}/api/health`)),
   listSpaces: () => j<Space[]>(fetch(`${BASE}/api/spaces`)),
   createSpace: (name: string, description: string) =>
     j<Space>(fetch(`${BASE}/api/spaces`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description }) })),
-  deleteSpace: (id: string) => fetch(`${BASE}/api/spaces/${id}`, { method: 'DELETE' }),
+  deleteSpace: (id: string) => ok(fetch(`${BASE}/api/spaces/${id}`, { method: 'DELETE' })),
 
   listDocs: (sid: string) => j<Doc[]>(fetch(`${BASE}/api/spaces/${sid}/documents`)),
   uploadDoc: (sid: string, file: File) => {
     const fd = new FormData(); fd.append('file', file)
     return j<Doc>(fetch(`${BASE}/api/spaces/${sid}/documents`, { method: 'POST', body: fd }))
   },
+  deleteDoc: (sid: string, did: string) =>
+    ok(fetch(`${BASE}/api/spaces/${sid}/documents/${did}`, { method: 'DELETE' })),
   listMessages: (sid: string) => j<Msg[]>(fetch(`${BASE}/api/spaces/${sid}/messages`)),
   chat: (sid: string, mode: string, message: string, guide = false) =>
     j<{ reply: string; citations: Citation[]; expert: string }>(fetch(`${BASE}/api/spaces/${sid}/chat`, {
@@ -192,7 +206,7 @@ export const api = {
     })),
   quizzes: (sid: string) => j<QuizRecord[]>(fetch(`${BASE}/api/spaces/${sid}/quizzes`)),
   memory: (sid: string) => j<MemoryData>(fetch(`${BASE}/api/spaces/${sid}/memory`)),
-  clearMemory: (sid: string, level: number) => fetch(`${BASE}/api/spaces/${sid}/memory/${level}`, { method: 'DELETE' }),
+  clearMemory: (sid: string, level: number) => ok(fetch(`${BASE}/api/spaces/${sid}/memory/${level}`, { method: 'DELETE' })),
 
   library: (query = '', subject = '') =>
     j<Book[]>(fetch(`${BASE}/api/library?query=${encodeURIComponent(query)}&subject=${encodeURIComponent(subject)}`)),
@@ -208,7 +222,7 @@ export const api = {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ space_id: sid }),
     })),
   bookSpaces: (bid: string) => j<Space[]>(fetch(`${BASE}/api/library/${bid}/spaces`)),
-  deleteBook: (bid: string) => fetch(`${BASE}/api/library/${bid}`, { method: 'DELETE' }),
+  deleteBook: (bid: string) => ok(fetch(`${BASE}/api/library/${bid}`, { method: 'DELETE' })),
 
   sendFeedback: (sid: string, message_id: string, rating: string, understood: number, confusion: string) =>
     j<{ ok: boolean; points: string[] }>(fetch(`${BASE}/api/spaces/${sid}/feedback`, {
@@ -232,7 +246,7 @@ export const api = {
     })),
   handbooks: () => j<HandbookMeta[]>(fetch(`${BASE}/api/handbook`)),
   handbook: (hid: string) => j<Handbook>(fetch(`${BASE}/api/handbook/${hid}`)),
-  deleteHandbook: (hid: string) => fetch(`${BASE}/api/handbook/${hid}`, { method: 'DELETE' }),
+  deleteHandbook: (hid: string) => ok(fetch(`${BASE}/api/handbook/${hid}`, { method: 'DELETE' })),
 
   wrongQuestions: (sid: string) => j<WrongQ[]>(fetch(`${BASE}/api/spaces/${sid}/wrong-questions`)),
   redoWrong: (sid: string, qids: string[]) =>
@@ -242,17 +256,18 @@ export const api = {
   flashcards: (sid: string, due = false) =>
     j<{ cards: Flashcard[]; stats: { total: number; due: number } }>(
       fetch(`${BASE}/api/spaces/${sid}/flashcards?due=${due ? 1 : 0}`)),
-  gradeFlashcard: (sid: string, fid: string, know: boolean) =>
-    j<{ id: string; box: number; due_at: number }>(fetch(`${BASE}/api/spaces/${sid}/flashcards/${fid}/grade`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ know }),
-    })),
-  clearFlashcards: (sid: string) => fetch(`${BASE}/api/spaces/${sid}/flashcards`, { method: 'DELETE' }),
+  gradeFlashcard: (sid: string, fid: string, rating: number) =>
+    j<{ id: string; box: number; due_at: number; interval: number; reps: number; lapses: number }>(
+      fetch(`${BASE}/api/spaces/${sid}/flashcards/${fid}/grade`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rating }),
+      })),
+  clearFlashcards: (sid: string) => ok(fetch(`${BASE}/api/spaces/${sid}/flashcards`, { method: 'DELETE' })),
   plan: (sid: string) => j<{ tasks: PlanTask[]; done: number; total: number }>(
     fetch(`${BASE}/api/spaces/${sid}/plan`)),
   togglePlanTask: (sid: string, tid: string, done: boolean) =>
-    fetch(`${BASE}/api/spaces/${sid}/plan/${tid}/toggle`, {
+    ok(fetch(`${BASE}/api/spaces/${sid}/plan/${tid}/toggle`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ done }),
-    }),
+    })),
   setTaskDate: (sid: string, tid: string, dueDate: string) =>
     j<{ id: string; due_date: string }>(fetch(`${BASE}/api/spaces/${sid}/plan/${tid}/date`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ due_date: dueDate }),
@@ -267,10 +282,10 @@ export const api = {
   connectors: () => j<{ builtin: { name: string; description: string }[]; mcp: { name: string; command: string[] }[] }>(
     fetch(`${BASE}/api/connectors`)),
   registerMcp: (name: string, command: string[]) =>
-    fetch(`${BASE}/api/connectors/mcp`, {
+    ok(fetch(`${BASE}/api/connectors/mcp`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, command }),
-    }),
-  removeMcp: (name: string) => fetch(`${BASE}/api/connectors/mcp/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+    })),
+  removeMcp: (name: string) => ok(fetch(`${BASE}/api/connectors/mcp/${encodeURIComponent(name)}`, { method: 'DELETE' })),
 
   // 导出：返回原始 markdown 文本供前端另存
   exportMd: async (sid: string, kind: 'report' | 'wrong' | 'plan') => {
@@ -286,6 +301,7 @@ export const api = {
     })),
   profileOverview: () => j<{ spaces: SpaceOverview[] }>(fetch(`${BASE}/api/profile/overview`)),
   defects: (sid: string) => j<DefectDiag>(fetch(`${BASE}/api/spaces/${sid}/defects`)),
+  curriculums: () => j<CurriculumMeta[]>(fetch(`${BASE}/api/curriculum`)),
 
   // ---- 学涯规划 ----
   syllabusStats: () => j<SyllabusStats>(fetch(`${BASE}/api/syllabus/stats`)),
@@ -323,7 +339,7 @@ export const api = {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ term, courses }),
     })),
   deleteSchedule: (term: string) =>
-    fetch(`${BASE}/api/schedule?term=${encodeURIComponent(term)}`, { method: 'DELETE' }),
+    ok(fetch(`${BASE}/api/schedule?term=${encodeURIComponent(term)}`, { method: 'DELETE' })),
   careerPlans: () => j<CareerPlanMeta[]>(fetch(`${BASE}/api/planner`)),
   careerPlan: (pid: string) => j<CareerPlan>(fetch(`${BASE}/api/planner/${pid}`)),
   generateCareerPlan: (p: { school: string; major: string; year: string; goal_type: string; target: string; term: string; horizon: string }) =>
@@ -331,14 +347,14 @@ export const api = {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p),
     })),
   toggleCareerTask: (pid: string, taskId: string, done: boolean) =>
-    fetch(`${BASE}/api/planner/${pid}/toggle`, {
+    ok(fetch(`${BASE}/api/planner/${pid}/toggle`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ task_id: taskId, done }),
-    }),
+    })),
   pushCareerPlan: (pid: string, spaceId: string, replace = false) =>
-    j<{ synced: number }>(fetch(`${BASE}/api/planner/${pid}/push`, {
+    j<{ synced: number; kept_done?: number }>(fetch(`${BASE}/api/planner/${pid}/push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ space_id: spaceId, replace }),
     })),
-  deleteCareerPlan: (pid: string) => fetch(`${BASE}/api/planner/${pid}`, { method: 'DELETE' }),
+  deleteCareerPlan: (pid: string) => ok(fetch(`${BASE}/api/planner/${pid}`, { method: 'DELETE' })),
 }
 
 export function chatStream(
@@ -346,14 +362,22 @@ export function chatStream(
   onDelta: (t: string) => void,
   onDone: (meta: { expert: string; citations: Citation[]; assistant_message_id?: string }) => void,
   guide = false,
+  onError?: (msg: string) => void,
 ) {
+  // 失败必须回调 onError 并结束 busy：此前 fetch 无 catch、不查 r.ok、也不认 error 事件，
+  // 模型不可用/断流时发送按钮永久禁用且无任何提示
   fetch(`${BASE}/api/spaces/${sid}/chat/stream`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ mode, message, guide }),
   }).then(async (r) => {
-    const reader = r.body!.getReader()
+    if (!r.ok || !r.body) {
+      const detail = await r.json().catch(() => null)
+      throw new Error(detail?.detail || `请求失败（${r.status}）`)
+    }
+    const reader = r.body.getReader()
     const dec = new TextDecoder()
     let buf = ''
+    let finished = false
     for (; ;) {
       const { done, value } = await reader.read()
       if (done) break
@@ -363,10 +387,18 @@ export function chatStream(
       for (const p of parts) {
         const line = p.split('\n').find((l) => l.startsWith('data:'))
         if (!line) continue
-        const evt = JSON.parse(line.slice(5))
+        let evt: any
+        try {
+          evt = JSON.parse(line.slice(5))
+        } catch { continue }
         if (evt.type === 'delta') onDelta(evt.text)
-        if (evt.type === 'done') onDone({ expert: evt.expert, citations: evt.citations, assistant_message_id: evt.assistant_message_id })
+        if (evt.type === 'done') {
+          finished = true
+          onDone({ expert: evt.expert, citations: evt.citations, assistant_message_id: evt.assistant_message_id })
+        }
+        if (evt.type === 'error') throw new Error(evt.message || '生成回答失败')
       }
     }
-  })
+    if (!finished) throw new Error('连接中断，未收到完整回答')
+  }).catch((e: any) => onError?.(e?.message || '网络错误：无法连接服务'))
 }

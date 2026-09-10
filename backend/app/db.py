@@ -8,6 +8,7 @@ import uuid
 from typing import Any
 
 from .config import settings
+from . import fsrs as _fsrs
 
 os.makedirs(settings.data_dir, exist_ok=True)
 os.makedirs(settings.upload_dir, exist_ok=True)
@@ -106,10 +107,15 @@ CREATE TABLE IF NOT EXISTS mastery(
   attempts INTEGER DEFAULT 0,
   correct INTEGER DEFAULT 0,
   wrong INTEGER DEFAULT 0,
-  box INTEGER DEFAULT 1,           -- 1..5 复习盒（Leitner 间隔复习）
-  due_at REAL DEFAULT 0,           -- 下次应复习的时间戳
+  box INTEGER DEFAULT 1,           -- 展示用盒位（1=刚忘/学习中 .. 5=长稳），调度由 FSRS 接管
+  due_at REAL DEFAULT 0,           -- 下次应复习的时间戳（FSRS due）
   status TEXT DEFAULT 'learning',  -- weak / learning / mastered
   updated_at REAL,
+  state INTEGER DEFAULT 0,         -- FSRS 状态 0=未评 1=学习中 2=复习中 3=重学
+  step INTEGER,                    -- FSRS 学习/重学步进
+  stability REAL DEFAULT 0,        -- FSRS 稳定性（天）
+  difficulty REAL DEFAULT 0,       -- FSRS 难度 1..10
+  last_review REAL DEFAULT 0,      -- 上次评分时间戳
   UNIQUE(space_id, point)
 );
 CREATE TABLE IF NOT EXISTS meta(
@@ -130,9 +136,16 @@ CREATE TABLE IF NOT EXISTS flashcards(
   front TEXT NOT NULL,             -- 卡面（问题/提示）
   back TEXT NOT NULL,              -- 答案
   point TEXT DEFAULT '',           -- 关联知识点
-  box INTEGER DEFAULT 1,           -- 1..5 Leitner 复习盒
-  due_at REAL DEFAULT 0,           -- 下次应复习时间戳
-  created_at REAL
+  box INTEGER DEFAULT 1,           -- 展示用盒位（1=刚忘/学习中 .. 5=长稳），调度由 FSRS 接管
+  due_at REAL DEFAULT 0,           -- 下次应复习时间戳（FSRS due）
+  created_at REAL,
+  state INTEGER DEFAULT 0,         -- FSRS 状态 0=未评 1=学习中 2=复习中 3=重学
+  step INTEGER,                    -- FSRS 学习/重学步进
+  stability REAL DEFAULT 0,        -- FSRS 稳定性（天）
+  difficulty REAL DEFAULT 0,       -- FSRS 难度 1..10
+  last_review REAL DEFAULT 0,      -- 上次评分时间戳
+  reps INTEGER DEFAULT 0,          -- 累计评分次数
+  lapses INTEGER DEFAULT 0         -- 累计遗忘次数（评"忘了"）
 );
 CREATE INDEX IF NOT EXISTS idx_fc_space ON flashcards(space_id);
 CREATE TABLE IF NOT EXISTS mastery_history(
@@ -152,6 +165,7 @@ CREATE TABLE IF NOT EXISTS plan_tasks(
   accept TEXT DEFAULT '',          -- 验收标准
   points TEXT DEFAULT '[]',        -- 涉及知识点 json
   due_date TEXT DEFAULT '',        -- 截止日期 YYYY-MM-DD（今日学习页排期用）
+  source_plan TEXT DEFAULT '',     -- 来源学涯计划 id（push 同步写入，幂等/回溯用）
   done INTEGER DEFAULT 0,
   done_at REAL DEFAULT 0,
   created_at REAL
@@ -231,7 +245,36 @@ def get_conn() -> sqlite3.Connection:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_tasks)")}
         if "due_date" not in cols:
             conn.execute("ALTER TABLE plan_tasks ADD COLUMN due_date TEXT DEFAULT ''")
-            conn.commit()
+        if "source_plan" not in cols:
+            conn.execute("ALTER TABLE plan_tasks ADD COLUMN source_plan TEXT DEFAULT ''")
+        # FSRS 调度列（老 Leitner 数据零迁移：box 折算初始稳定性的逻辑在 app.fsrs 里）
+        mcols = {r[1] for r in conn.execute("PRAGMA table_info(mastery)")}
+        if "state" not in mcols:
+            conn.execute("ALTER TABLE mastery ADD COLUMN state INTEGER DEFAULT 0")
+        if "step" not in mcols:
+            conn.execute("ALTER TABLE mastery ADD COLUMN step INTEGER")
+        if "stability" not in mcols:
+            conn.execute("ALTER TABLE mastery ADD COLUMN stability REAL DEFAULT 0")
+        if "difficulty" not in mcols:
+            conn.execute("ALTER TABLE mastery ADD COLUMN difficulty REAL DEFAULT 0")
+        if "last_review" not in mcols:
+            conn.execute("ALTER TABLE mastery ADD COLUMN last_review REAL DEFAULT 0")
+        fcols = {r[1] for r in conn.execute("PRAGMA table_info(flashcards)")}
+        if "state" not in fcols:
+            conn.execute("ALTER TABLE flashcards ADD COLUMN state INTEGER DEFAULT 0")
+        if "step" not in fcols:
+            conn.execute("ALTER TABLE flashcards ADD COLUMN step INTEGER")
+        if "stability" not in fcols:
+            conn.execute("ALTER TABLE flashcards ADD COLUMN stability REAL DEFAULT 0")
+        if "difficulty" not in fcols:
+            conn.execute("ALTER TABLE flashcards ADD COLUMN difficulty REAL DEFAULT 0")
+        if "last_review" not in fcols:
+            conn.execute("ALTER TABLE flashcards ADD COLUMN last_review REAL DEFAULT 0")
+        if "reps" not in fcols:
+            conn.execute("ALTER TABLE flashcards ADD COLUMN reps INTEGER DEFAULT 0")
+        if "lapses" not in fcols:
+            conn.execute("ALTER TABLE flashcards ADD COLUMN lapses INTEGER DEFAULT 0")
+        conn.commit()
         _local.conn = conn
     return conn
 
@@ -318,6 +361,24 @@ def get_document(did: str) -> dict[str, Any] | None:
     return dict(r) if r else None
 
 
+def delete_document(did: str, remove_file: bool = True) -> None:
+    """删除单个文档：向量、教材挂载映射一并清理；磁盘文件默认删除
+    （挂载教材的文档与书库文件同路径，需 remove_file=False 避免误删书库文件）。"""
+    c = get_conn()
+    r = c.execute("SELECT path FROM documents WHERE id=?", (did,)).fetchone()
+    if r and r["path"] and remove_file:
+        upload_root = os.path.realpath(settings.upload_dir)
+        try:
+            if os.path.realpath(r["path"]).startswith(upload_root + os.sep):
+                os.remove(r["path"])
+        except OSError:
+            pass  # 文件可能已被移动/删除，不阻塞记录清理
+    c.execute("DELETE FROM vectors WHERE document_id=?", (did,))
+    c.execute("DELETE FROM book_documents WHERE document_id=?", (did,))
+    c.execute("DELETE FROM documents WHERE id=?", (did,))
+    c.commit()
+
+
 # ---------- 消息 ----------
 
 def add_message(space_id: str, mode: str, role: str, content: str,
@@ -341,10 +402,12 @@ def list_messages(space_id: str, limit: int = 200) -> list[dict[str, Any]]:
 
 
 def recent_messages(space_id: str, n: int = 12) -> list[dict[str, Any]]:
-    """L1 记忆素材：最近 n 轮消息。"""
+    """L1 记忆素材：最近 n 轮消息（按时间正序返回，保证摘要模型看到的是正常时间线）。"""
     rows = get_conn().execute(
         "SELECT role,content,mode FROM messages WHERE space_id=? ORDER BY created_at DESC LIMIT ?", (space_id, n)).fetchall()
-    return rows_to_dicts(rows)
+    out = rows_to_dicts(rows)
+    out.reverse()
+    return out
 
 
 # ---------- 测验 ----------
@@ -437,12 +500,25 @@ def search_vectors(space_id: str, query_emb: list[float], top_k: int = 6) -> lis
     # 库内嵌入写入时已归一化，点积即余弦相似度；整块矩阵乘替代逐行 Python 循环
     q = np.asarray(query_emb, dtype=np.float32)
     q = q / (np.linalg.norm(q) + 1e-9)
-    mat = np.stack([np.frombuffer(r["embedding"], dtype=np.float32) for r in rows])
-    scores = mat @ q
+    vecs = [np.frombuffer(r["embedding"], dtype=np.float32) for r in rows]
+    # 过滤维度不一致的旧向量（更换嵌入模型后可能出现），避免整体检索崩溃
+    rows = [r for r, v in zip(rows, vecs) if v.shape[0] == q.shape[0]]
+    vecs = [v for v in vecs if v.shape[0] == q.shape[0]]
+    if not rows:
+        return []
+    scores = np.stack(vecs) @ q
     top = np.argsort(-scores)[:top_k]
     return [{"id": rows[i]["id"], "document_id": rows[i]["document_id"],
              "chunk_index": rows[i]["chunk_index"], "text": rows[i]["text"],
              "score": float(scores[i])} for i in top]
+
+
+def space_chunks(space_id: str) -> list[dict[str, Any]]:
+    """全量 chunk 行（含嵌入与原文）：混合检索一次取数，向量/BM25 双通道共用。"""
+    rows = get_conn().execute(
+        "SELECT id,document_id,chunk_index,text,embedding FROM vectors WHERE space_id=?",
+        (space_id,)).fetchall()
+    return rows_to_dicts(rows)
 
 
 def doc_filename(document_id: str) -> str:
@@ -494,6 +570,11 @@ def find_book_by_title(title: str) -> dict[str, Any] | None:
     return dict(r) if r else None
 
 
+def find_book_by_url(url: str) -> dict[str, Any] | None:
+    r = get_conn().execute("SELECT * FROM books WHERE source_url=? AND source_url!=''", (url,)).fetchone()
+    return dict(r) if r else None
+
+
 def update_book_file(bid: str, status: str, path: str = "", error: str = "") -> None:
     c = get_conn()
     c.execute("UPDATE books SET status=?, path=?, error=? WHERE id=?", (status, path, error, bid))
@@ -501,7 +582,20 @@ def update_book_file(bid: str, status: str, path: str = "", error: str = "") -> 
 
 
 def delete_book(bid: str) -> None:
+    """删除书目：所有空间里的挂载文档（含向量）与磁盘文件一并清理，避免检索残留。"""
     c = get_conn()
+    upload_root = os.path.realpath(settings.upload_dir)
+    for r in c.execute(
+            "SELECT d.id AS did, d.path AS path FROM book_documents bd "
+            "JOIN documents d ON d.id=bd.document_id WHERE bd.book_id=?", (bid,)).fetchall():
+        c.execute("DELETE FROM vectors WHERE document_id=?", (r["did"],))
+        c.execute("DELETE FROM documents WHERE id=?", (r["did"],))
+        if r["path"]:
+            try:
+                if os.path.realpath(r["path"]).startswith(upload_root + os.sep):
+                    os.remove(r["path"])
+            except OSError:
+                pass  # 文件可能已被移动/删除，不阻塞书目删除
     c.execute("DELETE FROM book_documents WHERE book_id=?", (bid,))
     c.execute("DELETE FROM books WHERE id=?", (bid,))
     c.commit()
@@ -554,7 +648,14 @@ def list_feedback(space_id: str, limit: int = 50) -> list[dict[str, Any]]:
 
 def get_message(mid: str) -> dict[str, Any] | None:
     r = get_conn().execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
-    return dict(r) if r else None
+    if not r:
+        return None
+    d = dict(r)
+    try:
+        d["citations"] = json.loads(d.get("citations") or "[]")
+    except ValueError:
+        d["citations"] = []
+    return d
 
 
 def previous_user_message(space_id: str, before_id: str) -> str:
@@ -569,10 +670,11 @@ def previous_user_message(space_id: str, before_id: str) -> str:
     return r["content"] if r else ""
 
 
-# ---------- 知识点掌握度（BKT 知识追踪 + Leitner 间隔复习 + 缺陷依赖图） ----------
+# ---------- 知识点掌握度（BKT 知识追踪 + FSRS 间隔复习 + 缺陷依赖图） ----------
 
+# 旧 Leitner 盒间隔（盒1=30分钟 … 盒5=14天）：仅作老数据折算与留存率回退公式，
+# 复习调度已由 FSRS 接管（app.fsrs，目标留存率 0.9，按个人评分历史自适应间隔）
 _BOX_DELAYS = {1: 1800.0, 2: 86400.0, 3: 259200.0, 4: 604800.0, 5: 1209600.0}
-# 复习间隔：盒1=30分钟 盒2=1天 盒3=3天 盒4=7天 盒5=14天
 
 # ---- 贝叶斯知识追踪（BKT）参数 ----
 # prior: 初始先验 P(已掌握)；learn: 每次练习后的学习转移概率 P(T)
@@ -604,8 +706,13 @@ def _bkt_update(p: float, evidence: float, guess: float) -> float:
     return min(0.98, p_obs + (1 - p_obs) * _BKT_LEARN)
 
 
-def estimate_retention(p_known: float, box: int, updated_at: float, at: float | None = None) -> float:
-    """按 Ebbinghaus 指数遗忘估算当前留存率：R = 0.5^(Δt/半衰期)，半衰期随复习盒加长。"""
+def estimate_retention(p_known: float, box: int, updated_at: float, at: float | None = None,
+                       stability: float = 0.0, last_review: float = 0.0) -> float:
+    """估算"此刻还记得多少"：优先 FSRS 幂律遗忘曲线（有稳定性时）；
+    无 FSRS 状态的老数据退回 Ebbinghaus 半衰期公式 R = 0.5^(Δt/半衰期)。"""
+    r = _fsrs.retrievability(stability, last_review, at)
+    if r >= 0:
+        return round(r, 4)
     at = at if at is not None else time.time()
     delay_h = _BOX_DELAYS.get(box, 1800.0) / 3600.0
     half_life_h = delay_h * 1.2 + 4.0
@@ -663,23 +770,28 @@ def adjust_mastery(space_id: str, point: str, verdict: str, guess: float | None 
     attempts += 1
     if verdict == "correct":
         correct += 1
-        box = min(box + 1, 5)
     elif verdict == "wrong":
         wrong += 1
-        box = 1
-    elif verdict == "confused":
-        box = 1
-    elif verdict in ("partial", "progress"):
-        box = min(box + 1, 5)
-    due = now() + _BOX_DELAYS[box]
+    # 复习排期走 FSRS（正确→良好 / 部分·进步→困难 / 混淆·错误→忘了），box 仅作展示同步
+    sched_row = dict(row) if row else {
+        "id": f"{space_id}:{point}", "box": 1, "due_at": now(), "state": 0, "step": None,
+        "stability": 0.0, "difficulty": 0.0, "last_review": 0.0, "attempts": 0, "updated_at": 0,
+    }
+    sched_row["attempts"] = attempts - 1  # 折算旧数据时看评分前的次数
+    sched = _fsrs.review(sched_row, _fsrs.VERDICT_RATING[verdict])
+    box, due = sched["box"], sched["due_at"]
     c = get_conn()
-    c.execute("INSERT INTO mastery(id,space_id,point,score,attempts,correct,wrong,box,due_at,status,updated_at) "
-              "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+    c.execute("INSERT INTO mastery(id,space_id,point,score,attempts,correct,wrong,box,due_at,status,"
+              "updated_at,state,step,stability,difficulty,last_review) "
+              "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
               "ON CONFLICT(space_id,point) DO UPDATE SET score=excluded.score, attempts=excluded.attempts, "
               "correct=excluded.correct, wrong=excluded.wrong, box=excluded.box, due_at=excluded.due_at, "
-              "status=excluded.status, updated_at=excluded.updated_at",
+              "status=excluded.status, updated_at=excluded.updated_at, state=excluded.state, "
+              "step=excluded.step, stability=excluded.stability, difficulty=excluded.difficulty, "
+              "last_review=excluded.last_review",
               (new_id(), space_id, point, round(score, 4), attempts, correct, wrong,
-               box, due, _mastery_status(score), now()))
+               box, due, _mastery_status(score), now(),
+               sched["state"], sched["step"], sched["stability"], sched["difficulty"], sched["last_review"]))
     add_mastery_history(space_id, point, round(score, 4), verdict)
     c.commit()
     return get_mastery_point(space_id, point)
@@ -773,7 +885,8 @@ def add_flashcards(space_id: str, cards: list[dict]) -> list[dict]:
     return saved
 
 
-def list_flashcards(space_id: str, due_only: bool = False, limit: int = 30) -> list[dict[str, Any]]:
+def list_flashcards(space_id: str, due_only: bool = False, limit: int = 30,
+                    with_preview: bool = False) -> list[dict[str, Any]]:
     sql = "SELECT * FROM flashcards WHERE space_id=?"
     params: list[Any] = [space_id]
     if due_only:
@@ -782,7 +895,11 @@ def list_flashcards(space_id: str, due_only: bool = False, limit: int = 30) -> l
     sql += " ORDER BY due_at ASC LIMIT ?"
     params.append(limit)
     rows = get_conn().execute(sql, params).fetchall()
-    return rows_to_dicts(rows)
+    cards = rows_to_dicts(rows)
+    if with_preview:  # 到期复习流：附四档评分的下次间隔（秒）供按钮预告
+        for card in cards:
+            card["preview"] = _fsrs.preview_intervals(card)
+    return cards
 
 
 def flashcard_stats(space_id: str) -> dict[str, int]:
@@ -793,20 +910,28 @@ def flashcard_stats(space_id: str) -> dict[str, int]:
     return {"total": total, "due": due}
 
 
-def grade_flashcard(space_id: str, fid: str, know: bool) -> dict[str, Any] | None:
-    """刷卡自评：记得 → 推进复习盒；忘了 → 回到盒1（10 分钟后重现）。"""
+def grade_flashcard(space_id: str, fid: str, know: bool | None = None,
+                    rating: int = 0) -> dict[str, Any] | None:
+    """刷卡自评走 FSRS 调度。rating 1..4（忘了/困难/良好/轻松）优先；
+    旧调用只传 know 布尔时映射：记得→良好(3)、忘了→忘了(1)。"""
     c = get_conn()
     r = c.execute("SELECT * FROM flashcards WHERE id=? AND space_id=?", (fid, space_id)).fetchone()
     if not r:
         return None
-    if know:
-        box = min(r["box"] + 1, 5)
-        due = now() + _BOX_DELAYS[box]
-    else:
-        box, due = 1, now() + 600.0
-    c.execute("UPDATE flashcards SET box=?, due_at=? WHERE id=?", (box, due, fid))
+    if rating not in (_fsrs.R_AGAIN, _fsrs.R_HARD, _fsrs.R_GOOD, _fsrs.R_EASY):
+        rating = _fsrs.R_GOOD if know else _fsrs.R_AGAIN
+    row = dict(r)
+    sched = _fsrs.review(row, rating)
+    reps = int(row["reps"] or 0) + 1
+    lapses = int(row["lapses"] or 0) + (1 if rating == _fsrs.R_AGAIN else 0)
+    c.execute("UPDATE flashcards SET box=?, due_at=?, state=?, step=?, stability=?, difficulty=?, "
+              "last_review=?, reps=?, lapses=? WHERE id=?",
+              (sched["box"], sched["due_at"], sched["state"], sched["step"], sched["stability"],
+               sched["difficulty"], sched["last_review"], reps, lapses, fid))
     c.commit()
-    return {"id": fid, "box": box, "due_at": due}
+    return {"id": fid, "box": sched["box"], "due_at": sched["due_at"],
+            "interval": sched["interval_seconds"], "state": sched["state"],
+            "stability": sched["stability"], "reps": reps, "lapses": lapses}
 
 
 def clear_flashcards(space_id: str) -> None:
@@ -822,13 +947,35 @@ def replace_plan_tasks(space_id: str, tasks: list[dict]) -> None:
     c = get_conn()
     c.execute("DELETE FROM plan_tasks WHERE space_id=?", (space_id,))
     for t in tasks:
-        c.execute("INSERT INTO plan_tasks(id,space_id,phase,content,accept,points,due_date,created_at) "
-                  "VALUES(?,?,?,?,?,?,?,?)",
-                  (new_id(), space_id, (t.get("phase") or "").strip()[:80],
-                   (t.get("content") or "").strip(), (t.get("accept") or "").strip(),
-                   json.dumps(t.get("points") or [], ensure_ascii=False),
-                   (t.get("due_date") or "").strip()[:10], now()))
+        add_plan_task(space_id, t)
+
+
+def add_plan_task(space_id: str, t: dict, source_plan: str = "",
+                  done: int = 0, done_at: float = 0) -> str:
+    c = get_conn()
+    tid = new_id()
+    due = (t.get("due_date") or t.get("due") or "").strip()[:10]
+    c.execute("INSERT INTO plan_tasks(id,space_id,phase,content,accept,points,due_date,source_plan,done,done_at,created_at) "
+              "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+              (tid, space_id, (t.get("phase") or "").strip()[:80],
+               (t.get("content") or "").strip(), (t.get("accept") or "").strip(),
+               json.dumps(t.get("points") or [], ensure_ascii=False),
+               due, source_plan, done, done_at, now()))
     c.commit()
+    return tid
+
+
+def delete_plan_tasks_by_source(space_id: str, source_plan: str, keep_done: bool = False) -> int:
+    """删除某学涯计划同步到空间的任务（push 重新同步/删除计划时用）。"""
+    c = get_conn()
+    if keep_done:
+        n = c.execute("DELETE FROM plan_tasks WHERE space_id=? AND source_plan=? AND done=0",
+                      (space_id, source_plan)).rowcount
+    else:
+        n = c.execute("DELETE FROM plan_tasks WHERE space_id=? AND source_plan=?",
+                      (space_id, source_plan)).rowcount
+    c.commit()
+    return n
 
 
 def list_plan_tasks(space_id: str) -> list[dict[str, Any]]:
@@ -995,6 +1142,12 @@ def set_space_edges(space_id: str, edges: list[dict], source: str) -> int:
     return n
 
 
+def count_space_edges(space_id: str, source: str) -> int:
+    r = get_conn().execute("SELECT COUNT(*) AS n FROM concept_edges WHERE space_id=? AND source=?",
+                           (space_id, source)).fetchone()
+    return r["n"]
+
+
 def list_edges(space_id: str) -> list[dict[str, Any]]:
     return rows_to_dicts(get_conn().execute(
         "SELECT from_point, to_point, source FROM concept_edges WHERE space_id=?", (space_id,)).fetchall())
@@ -1012,9 +1165,10 @@ def replace_schedule(term: str, courses: list[dict]) -> int:
         if not name:
             continue
         try:
-            day = max(1, min(7, int(t.get("day") or 1)))
+            raw_day = int(t.get("day") or 0)
         except (TypeError, ValueError):
-            day = 1
+            raw_day = 0
+        day = min(7, max(0, raw_day))  # 0 表示星期未定，保留原始语义而不强行归入周一
         c.execute(
             "INSERT INTO course_schedule(id,term,day,period,course,teacher,room,weeks,kind,created_at) "
             "VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -1032,8 +1186,10 @@ def list_schedule(term: str) -> list[dict[str, Any]]:
 
 
 def list_schedule_terms() -> list[dict[str, Any]]:
+    # 按最近一次写入时间排序（学期名混合"2025-2026-1"与"大二上"等格式时字符串序不可靠）
     return rows_to_dicts(get_conn().execute(
-        "SELECT term, COUNT(*) AS courses FROM course_schedule GROUP BY term ORDER BY term DESC").fetchall())
+        "SELECT term, COUNT(*) AS courses FROM course_schedule GROUP BY term "
+        "ORDER BY MAX(created_at) DESC").fetchall())
 
 
 def delete_schedule(term: str) -> None:
@@ -1091,13 +1247,21 @@ def toggle_career_task(pid: str, task_id: str, done: bool) -> dict[str, Any] | N
     c = get_conn()
     c.execute("UPDATE career_plans SET tasks=? WHERE id=?",
               (json.dumps(plan["tasks"], ensure_ascii=False), pid))
+    # 计划内打卡同步到已推送到课程空间的任务（同来源且内容一致），两处状态不再各管各的
+    c.execute(
+        "UPDATE plan_tasks SET done=?, done_at=? WHERE source_plan=? AND content=?",
+        (1 if done else 0, now() if done else 0, pid, hit.get("content") or ""))
     c.commit()
     return hit
 
 
-def delete_career_plan(pid: str) -> None:
-    get_conn().execute("DELETE FROM career_plans WHERE id=?", (pid,))
-    get_conn().commit()
+def delete_career_plan(pid: str) -> dict[str, int]:
+    """删除学涯计划，并移除它同步到各空间的任务（计划是任务的唯一来源）。"""
+    c = get_conn()
+    pushed = c.execute("DELETE FROM plan_tasks WHERE source_plan=?", (pid,)).rowcount
+    c.execute("DELETE FROM career_plans WHERE id=?", (pid,))
+    c.commit()
+    return {"deleted_plan": 1, "deleted_pushed_tasks": pushed}
 
 
 # ---------- 自定义培养方案（导入本校培养手册解析入库） ----------
@@ -1112,8 +1276,26 @@ def save_syllabus_custom(school: str, major: str, data: dict, source: str = "") 
 
 
 def get_syllabus_custom(school: str, major: str) -> dict[str, Any] | None:
-    r = get_conn().execute("SELECT * FROM syllabus_custom WHERE school=? AND major=?",
-                           (school, major)).fetchone()
+    """精确匹配 → 导入时登记的别名 → 专业名相似度回落
+    （导入时的存储键来自 LLM 抽取/模板名，与用户查询表述可能存在漂移）。"""
+    c = get_conn()
+    r = c.execute("SELECT * FROM syllabus_custom WHERE school=? AND major=?",
+                  (school, major)).fetchone()
+    if not r:
+        import difflib
+        best, best_score = None, 0.0
+        for row in c.execute("SELECT * FROM syllabus_custom WHERE school=?", (school,)).fetchall():
+            try:
+                aliases = json.loads(row["data"]).get("aliases") or []
+            except (ValueError, AttributeError):
+                aliases = []
+            score = 1.0 if major in aliases else 0.0
+            ratio = difflib.SequenceMatcher(None, row["major"], major).ratio()
+            if ratio > score:
+                score = ratio
+            if score > best_score:
+                best, best_score = row, score
+        r = best if best and best_score >= 0.55 else None
     if not r:
         return None
     d = dict(r)

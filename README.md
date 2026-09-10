@@ -15,7 +15,8 @@ WorkBuddy 架构（模式 / 技能 / 专家团 / 连接器 / 项目空间）× D
 │ 技能 quiz.generate / quiz.grade / wrong.redo / wrong.variants │
 │     / note.summarize / plan.study / review.generate …         │
 │ 三层记忆 L1镜像 → L2摘要(LLM压缩) → L3长期档案(错题/薄弱点)     │
-│ RAG: pymupdf解析 → 分块 → BGE向量 → 余弦检索(带引用)           │
+│ RAG: pymupdf解析 → 分块 → BGE向量 × BM25词法 双通道RRF融合      │
+│     (带引用；可选 cross-encoder 精排 RERANK_MODEL)             │
 │ 教材书库: 预置书目 + 官方免费教材直链获取 + 自有教材上传          │
 │          + 挂载到课程空间参与 RAG（library.py）                │
 │ 连接器: 本地上传 + MCP 客户端骨架(connectors.py)               │
@@ -64,12 +65,13 @@ cd frontend && pnpm install && pnpm dev   # http://localhost:5173
 7. 错题本：整卷/勾选「重做」原题，或「变式训练」——对错题生成同知识点、
    换数字/换情境/换问法的变式题，检验真理解而非背答案
 8. 测验页「费曼讲解检验」：用自己的话讲一个概念，判卷专家评估准确/遗漏/误解并更新掌握度
-9. 闪卡页从讲义生成问答卡，按 Leitner 记忆盒刷卡复习（记得→间隔翻倍，忘了→10 分钟后重现）
+9. 闪卡页从讲义生成问答卡，按 **FSRS 记忆算法**四档刷卡（忘了/困难/良好/轻松，按钮预告下次间隔）：
+   目标记住率 90%，间隔随个人评分历史自适应；新卡先经分钟级学习步进，答对毕业进入天级间隔
 10. 学习计划页：目标一键拆成分阶段任务清单（自动带截止日期，可手动改期），完成打卡；
     掌握度历史按天画趋势线
 11. 记忆图谱页查看缺陷诊断、依赖图谱（力导向 SVG：节点按掌握状态着色、箭头指向后继、
     点节点看前置/后继并可一键"出 3 题练它"）、到期复习与趋势；一键「生成薄弱点复习题」
-    （Leitner 间隔复习：30分钟 → 1天 → 3天 → 7天 → 14天）
+    （FSRS 间隔复习：按每人的评分历史自适应排期，遗忘快的知识点更快重现）
 12. 学习报告 / 错题本 / 学习计划均可一键导出 Markdown 存档
 
 ## 学涯规划 · 培养方案库 · 课程表 · 目标导向计划
@@ -122,13 +124,20 @@ cd frontend && pnpm install && pnpm dev   # http://localhost:5173
 
 ## 闪卡与学习计划
 
-- **闪卡**：表 `flashcards` 自带 Leitner 复习盒（box 1..5，间隔同掌握度复习），刷卡自评
-  「记得/忘了」调度重现时间；`GET /api/spaces/{sid}/flashcards?due=1` 取到期卡。
+- **闪卡（FSRS 调度）**：`flashcards` 表带 FSRS 状态（state/step/stability/difficulty/last_review +
+  reps/lapses 计数），封装在 `app/fsrs.py`（[py-fsrs](https://github.com/open-spaced-repetition/py-fsrs)，
+  MIT）；刷卡自评四档「忘了/困难/良好/轻松」（旧「记得/忘了」布尔仍兼容，映射良好/忘了），
+  目标留存率 0.9、单卡最长一年重现；到期查询 `GET /api/spaces/{sid}/flashcards?due=1`
+  附带四档按钮的下次间隔预告。老 Leitner 数据零迁移：首次评分按旧盒位间隔折算初始稳定性后由
+  FSRS 接管，`box` 列保留仅作展示。
+- **知识点复习排期**：`mastery` 表同构 FSRS 列，BKT 只负责 P(已掌握)，复习间隔由 FSRS 按证据
+  档位（correct→良好 / partial·progress→困难 / confused·wrong→忘了）调度，答错稳定性坍缩、
+  很快重现。
 - **学习计划**：`plan.study` 输出结构化阶段任务（内容/验收标准/涉及知识点/截止日期，
   今天日期注入 prompt 由模型按阶段推算）存 `plan_tasks` 表（`due_date` 列，老库自动迁移），
   前端打卡并计算进度；`POST /api/spaces/{sid}/plan/{tid}/date` 可改期；
   重新生成会整体替换当前计划。
-- **今日学习**：`GET /api/spaces/{sid}/today` 聚合到期复习点（Leitner）、到期闪卡、
+- **今日学习**：`GET /api/spaces/{sid}/today` 聚合到期复习点（FSRS）、到期闪卡、
   今日/逾期/未排期计划任务与今日打卡数、错题数——学生每天打开就知道该学什么。
 
 ## 模型通道：本地 / 云端
@@ -137,6 +146,18 @@ cd frontend && pnpm install && pnpm dev   # http://localhost:5173
   `local` 全本地 / `auto` 重任务（出题/判卷/分析/规划/抽取）走云端 / `cloud` 全云端。
 - 任何通道失败自动回退本地；`POST /api/llm/test` 一键实测双通道连通性与延迟。
 - 云端密钥仅存本机 `data/llm_config.json`（接口只回掩码）。
+
+## 混合检索（向量 × BM25，RRF 融合）
+
+答疑/出题的讲义检索是**双通道**（`rag.retrieve`，封装在 `app/rag.py`）：
+
+- **向量通道**：BGE 语义检索，负责换说法的语义匹配；
+- **BM25 词法通道**：中文按字+二元组、拉丁按整词（零依赖纯 Python 实现，索引按空间缓存），
+  专有名词、公式符号、章节标题等"词面精确匹配"场景向量检索常漏召，由该通道补齐；
+- **RRF 融合**：两通道排名倒数融合（k=60，每通道超采 3×），引用里的 score 为融合归一化
+  相关度（Top1=1.0）；`HYBRID_SEARCH=0` 可退回纯向量模式；
+- **可选精排**：配置 `RERANK_MODEL`（如 `BAAI/bge-reranker-v2-m3`）后对融合候选做
+  cross-encoder 重排（首次使用自动下载，失败静默回退融合序），留空关闭。
 
 ## 防降智措施
 
@@ -153,7 +174,8 @@ cd frontend && pnpm install && pnpm dev   # http://localhost:5173
 - **贝叶斯知识追踪（BKT）**：每次测验/反馈证据都做贝叶斯后验更新 P(已掌握)——
   参数 P(学习转移)=0.13、P(失误)=0.10、P(蒙对) 按题型区分（选择/判断 0.25、简答 0.05），
   部分/混淆类证据按强度做软观测混合，不再是无依据的固定加减分；
-- **遗忘曲线留存率**：按 Leitner 复习盒对应的半衰期估算"此刻还记得多少"
+- **遗忘曲线留存率**：优先按 FSRS 幂律遗忘曲线（R = (1 + 19/81·Δt/S)^-0.5，S 为该知识点
+  的个人稳定性）估算"此刻还记得多少"，无 FSRS 状态的老数据退回复习盒半衰期公式
   （R = 0.5^(Δt/半衰期)），掌握但久未复习的知识点会浮上来；
 - **前置依赖风险传播**：知识点依赖图（讲义 LLM 抽取 + 内置课程图谱）上做松弛传播，
   前置薄弱按 0.6 系数拖累后继的"有效掌握度"——高斯定理不会了，可能根因在场强叠加；

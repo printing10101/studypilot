@@ -5,6 +5,9 @@
 """
 import json
 import os
+import queue
+import threading
+import time
 
 import httpx
 
@@ -15,16 +18,22 @@ from .config import settings
 
 
 def import_local_folder(space_id: str, folder: str) -> list[dict]:
-    """把文件夹下所有 PDF/TXT/MD 导入空间并建立索引。"""
+    """把文件夹下所有 PDF/TXT/MD 导入空间并建立索引（同一文件不重复导入）。"""
     results = []
+    seen_paths = {os.path.abspath(r["path"]) for r in db.rows_to_dicts(
+        db.get_conn().execute(
+            "SELECT path FROM documents WHERE space_id=?", (space_id,)).fetchall()) if r["path"]}
     for root, _dirs, files in os.walk(folder):
         for fn in files:
             if not fn.lower().endswith(ingest.DOC_EXTS + ingest.IMAGE_EXTS):
                 continue
             path = os.path.join(root, fn)
+            if os.path.abspath(path) in seen_paths:
+                continue
             did = db.add_document(space_id, fn, path)
             try:
                 n = rag.index_document(space_id, did)
+                seen_paths.add(os.path.abspath(path))
                 results.append({"filename": fn, "status": "ready", "chunks": n})
             except Exception as e:
                 results.append({"filename": fn, "status": "error", "error": str(e)[:200]})
@@ -46,6 +55,7 @@ class McpClient:
         self._proc = None
         self._req_id = 0
         self._inited = False
+        self._lines: queue.Queue = queue.Queue()
 
     def start(self):
         import subprocess
@@ -53,23 +63,41 @@ class McpClient:
             self._proc = subprocess.Popen(
                 self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 text=True, encoding="utf-8", shell=False)
+            # 独立读线程把 stdout 泵入队列：readline() 直接读会无限阻塞，
+            # server 挂起时整个聊天请求都会被卡死
+            threading.Thread(target=self._pump, daemon=True, name=f"mcp-{self.name}").start()
+
+    def _pump(self) -> None:
+        try:
+            assert self._proc and self._proc.stdout
+            for line in self._proc.stdout:
+                self._lines.put(line)
+        except Exception:
+            pass
+        self._lines.put("")  # EOF 哨兵
 
     def _send(self, payload: dict) -> None:
         assert self._proc and self._proc.stdin
         self._proc.stdin.write(json.dumps(payload) + "\n")
         self._proc.stdin.flush()
 
-    def _rpc(self, method: str, params: dict | None = None) -> dict:
+    def _rpc(self, method: str, params: dict | None = None, timeout: float = 30.0) -> dict:
         self.start()
         assert self._proc and self._proc.stdout
         self._req_id += 1
         req = {"jsonrpc": "2.0", "id": self._req_id, "method": method, "params": params or {}}
         self._send(req)
         while True:
-            line = self._proc.stdout.readline()
+            try:
+                line = self._lines.get(timeout=timeout)
+            except queue.Empty:
+                raise RuntimeError(f"MCP server {self.name} 响应超时（>{int(timeout)}s）")
             if not line:
-                raise RuntimeError(f"MCP server {self.name} 无响应")
-            msg = json.loads(line)
+                raise RuntimeError(f"MCP server {self.name} 无响应（进程已退出）")
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue  # 非 JSON 行（server 日志等）跳过
             if msg.get("id") == self._req_id:
                 if "error" in msg:
                     raise RuntimeError(str(msg["error"]))
@@ -89,13 +117,13 @@ class McpClient:
             self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
             self._inited = True
 
-    def list_tools(self) -> list:
+    def list_tools(self, timeout: float = 15.0) -> list:
         self.ensure_init()
-        return self._rpc("tools/list").get("tools", [])
+        return self._rpc("tools/list", timeout=timeout).get("tools", [])
 
-    def call_tool(self, tool: str, arguments: dict) -> dict:
+    def call_tool(self, tool: str, arguments: dict, timeout: float = 120.0) -> dict:
         self.ensure_init()
-        return self._rpc("tools/call", {"name": tool, "arguments": arguments})
+        return self._rpc("tools/call", {"name": tool, "arguments": arguments}, timeout=timeout)
 
 
 # 已注册的 MCP server（name -> command），注册持久化在 meta 表，重启后自动恢复
@@ -127,6 +155,7 @@ def register_mcp(name: str, command: list[str]) -> None:
     if len(command) > 32:
         raise ValueError("启动命令参数过多（上限 32 个）")
     _mcp_servers[name] = McpClient(name, command)
+    _invalidate_tools_cache()
     db.set_meta(_MCP_META_KEY, json.dumps(
         {n: c.command for n, c in _mcp_servers.items()}, ensure_ascii=False))
 
@@ -140,22 +169,43 @@ def remove_mcp(name: str) -> bool:
             client._proc.terminate()
     except Exception:
         pass
+    _invalidate_tools_cache()
     db.set_meta(_MCP_META_KEY, json.dumps(
         {n: c.command for n, c in _mcp_servers.items()}, ensure_ascii=False))
     return True
 
 
+_TOOLS_TTL = 300.0  # 工具清单缓存 5 分钟，避免每条聊天消息都同步拉一遍 list_tools
+_tools_cache: list[dict] | None = None
+_tools_cached_at = 0.0
+_tools_lock = threading.Lock()
+
+
+def _invalidate_tools_cache() -> None:
+    global _tools_cache
+    with _tools_lock:
+        _tools_cache = None
+
+
 def all_tools() -> list[dict]:
-    """汇总所有已注册 server 的工具清单：[{server, name, description}]，单个失败不影响整体。"""
-    tools = []
-    for client in _mcp_servers.values():
-        try:
-            for t in client.list_tools():
-                tools.append({"server": client.name, "name": t.get("name", ""),
-                              "description": (t.get("description") or "")[:200]})
-        except Exception:
-            continue
-    return tools
+    """汇总所有已注册 server 的工具清单：[{server, name, description}]。
+
+    带缓存（TTL 5 分钟），单个 server 失败/超时只影响它自己的工具。"""
+    global _tools_cache, _tools_cached_at
+    with _tools_lock:
+        if _tools_cache is not None and time.time() - _tools_cached_at < _TOOLS_TTL:
+            return _tools_cache
+        tools = []
+        for client in _mcp_servers.values():
+            try:
+                for t in client.list_tools():
+                    tools.append({"server": client.name, "name": t.get("name", ""),
+                                  "description": (t.get("description") or "")[:200]})
+            except Exception:
+                continue
+        _tools_cache = tools
+        _tools_cached_at = time.time()
+        return tools
 
 
 def call_mcp_tool(server: str, tool: str, arguments: dict) -> str:

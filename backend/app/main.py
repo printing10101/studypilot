@@ -82,7 +82,8 @@ class RedoIn(BaseModel):
 
 
 class FlashGradeIn(BaseModel):
-    know: bool
+    know: bool | None = None   # 旧两档自评：记得/忘了（兼容保留）
+    rating: int | None = None  # FSRS 四档：1=忘了 2=困难 3=良好 4=轻松，优先于 know
 
 
 class ToggleIn(BaseModel):
@@ -205,7 +206,11 @@ def api_library_import_url(body: UrlIn):
 
 @app.post("/api/library/{bid}/fetch")
 def api_library_fetch(bid: str):
-    return library.fetch_pdf(bid)
+    try:
+        return library.fetch_pdf(bid)
+    except ValueError as e:
+        # 书目不存在 / 无直链 / 下载失败等业务原因，前端弹明确提示而非 500
+        raise HTTPException(400, str(e))
 
 
 @app.post("/api/library/{bid}/attach")
@@ -222,8 +227,7 @@ def api_library_book_spaces(bid: str):
 
 @app.delete("/api/library/{bid}")
 def api_library_delete(bid: str):
-    db.delete_book(bid)
-    return {"ok": True}
+    return library.delete_book(bid)
 
 
 # ---------- 项目空间 ----------
@@ -294,6 +298,18 @@ def api_upload(sid: str, file: UploadFile = File(...)):
         raise HTTPException(400, f"索引失败: {e}")
 
 
+@app.delete("/api/spaces/{sid}/documents/{did}")
+def api_delete_document(sid: str, did: str):
+    """删除知识库文档（含向量、磁盘文件；若为挂载教材则同时解除挂载）。"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    doc = db.get_document(did)
+    if not doc or doc["space_id"] != sid:
+        raise HTTPException(404, "文档不存在")
+    db.delete_document(did)
+    return {"ok": True}
+
+
 # ---------- 聊天 ----------
 
 @app.get("/api/spaces/{sid}/messages")
@@ -305,8 +321,12 @@ def api_messages(sid: str):
 def api_chat(sid: str, body: ChatIn):
     if not db.get_space(sid):
         raise HTTPException(404, "空间不存在")
-    reply, citations, expert, user_mid, assistant_mid = experts.answer(
-        sid, body.mode, body.message, guide=body.guide)
+    try:
+        reply, citations, expert, user_mid, assistant_mid = experts.answer(
+            sid, body.mode, body.message, guide=body.guide)
+    except RuntimeError as e:
+        # 模型通道不可用与技能/手册端点保持一致：502 + 明确原因，而非裸 500
+        raise HTTPException(502, f"模型通道失败: {str(e)[:200]}")
     return {"reply": reply, "citations": citations, "expert": expert,
             "user_message_id": user_mid, "assistant_message_id": assistant_mid}
 
@@ -319,25 +339,35 @@ def api_chat_stream(sid: str, body: ChatIn):
     def gen():
         yield "data: " + json.dumps({"type": "meta"}) + "\n\n"
         full = []
-        # 与非流式共用 prompt 组装（专家路由 + 上下文预算 + 记忆注入），避免两条路径行为漂移
-        system, _expert_key, hits = experts.build_prompt(sid, body.mode, body.message, guide=body.guide)
-        expert_key = _expert_key
-        expert_name = experts.EXPERTS.get(expert_key, experts.EXPERTS["qa"])["name"]
-        messages = [{"role": "system", "content": system},
-                    {"role": "user", "content": body.message}]
-        for delta in llm.chat_stream(messages):
-            full.append(delta)
-            yield "data: " + json.dumps({"type": "delta", "text": delta}, ensure_ascii=False) + "\n\n"
-        reply = "".join(full).strip()
-        citations = [{"index": i + 1, "source": h["source"], "score": round(h["score"], 3),
-                      "snippet": h["text"][:120]} for i, h in enumerate(hits)]
-        db.add_message(sid, body.mode, "user", body.message)
-        assistant_mid = db.add_message(sid, body.mode, "assistant", reply, expert=expert_name, citations=citations)
-        # 学习分析后台化：done 事件不被 3 次串行 LLM 调用推迟
-        experts.maybe_update_memory_async(sid)
-        yield "data: " + json.dumps({"type": "done", "expert": expert_name, "citations": citations,
-                                     "assistant_message_id": assistant_mid},
-                                    ensure_ascii=False) + "\n\n"
+        try:
+            # 先落库用户提问：模型/检索失败时问题不丢失
+            user_mid = db.add_message(sid, body.mode, "user", body.message)
+            # 与非流式共用 prompt 组装（专家路由 + 上下文预算 + 记忆注入），避免两条路径行为漂移
+            system, _expert_key, hits = experts.build_prompt(sid, body.mode, body.message, guide=body.guide)
+            expert_key = _expert_key
+            expert_name = experts.EXPERTS.get(expert_key, experts.EXPERTS["qa"])["name"]
+            messages = [{"role": "system", "content": system},
+                        {"role": "user", "content": body.message}]
+            for delta in llm.chat_stream(messages):
+                full.append(delta)
+                yield "data: " + json.dumps({"type": "delta", "text": delta}, ensure_ascii=False) + "\n\n"
+            reply = "".join(full).strip()
+            if not reply:
+                reply = "（模型未返回有效内容，请重试或在模型设置页检查通道连通性。）"
+            citations = [{"index": i + 1, "source": h["source"], "score": round(h["score"], 3),
+                          "snippet": h["text"][:120]} for i, h in enumerate(hits)]
+            assistant_mid = db.add_message(sid, body.mode, "assistant", reply,
+                                           expert=expert_name, citations=citations)
+            # 学习分析后台化：done 事件不被 3 次串行 LLM 调用推迟
+            experts.maybe_update_memory_async(sid)
+            yield "data: " + json.dumps({"type": "done", "expert": expert_name, "citations": citations,
+                                         "assistant_message_id": assistant_mid},
+                                        ensure_ascii=False) + "\n\n"
+        except Exception as e:
+            # 明确告知前端失败原因，而不是让流静默断掉（前端显示"正在输入"到天荒地老）
+            yield "data: " + json.dumps({"type": "error",
+                                         "message": f"生成回答失败：{str(e)[:200]}"},
+                                        ensure_ascii=False) + "\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -378,7 +408,11 @@ def api_run_skill(sid: str, body: SkillIn):
         if body.skill == "graph.build":
             return skills.graph_build(sid)
     except (KeyError, ValueError) as e:
-        raise HTTPException(400, f"参数错误: {e}")
+        # ValueError 携带具体业务原因（"没有可重做的错题"/"出题结果格式异常"…），直接透传
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        # 模型通道不可用属于上游故障，不要伪装成用户的参数错误
+        raise HTTPException(502, f"模型通道失败: {str(e)[:200]}")
     raise HTTPException(400, "未知技能")
 
 
@@ -438,13 +472,15 @@ def api_wrong_redo(sid: str, body: RedoIn):
 def api_flashcards(sid: str, due: int = 0, limit: int = 30):
     if not db.get_space(sid):
         raise HTTPException(404, "空间不存在")
-    return {"cards": db.list_flashcards(sid, due_only=bool(due), limit=limit),
+    return {"cards": db.list_flashcards(sid, due_only=bool(due), limit=limit, with_preview=bool(due)),
             "stats": db.flashcard_stats(sid)}
 
 
 @app.post("/api/spaces/{sid}/flashcards/{fid}/grade")
 def api_flashcard_grade(sid: str, fid: str, body: FlashGradeIn):
-    r = db.grade_flashcard(sid, fid, body.know)
+    if body.rating is None and body.know is None:
+        raise HTTPException(400, "缺少评分：rating(1..4) 或 know(bool)")
+    r = db.grade_flashcard(sid, fid, know=body.know, rating=int(body.rating or 0))
     if not r:
         raise HTTPException(404, "闪卡不存在")
     return r
@@ -560,7 +596,12 @@ def api_export(sid: str, kind: str = "report"):
 
 @app.post("/api/handbook/generate")
 def api_handbook_generate(body: HandbookIn):
-    return handbook.generate(body.space_id, body.model_dump())
+    try:
+        return handbook.generate(body.space_id, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"手册生成失败（检查模型通道）：{str(e)[:200]}")
 
 
 @app.get("/api/handbook")
@@ -660,6 +701,8 @@ def api_syllabus_import_text(body: SyllabusImportIn):
         return syllabus.import_handbook(body.school, body.major, body.text, source="粘贴文本")
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(502, f"培养方案抽取失败（检查模型通道）：{str(e)[:200]}")
 
 
 @app.post("/api/syllabus/import/file")
@@ -682,6 +725,8 @@ def api_syllabus_import_file(school: str, major: str = "", file: UploadFile = Fi
         return syllabus.import_handbook(school, major, text, source=display_name)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(502, f"培养方案抽取失败（检查模型通道）：{str(e)[:200]}")
 
 
 @app.get("/api/schedule")
@@ -768,15 +813,15 @@ def api_planner_toggle(pid: str, body: PlanToggleIn):
 @app.post("/api/planner/{pid}/push")
 def api_planner_push(pid: str, body: PlanPushIn):
     try:
-        return {"synced": planner.push_to_space(pid, body.space_id, body.replace)}
+        return planner.push_to_space(pid, body.space_id, body.replace)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
 
 @app.delete("/api/planner/{pid}")
 def api_planner_delete(pid: str):
-    planner.delete_plan(pid)
-    return {"ok": True}
+    r = planner.delete_plan(pid)
+    return {"ok": True, "removed_pushed_tasks": r.get("deleted_pushed_tasks", 0)}
 
 
 # ---------- LLM 通道配置（本地 / 云端） ----------

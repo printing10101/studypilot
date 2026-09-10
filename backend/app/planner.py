@@ -35,9 +35,26 @@ def _term_index(year: str) -> int:
     return 0
 
 
+def _year_digit(year: str) -> int:
+    m = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
+    for ch in (year or ""):
+        if ch in m:
+            return m[ch]
+    return 0
+
+
 def _pick_semester_plan(program: dict, year: str) -> list[dict]:
-    """从培养方案的分学期序列里，取出当前学期及之后的规划。"""
+    """从培养方案的分学期序列里，取出当前学期及之后的规划。
+
+    兼容两种条目粒度：8 学期制（"大一上"…，按学期序号切片）与
+    学年制（临床医学等五年制的"大一…大五"，按年级对齐）。"""
     plan = program.get("semester_plan") or []
+    if not plan:
+        return plan
+    terms = [str(p.get("term") or "") for p in plan]
+    if terms and all(t and "大" in t and "上" not in t and "下" not in t for t in terms):
+        y = _year_digit(year)
+        return plan[y - 1:] if y and len(plan) >= y else plan
     cur = _term_index(year)
     if cur and len(plan) >= cur:
         return plan[cur - 1:]
@@ -103,8 +120,11 @@ def generate(school: str, major: str, year: str, goal_type: str,
     weak_ctx = _weak_ctx()
     goal_desc = GOALS.get(goal_type, goal_type)
 
-    # 升学/就业政策补充（政策库有就注入，标注来源；没有不阻塞）
-    policy_hits = handbook.retrieve_policy(f"{goal_type} {target} {school} {major} 时间线", top_k=4)
+    # 升学/就业政策补充（政策库有就注入，标注来源；没有或嵌入模型不可用都不阻塞）
+    try:
+        policy_hits = handbook.retrieve_policy(f"{goal_type} {target} {school} {major} 时间线", top_k=4)
+    except Exception:
+        policy_hits = []  # 嵌入模型加载失败等场景降级为无政策上下文，规划主流程继续
     policy_ctx = "\n\n".join(f"[政策{i}｜{h['source']}]\n{h['text']}" for i, h in enumerate(policy_hits, 1)) \
         or "（政策库暂无相关条目）"
 
@@ -184,34 +204,40 @@ def generate(school: str, major: str, year: str, goal_type: str,
             "course_spaces": _match_space_courses(db.list_spaces(), course_names)}
 
 
-def push_to_space(pid: str, space_id: str, replace: bool = False) -> int:
-    """把学涯计划的任务同步到课程空间 plan_tasks（默认追加，可选整体替换）。"""
+def push_to_space(pid: str, space_id: str, replace: bool = False) -> dict:
+    """把学涯计划的任务同步到课程空间 plan_tasks。
+
+    同步以计划为来源（source_plan）幂等：重复推送同一计划不会产生重复任务；
+    重同步时按 content 保留空间侧已有的完成状态与手工排期；
+    空间里非本计划来源的任务（手工/其他计划）不受影响。
+    replace=True 表示丢弃空间侧该计划旧任务重推（完成状态清零）。
+    """
     plan = db.get_career_plan(pid)
     if not plan:
         raise ValueError("计划不存在")
     if not db.get_space(space_id):
         raise ValueError("目标空间不存在")
-    tasks = [{"phase": t["phase"], "content": t["content"],
-              "accept": t.get("accept", ""), "points": [t.get("course")] if t.get("course") else []}
-             for t in plan["tasks"] if not t.get("done")]
-    if not tasks:
-        raise ValueError("计划中没有未完成任务可同步")
-    if replace:
-        db.replace_plan_tasks(space_id, tasks)
-    else:
-        _append_plan_tasks(space_id, tasks)
-    return len(tasks)
-
-
-def _append_plan_tasks(space_id: str, tasks: list[dict]) -> None:
     c = db.get_conn()
+    prev = db.rows_to_dicts(c.execute(
+        "SELECT content, done, done_at, due_date FROM plan_tasks WHERE space_id=? AND source_plan=?",
+        (space_id, pid)).fetchall())
+    prev_by_content = {p["content"]: p for p in prev}
+    db.delete_plan_tasks_by_source(space_id, pid)
+    tasks = plan["tasks"] or []
+    if not tasks:
+        raise ValueError("计划中没有可同步的任务")
     for t in tasks:
-        c.execute("INSERT INTO plan_tasks(id,space_id,phase,content,accept,points,created_at) "
-                  "VALUES(?,?,?,?,?,?,?)",
-                  (db.new_id(), space_id, (t.get("phase") or "").strip()[:80],
-                   (t.get("content") or "").strip(), (t.get("accept") or "").strip(),
-                   json.dumps(t.get("points") or [], ensure_ascii=False), db.now()))
-    c.commit()
+        old = prev_by_content.get(t["content"]) or {}
+        done, done_at = old.get("done", 0), old.get("done_at", 0)
+        if replace:
+            done, done_at = 0, 0
+        # course 不是知识点，不再塞进 points（语义错位）；课程信息保留在计划任务原文里
+        db.add_plan_task(space_id, {"phase": t["phase"], "content": t["content"],
+                                    "accept": t.get("accept", ""), "points": [],
+                                    "due_date": old.get("due_date", "")},
+                         source_plan=pid, done=int(bool(done)), done_at=done_at or 0)
+    return {"synced": len(tasks), "space_id": space_id,
+            "kept_done": sum(1 for t in tasks if (prev_by_content.get(t["content"]) or {}).get("done"))}
 
 
 def list_plans() -> list[dict]:
@@ -226,5 +252,6 @@ def toggle_task(pid: str, task_id: str, done: bool) -> dict | None:
     return db.toggle_career_task(pid, task_id, done)
 
 
-def delete_plan(pid: str) -> None:
-    db.delete_career_plan(pid)
+def delete_plan(pid: str) -> dict:
+    """删除学涯计划；同步到各空间的派生任务一并移除（返回清理数量供提示）。"""
+    return db.delete_career_plan(pid)

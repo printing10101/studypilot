@@ -109,12 +109,21 @@ def stats() -> dict:
 
 
 def official_sources() -> list[dict]:
-    """已收录官方全文的学校专业清单（展示来源与版本）。"""
-    return [{"school": o["school"], "major": o["major"],
-             "source_version": o.get("source_version", ""),
-             "source_url": o.get("source_url", ""),
-             "sections": o.get("official_sections", [])}
-            for o in _load_overrides()]
+    """已收录官方培养方案层的学校专业清单（含来源与版本）。
+
+    has_fulltext 如实标记全文文件是否就位：handbooks/ 目录需要用户按 source_url
+    自行获取后放入，缺文件时不应向用户宣称"已收录官方全文"。"""
+    out = []
+    for o in _load_overrides():
+        path = os.path.join(HANDBOOK_DIR, o.get("source_file") or "")
+        has = bool(o.get("source_file") and os.path.realpath(path).startswith(HANDBOOK_DIR + os.sep)
+                   and os.path.isfile(path))
+        out.append({"school": o["school"], "major": o["major"],
+                    "source_version": o.get("source_version", ""),
+                    "source_url": o.get("source_url", ""),
+                    "has_fulltext": has,
+                    "sections": o.get("official_sections", [])})
+    return out
 
 
 # ---------- 院校查询 ----------
@@ -274,6 +283,7 @@ def program(school: str, major: str) -> dict:
     override = _match_override(school_name, major_name) if school_name and major_name else None
     custom = db.get_syllabus_custom(school_name, major_name) if school_name and major_name else None
     custom_data = (custom or {}).get("data") or {}
+    custom_data.pop("aliases", None)  # 内部字段，不参与培养方案合并输出
 
     if not tpl and not override and not custom_data:
         out = {
@@ -397,6 +407,10 @@ def import_handbook(school: str, major: str, text: str, source: str = "") -> dic
     clean = {k: data.get(k) for k in _IMPORT_FIELDS}
     clean["major"] = (clean.get("major") or major_hint).strip() or major_hint
     clean["school"] = school_name
+    # 记录用户原始输入与模板名作为别名：LLM 抽取的专业名可能与用户查询表述不一致，
+    # 没有别名映射时会出现"导入成功但查询不生效"
+    user_major = (major or "").strip()
+    clean["aliases"] = sorted({user_major, tpl_name or ""} - {clean["major"], ""})
     clean["source_note"] = (f"由用户导入的本校培养手册抽取（{source or '手动粘贴'}），"
                             "字段仅含手册中明确出现的信息，未覆盖字段将在查看时回落通用模板。")
     db.save_syllabus_custom(school_name, clean["major"], clean, source=source)
