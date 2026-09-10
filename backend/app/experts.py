@@ -4,7 +4,7 @@ import re
 import sys
 import threading
 
-from . import connectors, db, llm, rag
+from . import connectors, db, fatigue, llm, rag
 from .config import settings
 
 # ---------- 专家团（WorkBuddy: 专家 agents） ----------
@@ -162,6 +162,11 @@ def build_prompt(space_id: str, mode: str, question: str,
         system += GUIDE_SUFFIX
     if memory_ctx:
         system += "\n\n以下是该学生的记忆档案，回答时结合其薄弱点个性化作答：\n" + memory_ctx
+    # 疲劳检测：零 LLM 成本的正则信号，高疲劳时调整语气与节奏
+    fatigue_score = fatigue.detect_fatigue(question)
+    fatigue_tip = fatigue.fatigue_hint(fatigue_score)
+    if fatigue_tip:
+        system += fatigue_tip
 
     hits = rag.retrieve(space_id, question)
     # 上下文预算：讲义片段总量不超过剩余字符预算，防止 prompt 超长被截断降智

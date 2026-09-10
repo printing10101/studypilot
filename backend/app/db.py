@@ -229,6 +229,20 @@ CREATE TABLE IF NOT EXISTS syllabus_custom(
   updated_at REAL,
   PRIMARY KEY(school, major)
 );
+CREATE TABLE IF NOT EXISTS question_bank(
+  id TEXT PRIMARY KEY,
+  space_id TEXT NOT NULL,
+  knowledge_point TEXT DEFAULT '',
+  question TEXT NOT NULL,          -- json 题目全文
+  qtype TEXT DEFAULT '',           -- 判断/选择/简答
+  difficulty INTEGER DEFAULT 1,    -- 1=基础 2=应用 3=陷阱
+  times_used INTEGER DEFAULT 0,
+  times_correct INTEGER DEFAULT 0,
+  created_at REAL,
+  last_used_at REAL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_qb_space ON question_bank(space_id);
+CREATE INDEX IF NOT EXISTS idx_qb_point ON question_bank(space_id, knowledge_point);
 """
 
 _local = threading.local()  # 线程本地连接：FastAPI 线程池并发共享单连接会触发 sqlite3 InterfaceError
@@ -1013,6 +1027,7 @@ def today_snapshot(space_id: str) -> dict[str, Any]:
 
     due = due_points(space_id)
     flash = flashcard_stats(space_id)
+    qb = question_bank_stats(space_id)
     return {
         "date": today,
         "due_points": due[:20],
@@ -1023,6 +1038,7 @@ def today_snapshot(space_id: str) -> dict[str, Any]:
         "tasks_unscheduled": [t for t in tasks if not t["done"] and not t["due_date"]][:20],
         "done_today": [t for t in tasks if t["done"] and _day(t["done_at"]) == today],
         "wrong_count": wrong_question_count(space_id),
+        "question_bank": qb,
     }
 
 
@@ -1315,3 +1331,75 @@ def list_syllabus_custom(school: str = "") -> list[dict[str, Any]]:
         rows = get_conn().execute(
             "SELECT school,major,source,updated_at FROM syllabus_custom ORDER BY school, major").fetchall()
     return rows_to_dicts(rows)
+
+
+# ---------- 全局题库（出过的题入库复用，省 token + 正确率可统计） ----------
+
+def add_to_question_bank(space_id: str, questions: list[dict], difficulty: int = 1) -> int:
+    """把出过的题写入题库（按 question 文本去重）。返回新增条数。"""
+    c = get_conn()
+    added = 0
+    for q in questions:
+        if not isinstance(q, dict) or not q.get("question"):
+            continue
+        qtext = q["question"].strip()
+        if len(qtext) < 5:
+            continue
+        # 去重：同空间同题干不重复入库
+        existing = c.execute(
+            "SELECT id FROM question_bank WHERE space_id=? AND question LIKE ?",
+            (space_id, f"%{qtext[:50]}%")).fetchone()
+        if existing:
+            continue
+        c.execute(
+            "INSERT INTO question_bank(id,space_id,knowledge_point,question,qtype,difficulty,times_used,created_at) "
+            "VALUES(?,?,?,?,?,?,0,?)",
+            (new_id(), space_id, q.get("knowledge_point", ""), qtext,
+             q.get("type", ""), difficulty, now()))
+        added += 1
+    c.commit()
+    return added
+
+
+def query_question_bank(space_id: str, points: list[str], limit: int = 5) -> list[dict]:
+    """按知识点查题库中已有的题（模糊匹配）。"""
+    import difflib
+    c = get_conn()
+    rows = c.execute(
+        "SELECT * FROM question_bank WHERE space_id=? ORDER BY times_used ASC, created_at DESC LIMIT 50",
+        (space_id,)).fetchall()
+    matched = []
+    for r in rows:
+        d = dict(r)
+        kp = d.get("knowledge_point", "")
+        if not kp:
+            continue
+        for pt in points:
+            ratio = difflib.SequenceMatcher(None, kp, pt).ratio()
+            if ratio >= 0.5 or pt in kp or kp in pt:
+                try:
+                    d["question_obj"] = json.loads(d["question"])
+                except ValueError:
+                    d["question_obj"] = {"question": d["question"], "type": d.get("qtype", "")}
+                matched.append(d)
+                break
+        if len(matched) >= limit:
+            break
+    return matched
+
+
+def mark_question_used(qb_id: str, correct: bool) -> None:
+    """标记题库中某题被使用过一次，记录是否答对。"""
+    c = get_conn()
+    c.execute(
+        "UPDATE question_bank SET times_used=times_used+1, times_correct=times_correct+?, last_used_at=? WHERE id=?",
+        (1 if correct else 0, now(), qb_id))
+    c.commit()
+
+
+def question_bank_stats(space_id: str) -> dict:
+    c = get_conn()
+    total = c.execute("SELECT COUNT(*) AS n FROM question_bank WHERE space_id=?", (space_id,)).fetchone()["n"]
+    used = c.execute("SELECT COUNT(*) AS n FROM question_bank WHERE space_id=? AND times_used>0",
+                     (space_id,)).fetchone()["n"]
+    return {"total": total, "used": used}

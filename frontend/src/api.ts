@@ -72,6 +72,17 @@ export interface TodayData {
   tasks_unscheduled: PlanTask[]
   done_today: PlanTask[]
   wrong_count: number
+  question_bank?: { total: number; used: number }
+  velocity?: {
+    window_days: number; mastered_in_window: number; concepts_per_day: number
+    velocity_trend: string; concepts_total: number; concepts_mastered: number
+    concepts_remaining: number
+  } | null
+  forecast?: {
+    is_complete: boolean; concepts_remaining: number; confidence: string
+    optimistic_days: number | null; expected_days: number | null; pessimistic_days: number | null
+    optimistic_date: string | null; expected_date: string | null; pessimistic_date: string | null
+  } | null
 }
 export interface GraphNode {
   point: string; p_known: number | null; status: string

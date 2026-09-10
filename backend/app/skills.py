@@ -1,9 +1,9 @@
 """技能系统（WorkBuddy: Skills）：出题 / 判卷 / 总结 / 学习计划 / 薄弱点复习
-/ 错题重做 / 错题变式 / 闪卡 / 费曼检验 / 模拟考试。"""
+/ 错题重做 / 错题变式 / 闪卡 / 费曼检验 / 模拟考试 / 今日一题。"""
 import json
 import time
 
-from . import db, experts, llm, rag
+from . import db, difficulty, experts, llm, rag, velocity
 
 
 def _as_list(data) -> list:
@@ -25,21 +25,43 @@ def _public_questions(questions: list[dict]) -> list[dict]:
 # ---------- quiz.generate ----------
 
 def quiz_generate(space_id: str, topic: str, count: int = 5) -> list[dict]:
-    hits = rag.retrieve(space_id, topic or "课程核心概念", top_k=8)
-    budget = max(2000, experts.settings.max_context_chars - 1500)
-    context = rag.build_context(hits, budget=budget) if hits else "（无讲义片段，按通识出题）"
-    questions = _as_list(llm.chat_json([
-        {"role": "system", "content": experts.EXPERTS["examiner"]["system"]},
-        {"role": "user", "content": (
-            f"围绕「{topic or '本课程重点'}」出 {count} 道题（判断/选择/简答混合）。"
-            f"输出 JSON 数组：[{{\"id\":\"q1\",\"type\":\"判断|选择|简答\",\"question\":\"...\","
-            f"\"options\":[\"A...\",\"B...\",\"C...\",\"D...\"],\"answer\":\"...\",\"knowledge_point\":\"...\"}}]。"
-            f"判断/简答题 options 为空数组。\n\n讲义片段：\n{context}")},
-    ], temperature=0.5, max_tokens=2600, task="quiz"))
-    if not questions:
+    # 1. 先查题库：命中已有题则复用（省 token + 风格稳定）
+    topic_points = [p.strip() for p in (topic or "").replace("；", ";").replace("、", ";").split(";") if p.strip()]
+    bank_hits = db.query_question_bank(space_id, topic_points or ["核心"], limit=count) if topic_points else []
+    reused = []
+    if bank_hits:
+        for h in bank_hits[:count]:
+            qobj = h.get("question_obj") or {}
+            if qobj.get("question"):
+                reused.append({**qobj, "id": f"qb_{h['id']}", "_from_bank": True, "_bank_id": h["id"]})
+    remaining = count - len(reused)
+    # 2. 不足部分调 LLM 生成，注入 ZPD 难度指导
+    generated = []
+    if remaining > 0:
+        hits = rag.retrieve(space_id, topic or "课程核心概念", top_k=8)
+        budget = max(2000, experts.settings.max_context_chars - 1500)
+        context = rag.build_context(hits, budget=budget) if hits else "（无讲义片段，按通识出题）"
+        # ZPD 难度分层：根据掌握度推荐难度分布
+        diff_rec = difficulty.recommend_for_space(space_id, topic_points or None)
+        diff_guide = difficulty.format_for_prompt(diff_rec)
+        questions = _as_list(llm.chat_json([
+            {"role": "system", "content": experts.EXPERTS["examiner"]["system"] + diff_guide},
+            {"role": "user", "content": (
+                f"围绕「{topic or '本课程重点'}」出 {remaining} 道题（判断/选择/简答混合）。"
+                f"输出 JSON 数组：[{{\"id\":\"q1\",\"type\":\"判断|选择|简答\",\"question\":\"...\","
+                f"\"options\":[\"A...\",\"B...\",\"C...\",\"D...\"],\"answer\":\"...\",\"knowledge_point\":\"...\"}}]。"
+                f"判断/简答题 options 为空数组。\n\n讲义片段：\n{context}")},
+        ], temperature=0.5, max_tokens=2600, task="quiz"))
+        if questions:
+            generated = questions
+            # 新生成的题入库供下次复用
+            db.add_to_question_bank(space_id, questions, difficulty=diff_rec.primary_layer)
+    all_questions = reused + generated
+    if not all_questions:
         raise ValueError("出题结果格式异常")
-    qid = db.save_quiz(space_id, topic, questions)
-    return [{"quiz_id": qid, "questions": _public_questions(questions)}]
+    qid = db.save_quiz(space_id, topic, all_questions)
+    return [{"quiz_id": qid, "questions": _public_questions(all_questions),
+             "reused_count": len(reused), "generated_count": len(generated)}]
 
 
 # ---------- quiz.grade ----------
@@ -54,14 +76,24 @@ def quiz_grade(space_id: str, quiz_id: str, answers: list[dict]) -> dict:
         raise ValueError("测验不存在")
     questions = {q["id"]: q for q in quiz["questions"]}
     results = _as_list(llm.chat_json([
-        {"role": "system", "content": experts.EXPERTS["grader"]["system"]},
+        {"role": "system", "content": experts.EXPERTS["grader"]["system"] + (
+            "\n\n【三层归因要求】对每道错题，从三个层面分析："
+            "1) 知识层（knowledge_layer）：概念本身不会/前置知识缺失/公式记错；"
+            "2) 策略层（strategy_layer）：方法选错/步骤跳步/时间分配不当；"
+            "3) 认知层（cognitive_layer）：审题偏差/思维定式/粗心大意。"
+            "在 error_type 中填最核心的那一层标签，在 analysis 中简述三层归因。"
+            "学生答案过短或过于模糊时，evidence_quality 标为 low，不要强行归因。")},
         {"role": "user", "content": (
             "题目与标准答案：" + json.dumps(quiz["questions"], ensure_ascii=False) +
             "\n学生答案：" + json.dumps(answers, ensure_ascii=False) +
             "\n输出 JSON 数组：[{\"qid\":\"...\",\"verdict\":\"对|错|部分对\","
             "\"error_type\":\"概念误解|计算失误|记忆模糊|审题错误|\","
+            "\"error_layer\":\"知识层|策略层|认知层|\","
+            "\"evidence_quality\":\"high|low|\","
             "\"analysis\":\"错误根因与正确思路（50字内）\",\"knowledge_point\":\"...\"}]，"
-            "答对的题 error_type 为空字符串，不要多余文字。")},
+            "答对的题 error_type 和 error_layer 为空字符串；"
+            "学生答案过短（<5字）或明显未认真作答时 evidence_quality 填 low。"
+            "不要多余文字。")},
     ], temperature=0.2, max_tokens=1600, task="grade"))
     if not results:
         raise ValueError("判卷结果格式异常")
@@ -89,6 +121,10 @@ def quiz_grade(space_id: str, quiz_id: str, answers: list[dict]) -> dict:
             db.adjust_mastery(space_id, point, _VERDICT_TO_MASTERY[verdict], guess=guess)
         if verdict != "对":
             db.add_memory(space_id, 3, f"测验错题（{point}）：{r.get('analysis', '')}", kind="error")
+        # 题库使用统计：来自题库的题标记使用次数与正确率
+        qid_raw = r.get("qid", "")
+        if qid_raw.startswith("qb_"):
+            db.mark_question_used(qid_raw[3:], r.get("verdict") == "对")
     correct = sum(1 for r in results if r.get("verdict") == "对")
     missing = len(questions) - len(results)
     return {"quiz_id": quiz_id, "results": results,
@@ -368,6 +404,35 @@ def graph_build(space_id: str) -> dict:
             "note": "" if llm_edges else "本次未能从讲义抽取到有效依赖边，已保留原有图谱"}
 
 
+# ---------- 今日一题（ZPD 最优） ----------
+
+def daily_question(space_id: str) -> dict:
+    """推荐一道 ZPD 最优题：预测正确率最接近 0.75 的薄弱知识点。
+
+    优先从错题本选已有题；没有则生成一道。
+    """
+    pick = velocity.pick_zpd_question(space_id)
+    if not pick:
+        # 没有薄弱知识点：生成一道综合题
+        made = quiz_generate(space_id, "课程核心概念", 1)
+        return {"source": "generated", "point": "", "quiz_id": made[0]["quiz_id"],
+                "questions": made[0]["questions"], "p_correct": None,
+                "note": "暂无薄弱知识点记录，先做几次测验积累数据"}
+    if pick["source"] == "wrong_book":
+        q = pick["question"]
+        questions = [{k: q[k] for k in ("id", "type", "question", "options", "answer", "knowledge_point")
+                      if k in q}]
+        qid = db.save_quiz(space_id, f"今日一题：{pick['point']}", questions)
+        return {"source": "wrong_book", "point": pick["point"], "quiz_id": qid,
+                "questions": _public_questions(questions), "p_correct": pick["p_correct"],
+                "note": f"来自错题本，预测正确率 {pick['p_correct']:.0%}"}
+    # 生成一道针对该知识点的题
+    made = quiz_generate(space_id, pick["point"], 1)
+    return {"source": "generated", "point": pick["point"], "quiz_id": made[0]["quiz_id"],
+            "questions": made[0]["questions"], "p_correct": pick["p_correct"],
+            "note": f"针对薄弱点「{pick['point']}」生成，预测正确率 {pick['p_correct']:.0%}"}
+
+
 SKILLS = {
     "quiz.generate": {"name": "出题测验", "fn": quiz_generate},
     "quiz.grade": {"name": "判卷分析", "fn": quiz_grade},
@@ -380,4 +445,5 @@ SKILLS = {
     "flashcard.generate": {"name": "生成闪卡", "fn": flashcard_generate},
     "teach.check": {"name": "费曼检验", "fn": teach_check},
     "graph.build": {"name": "构建知识图谱", "fn": graph_build},
+    "daily.question": {"name": "今日一题", "fn": daily_question},
 }

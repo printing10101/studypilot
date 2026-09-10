@@ -9,7 +9,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import connectors, db, defects, experts, export, handbook, ingest, library, llm, planner, rag, schedule, skills, syllabus
+from . import connectors, db, defects, experts, export, handbook, ingest, library, llm, planner, rag, schedule, skills, syllabus, velocity
 from .config import settings
 
 app = FastAPI(title="StudyPilot", version="0.1.0")
@@ -523,10 +523,46 @@ def api_plan_set_date(sid: str, tid: str, body: TaskDateIn):
 
 @app.get("/api/spaces/{sid}/today")
 def api_today(sid: str):
-    """今日学习视图：到期复习点 + 到期闪卡 + 今日/未排期计划任务 + 今日完成。"""
+    """今日学习视图：到期复习点 + 到期闪卡 + 今日/未排期计划任务 + 今日完成 + 学习速度。"""
     if not db.get_space(sid):
         raise HTTPException(404, "空间不存在")
-    return db.today_snapshot(sid)
+    snap = db.today_snapshot(sid)
+    # 附加学习速度与完成预测
+    try:
+        snap["velocity"] = velocity.compute_velocity(sid)
+        snap["forecast"] = velocity.forecast_completion(sid)
+    except Exception:
+        snap["velocity"] = None
+        snap["forecast"] = None
+    return snap
+
+
+@app.get("/api/spaces/{sid}/velocity")
+def api_velocity(sid: str):
+    """学习速度 + 完成度预测。"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    return {"velocity": velocity.compute_velocity(sid),
+            "forecast": velocity.forecast_completion(sid)}
+
+
+@app.get("/api/spaces/{sid}/daily-question")
+def api_daily_question(sid: str):
+    """今日一题：ZPD 最优推荐。"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    try:
+        return skills.daily_question(sid)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(502, f"模型通道失败: {str(e)[:200]}")
+
+
+@app.get("/api/transfer-opportunities")
+def api_transfer_opportunities():
+    """跨空间迁移检测：已掌握概念可加速学习的关联概念。"""
+    return velocity.detect_cross_space_transfer()
 
 
 @app.get("/api/spaces/{sid}/mastery/history")

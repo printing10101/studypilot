@@ -285,6 +285,38 @@ function TodayView({ sid, onGoto }: { sid: string; onGoto: (t: Tab) => void }) {
             <span className="sub">可变式训练 · 测验页</span>
           </div>
         </div>
+        {/* 学习速度 + 完成预测 */}
+        {data.velocity && data.velocity.concepts_total > 0 && (
+          <div style={{ marginTop: 14, padding: '10px 14px', background: 'var(--bg)', borderRadius: 10, fontSize: 13, display: 'flex', gap: 20, flexWrap: 'wrap', alignItems: 'center' }}>
+            <span>
+              <span className="sub">学习进度</span>{' '}
+              <b>{data.velocity.concepts_mastered}/{data.velocity.concepts_total}</b> 个知识点已掌握
+            </span>
+            {data.velocity.concepts_per_day > 0 && (
+              <span>
+                <span className="sub">速度</span>{' '}
+                <b>{data.velocity.concepts_per_day}</b> 个/天
+                {data.velocity.velocity_trend === 'accelerating' && ' ↑ 加速中'}
+                {data.velocity.velocity_trend === 'decelerating' && ' ↓ 放缓中'}
+              </span>
+            )}
+            {data.forecast && !data.forecast.is_complete && data.forecast.expected_date && (
+              <span>
+                <span className="sub">预计完成</span>{' '}
+                <b>{data.forecast.expected_date}</b>
+                {data.forecast.confidence === 'high' && '（高置信）'}
+                {data.forecast.optimistic_date && (
+                  <span className="sub" style={{ marginLeft: 6 }}>
+                    乐观 {data.forecast.optimistic_date} · 悲观 {data.forecast.pessimistic_date}
+                  </span>
+                )}
+              </span>
+            )}
+            {data.question_bank && data.question_bank.total > 0 && (
+              <span className="sub">题库 {data.question_bank.total} 题（已用 {data.question_bank.used}）</span>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="card">
