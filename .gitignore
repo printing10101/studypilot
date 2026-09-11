@@ -13,6 +13,14 @@ backend/*.log
 backend/desktop.log
 backend/_ocr_test.png
 backend/smoke_*.py
+# 本地调试/直推临时脚本与抓取样本，不入公开仓
+backend/_push_via_api.py
+backend/_example_news.html
+# 误从仓库根目录启动服务产生的运行时数据（真实数据在 backend/data/）
+/data/
+/uploads/
+# GitHub 直推工具的临时 blob 载荷
+/_blob*.json
 
 # 前端
 node_modules/
