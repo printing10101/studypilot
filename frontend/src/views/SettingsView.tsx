@@ -46,6 +46,7 @@ export function SettingsView() {
   }
 
   const delMcp = async (name: string) => {
+    if (!(await uxConfirm({ title: '移除 MCP server', message: `确定移除「${name}」？注册将在重启后不再恢复。`, danger: true }))) return
     try {
       await api.removeMcp(name); refreshMcp()
     } catch (e: any) { toast('error', '删除失败：' + (e.message || '未知错误')) }

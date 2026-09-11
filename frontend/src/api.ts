@@ -289,9 +289,21 @@ export interface CampusStatus {
 
 const BASE = ''
 
+// FastAPI 校验错误的 detail 是数组、业务错误是字符串，直接塞给 Error 会显示 [object Object]
+async function errMsg(r: Response): Promise<string> {
+  const body: any = await r.json().catch(() => ({ detail: r.statusText }))
+  const d = body.detail
+  const msg = typeof d === 'string' ? d
+    : Array.isArray(d) ? d.map((e: any) =>
+      `${(e.loc || []).slice(1).join('.')}${e.msg ? `: ${e.msg}` : ''}`).join('；')
+    : d && typeof d === 'object' ? JSON.stringify(d)
+      : ''
+  return msg || `请求失败（HTTP ${r.status}）`
+}
+
 async function j<T>(res: Promise<Response>): Promise<T> {
   const r = await res
-  if (!r.ok) throw new Error((await r.json().catch(() => ({ detail: r.statusText }))).detail || '请求失败')
+  if (!r.ok) throw new Error(await errMsg(r))
   return r.json()
 }
 
@@ -299,7 +311,7 @@ async function j<T>(res: Promise<Response>): Promise<T> {
 // 导致删除/打卡失败时界面毫无反应
 async function ok(res: Promise<Response>): Promise<{ ok: boolean }> {
   const r = await res
-  if (!r.ok) throw new Error((await r.json().catch(() => ({ detail: r.statusText }))).detail || '请求失败')
+  if (!r.ok) throw new Error(await errMsg(r))
   return r.json().catch(() => ({ ok: true }))
 }
 

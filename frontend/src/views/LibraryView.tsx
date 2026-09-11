@@ -108,22 +108,28 @@ function BookLibraryCard({ spaces, currentSid }: { spaces: Space[]; currentSid: 
   const [subjects, setSubjects] = useState<string[]>([])
   const [query, setQuery] = useState('')
   const [subject, setSubject] = useState('')
+  const [debouncedQuery, setDebouncedQuery] = useState('')
   const [busy, setBusy] = useState('')
   const [done, setDone] = useState(0)
   const [pageUrl, setPageUrl] = useState('')
   const [mounted, setMounted] = useState<Record<string, string[]>>({})
+  // 搜索 300ms 防抖：query 直接进依赖会每敲一键触发 1+N 个请求
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQuery(query), 300)
+    return () => clearTimeout(t)
+  }, [query])
   const refresh = () => {
-    api.library(query, subject).then(async (bs) => {
+    api.library(debouncedQuery, subject).then(async (bs) => {
       setBooks(bs)
-      // 每本书已挂载到哪些课程空间：本地书目可能有挂载，外部/仅书目必然为空
-      const entries = await Promise.all(bs.map(async (b) => {
+      // 每本书已挂载到哪些课程空间：挂载只存在于本地书，external/仅书目不查
+      const entries = await Promise.all(bs.filter((b) => b.status === 'local').map(async (b) => {
         try { return [b.id, (await api.bookSpaces(b.id)).map((s) => s.name)] as const } catch { return [b.id, []] as const }
       }))
       setMounted(Object.fromEntries(entries))
     }).catch(() => setBooks([]))
     api.librarySubjects().then(setSubjects).catch(() => {})
   }
-  useEffect(() => { refresh() }, [query, subject]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { refresh() }, [debouncedQuery, subject]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const upload = async (files: FileList | null, tag: string) => {
     if (!files?.length) return

@@ -15,14 +15,18 @@ export function ChatView({ sid }: { sid: string }) {
   const [note, setNote] = useState('')
   const [fbGiven, setFbGiven] = useState<Record<string, string>>({})
   const bottom = useRef<HTMLDivElement>(null)
+  const nearBottom = useRef(true)
 
   useEffect(() => { api.listMessages(sid).then(setMsgs).catch(() => {}) }, [sid])
-  useEffect(() => { bottom.current?.scrollIntoView({ behavior: 'smooth' }) }, [msgs, note])
+  useEffect(() => { nearBottom.current = true }, [sid])
+  // 仅当用户本来就停在底部时才自动跟随，否则流式输出期间无法往上翻历史
+  useEffect(() => { if (nearBottom.current) bottom.current?.scrollIntoView({ behavior: 'smooth' }) }, [msgs, note])
 
   const send = () => {
     const text = input.trim()
     if (!text || busy) return
     setInput(''); setNote(''); setBusy(true)
+    nearBottom.current = true
     setMsgs((m) => [...m, { role: 'user', mode, content: text }, { role: 'assistant', mode, content: '' }])
     const fail = (msg: string) => {
       setBusy(false)
@@ -82,7 +86,10 @@ export function ChatView({ sid }: { sid: string }) {
 
   return (
     <>
-      <div className="content">
+      <div className="content" onScroll={(e) => {
+        const el = e.currentTarget
+        nearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+      }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
           <div className="mode-tabs">
             {[['ask', 'Ask 答疑'], ['plan', 'Plan 规划'], ['craft', 'Craft 产出']].map(([m, l]) => (
