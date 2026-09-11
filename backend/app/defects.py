@@ -28,7 +28,8 @@ def list_curriculums() -> list[dict]:
         for name in sorted(os.listdir(CURRICULUM_DIR)):
             if name.endswith(".json"):
                 try:
-                    data = json.loads(open(os.path.join(CURRICULUM_DIR, name), encoding="utf-8").read())
+                    with open(os.path.join(CURRICULUM_DIR, name), encoding="utf-8") as f:
+                        data = json.load(f)
                     out.append({"file": name, "course": data.get("course", name),
                                 "concepts": len(data.get("concepts", []))})
                 except (ValueError, OSError):

@@ -40,6 +40,12 @@ def import_apkg(file_bytes: bytes, space_id: str) -> dict:
     except zipfile.BadZipFile:
         return {"imported": 0, "skipped": 0, "errors": ["不是有效的 .apkg 文件（zip 损坏）"]}
 
+    # .apkg 也是 zip，按声明解压大小防炸弹（同 ingest 的立场，按上限拒绝）
+    _MAX_UNCOMPRESSED = 500 * 1024 * 1024
+    if sum(i.file_size for i in zf.infolist()) > _MAX_UNCOMPRESSED:
+        return {"imported": 0, "skipped": 0,
+                "errors": [f".apkg 解压后超过 {_MAX_UNCOMPRESSED // (1024 * 1024)}MB 上限，已拒绝"]}
+
     # 找 collection.anki2 或 collection.anki21
     col_name = None
     for name in zf.namelist():

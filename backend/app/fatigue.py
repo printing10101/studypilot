@@ -17,11 +17,24 @@ _FATIGUE_SIGNALS: list[tuple[re.Pattern, float]] = [
 ]
 
 # 正面信号（减分）：表达理解/满意，防止误判
+# 命中后向前看 2 个字查否定词——"不会了/没搞懂了"不能命中"会了/搞懂了"反过来抵消疲劳分
+# （lookbehind 挡不住短备选绕过：'没搞懂了'里'懂了'的起点前是'搞'）
 _POSITIVE_SIGNALS: list[tuple[re.Pattern, float]] = [
-    (re.compile(r"(懂了|明白了|会了|理解了|搞懂了|终于懂|原来如此|原来是这样)", re.I), -0.3),
-    (re.compile(r"(明白了|清楚了|知道了|了解了|想通了|搞清楚)", re.I), -0.3),
-    (re.compile(r"(谢谢|感谢|不错|挺好|很好|厉害|棒|牛)", re.I), -0.15),
+    (re.compile(r"(搞懂了|懂了|会了|理解了|终于懂|原来如此|原来是这样)"), -0.3),
+    (re.compile(r"(明白了|清楚了|知道了|了解了|想通了|搞清楚)"), -0.3),
+    (re.compile(r"(谢谢|感谢|不错|挺好|很好|厉害|棒|牛)"), -0.15),
 ]
+_NEGATORS = ("不", "没", "别", "未", "莫")
+
+
+def _positive_hits(message: str, pattern: re.Pattern) -> int:
+    """未被否定词前缀修饰的正面信号命中次数。"""
+    n = 0
+    for m in pattern.finditer(message):
+        prefix = message[max(0, m.start() - 2):m.start()]
+        if not prefix.endswith(_NEGATORS):
+            n += 1
+    return n
 
 
 def detect_fatigue(message: str) -> float:
@@ -36,8 +49,7 @@ def detect_fatigue(message: str) -> float:
         if pattern.search(message):
             score += weight
     for pattern, weight in _POSITIVE_SIGNALS:
-        if pattern.search(message):
-            score += weight
+        score += weight * _positive_hits(message, pattern)
     return max(0.0, min(score, 1.0))
 
 

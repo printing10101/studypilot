@@ -208,8 +208,6 @@ def infer_personas(space_id: str) -> tuple[list[str], list[str]]:
     if concept_err / total_err >= 0.6 and concept_err >= 2:
         ids.append("procedure_drill")
         evidence.append("概念/记忆类错因偏多，需从刷题转向说理")
-    if careless == 0 and concept_err == 0 and len(quizzes) >= 2:
-        pass
 
     # 过度自信：测验少但薄弱点多，或测验正确率明显低于掌握分
     if points:

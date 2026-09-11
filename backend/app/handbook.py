@@ -134,8 +134,8 @@ SITUATIONS = {
 def _pick_situations(profile: dict) -> list[dict]:
     hits = [t for k, t in SITUATIONS.items() if k != "default" and t["match"](profile)]
     if not hits:
-        hits = [SITUATIONS["default"]]
-    hits.append(SITUATIONS["default"])
+        return [SITUATIONS["default"]]
+    hits.append(SITUATIONS["default"])  # 命中情况骨架之外，默认骨架始终兜底附加
     return hits
 
 

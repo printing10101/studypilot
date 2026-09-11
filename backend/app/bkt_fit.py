@@ -110,7 +110,6 @@ def fit_em(
                           (1 - p_s) if observations[t + 1] else p_s]
             # unnormalized xi(0,1)
             xi01 = (alpha[t][0] * p_t * p_obs_next[1] * beta[t + 1][1])
-            s = alpha[t + 1][0] + alpha[t + 1][1]
             # normalize by total likelihood at t+1
             total = alpha[t][0] * ((1 - p_t) * p_obs_next[0] * beta[t + 1][0] +
                                    p_t * p_obs_next[1] * beta[t + 1][1]) + \

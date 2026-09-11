@@ -8,6 +8,7 @@ import math
 import os
 import re
 import threading
+import time
 from collections import Counter
 
 from . import db, ingest, llm
@@ -192,6 +193,8 @@ _bm25_lock = threading.Lock()  # 仅保护 _bm25_cache 的并发写（索引重�
 _bm25_cache: dict[str, tuple[tuple, dict]] = {}   # space_id -> (行签名, 索引)
 _reranker = None
 _reranker_lock = threading.Lock()
+_reranker_failed_at = 0.0
+_RERANKER_RETRY_INTERVAL = 3600.0  # 加载失败后的冷却期（秒），期内直接回退融合序
 
 
 def _tokenize(text: str) -> list[str]:
@@ -262,17 +265,24 @@ def _vector_scores(rows: list[dict], qvec: list[float]) -> list[tuple[int, float
 
 
 def _get_reranker():
-    """懒加载 cross-encoder 精排模型（settings.rerank_model），加载失败返回 None。"""
-    global _reranker
+    """懒加载 cross-encoder 精排模型（settings.rerank_model），加载失败返回 None。
+
+    失败后冷却 1 小时内不再尝试：模型下载失败时反复重试会让每次检索都付出加载开销。"""
+    global _reranker, _reranker_failed_at
     if not settings.rerank_model:
+        return None
+    if _reranker is None and time.time() - _reranker_failed_at < _RERANKER_RETRY_INTERVAL:
         return None
     if _reranker is None:
         with _reranker_lock:
             if _reranker is None:
+                if time.time() - _reranker_failed_at < _RERANKER_RETRY_INTERVAL:
+                    return None
                 try:
                     from sentence_transformers import CrossEncoder
                     _reranker = CrossEncoder(settings.rerank_model, max_length=512)
                 except Exception:
+                    _reranker_failed_at = time.time()
                     return None  # 模型下载失败/无网络等：静默回退融合序，不阻塞答疑
     return _reranker
 

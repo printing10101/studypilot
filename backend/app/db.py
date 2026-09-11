@@ -935,7 +935,8 @@ def add_flashcards(space_id: str, cards: list[dict]) -> list[dict]:
                    (card.get("back") or "").strip(), (card.get("point") or "").strip()[:80],
                    now(), now()))
         saved.append({"id": fid, "front": card.get("front", ""), "back": card.get("back", ""),
-                      "point": card.get("point", ""), "box": 1, "due_at": now()})
+                      "point": card.get("point", ""), "box": 1, "due_at": now(),
+                      "kind": card.get("kind", "")})
     c.commit()
     return saved
 

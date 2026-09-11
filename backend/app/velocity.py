@@ -15,7 +15,7 @@ def compute_velocity(space_id: str, window_days: int = 14) -> dict:
     t = db.now()
     window_start = t - window_days * 86400
     history = db.list_mastery_history(space_id)
-    # 按知识点取窗口内最后一次达到 threshold 的时间
+    # 按知识点取窗口内首次达到 threshold 的时间（首次达标即视为掌握日）
     first_mastered: dict[str, float] = {}
     for h in history:
         if h["created_at"] < window_start:
@@ -31,7 +31,14 @@ def compute_velocity(space_id: str, window_days: int = 14) -> dict:
         day = time.strftime("%Y-%m-%d", time.localtime(ts))
         daily[day] = daily.get(day, 0) + 1
     days_active = max(1, len(daily))
-    cpd = mastered_in_window / max(window_days, 1)
+    # 分母用有效天数：空间建库不满一个窗口时按 14 天算会系统性低估日均速度、
+    # 把完成日期预测得偏晚
+    if history:
+        span_days = min(float(window_days),
+                        max(1.0, (t - min(h["created_at"] for h in history)) / 86400 + 1))
+    else:
+        span_days = float(window_days)
+    cpd = mastered_in_window / max(span_days, 1)
     # 趋势：前半段 vs 后半段
     sorted_days = sorted(daily.keys())
     mid = len(sorted_days) // 2
@@ -49,6 +56,7 @@ def compute_velocity(space_id: str, window_days: int = 14) -> dict:
     mastered = sum(1 for p in all_points if p["score"] >= _MASTERY_THRESHOLD)
     return {
         "window_days": window_days,
+        "effective_days": round(span_days, 1),
         "mastered_in_window": mastered_in_window,
         "concepts_per_day": round(cpd, 3),
         "velocity_trend": trend,
