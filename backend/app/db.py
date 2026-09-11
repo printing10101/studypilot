@@ -366,8 +366,14 @@ def delete_space(sid: str) -> None:
             pass  # 文件可能已被移动/删除，不阻塞空间清理
     for t in ("documents", "messages", "quiz_records", "memory", "vectors",
               "feedback", "mastery", "mastery_history", "flashcards",
-              "plan_tasks", "concept_edges", "book_documents"):
+              "plan_tasks", "concept_edges", "book_documents", "question_bank"):
         c.execute(f"DELETE FROM {t} WHERE space_id=?", (sid,))
+    # method_events/quiz_predictions 由 study_metrics 首次使用时才建表，可能尚不存在
+    for t in ("method_events", "quiz_predictions"):
+        try:
+            c.execute(f"DELETE FROM {t} WHERE space_id=?", (sid,))
+        except sqlite3.OperationalError:
+            pass  # 表未创建，自然也没有该空间的行
     c.execute("DELETE FROM spaces WHERE id=?", (sid,))
     c.commit()
 

@@ -122,7 +122,9 @@ def quiz_grade(space_id: str, quiz_id: str, answers: list[dict]) -> dict:
             try:
                 params = bkt_fit.get_params(space_id, point, qtype)
                 if params.get("source") == "fitted":
-                    correct = verdict == "对"
+                    # bkt_fit 的参数从"部分对算弱正确"的历史序列拟合而来（_collect_observations），
+                    # 应用时必须同口径，否则 partial 在两条路径下掌握度更新方向相反
+                    correct = verdict in ("对", "部分对")
                     new_score = bkt_fit.update_mastery_bkt(space_id, point, correct, qtype)
                     db.adjust_mastery(space_id, point, _VERDICT_TO_MASTERY[verdict],
                                       guess=params["p_g"], override_score=new_score)

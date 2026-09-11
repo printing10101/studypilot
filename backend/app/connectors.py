@@ -56,6 +56,9 @@ class McpClient:
         self._req_id = 0
         self._inited = False
         self._lines: queue.Queue = queue.Queue()
+        # 响应按 id 匹配但从同一条共享队列逐行消费：并发 RPC 会把对方响应当
+        # "不匹配"丢掉导致其超时，整个请求-响应周期必须串行（RLock 供 ensure_init 嵌套）
+        self._lock = threading.RLock()
 
     def start(self):
         import subprocess
@@ -82,26 +85,27 @@ class McpClient:
         self._proc.stdin.flush()
 
     def _rpc(self, method: str, params: dict | None = None, timeout: float = 30.0) -> dict:
-        self.start()
-        assert self._proc and self._proc.stdout
-        self._req_id += 1
-        req = {"jsonrpc": "2.0", "id": self._req_id, "method": method, "params": params or {}}
-        self._send(req)
-        while True:
-            try:
-                line = self._lines.get(timeout=timeout)
-            except queue.Empty:
-                raise RuntimeError(f"MCP server {self.name} 响应超时（>{int(timeout)}s）")
-            if not line:
-                raise RuntimeError(f"MCP server {self.name} 无响应（进程已退出）")
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue  # 非 JSON 行（server 日志等）跳过
-            if msg.get("id") == self._req_id:
-                if "error" in msg:
-                    raise RuntimeError(str(msg["error"]))
-                return msg["result"]
+        with self._lock:
+            self.start()
+            assert self._proc and self._proc.stdout
+            self._req_id += 1
+            req = {"jsonrpc": "2.0", "id": self._req_id, "method": method, "params": params or {}}
+            self._send(req)
+            while True:
+                try:
+                    line = self._lines.get(timeout=timeout)
+                except queue.Empty:
+                    raise RuntimeError(f"MCP server {self.name} 响应超时（>{int(timeout)}s）")
+                if not line:
+                    raise RuntimeError(f"MCP server {self.name} 无响应（进程已退出）")
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue  # 非 JSON 行（server 日志等）跳过
+                if msg.get("id") == self._req_id:
+                    if "error" in msg:
+                        raise RuntimeError(str(msg["error"]))
+                    return msg["result"]
 
     def initialize(self) -> dict:
         return self._rpc("initialize", {
@@ -111,11 +115,12 @@ class McpClient:
         })
 
     def ensure_init(self) -> None:
-        if not self._inited:
-            self.initialize()
-            # initialized 通知无 id、无响应，直接发送即可
-            self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-            self._inited = True
+        with self._lock:
+            if not self._inited:
+                self.initialize()
+                # initialized 通知无 id、无响应，直接发送即可
+                self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                self._inited = True
 
     def list_tools(self, timeout: float = 15.0) -> list:
         self.ensure_init()

@@ -45,8 +45,11 @@ def grade_to_gpa(grade: str) -> float:
     if m:
         raw = m.group()
         v = float(raw)
-        if v <= 5.0 and ("." in raw or v <= 4.0):
-            return round(v, 2)  # 绩点制成绩（3.7 / 3.5 / 3）
+        if v <= 4.0:
+            return round(v, 2)  # 4.0 制绩点原值（3.7 / 3.5 / 3）
+        if v <= 5.0:
+            # >4 不可能是 4.0 制绩点：按五级分制折算（优5/良4/中3/及格2 → 4/3/2/1）
+            return round(min(v - 1.0, 4.0), 2)
         if 0 <= v <= 100:
             for floor, gpa in _PERCENT_GPA:
                 if v >= floor:
@@ -130,7 +133,8 @@ def run_audit(school: str = "", major: str = "") -> dict[str, Any]:
     for t in taken:
         r = _match_req(t["name"], reqs)
         if r is None:
-            unmatched.append({"name": t["name"], "credit": t["credit"], "grade": t["grade"]})
+            unmatched.append({"name": t["name"], "credit": t["credit"],
+                              "grade": t["grade"], "status": t["status"]})
             continue
         prev = matched.get(r["base"])
         # 同一要求多门已修（如重修/多学期）：已修优先，取成绩更好的
@@ -223,6 +227,8 @@ def run_audit(school: str = "", major: str = "") -> dict[str, Any]:
                  for b, t in matched.items()
                  if t["status"] == "done" and float(t.get("gpa") or -1) >= 0]
     for u in unmatched:
+        if u.get("status") == "taking":  # 在修课无最终成绩，不计入 GPA
+            continue
         g = grade_to_gpa(u.get("grade") or "")
         if g >= 0 and float(u.get("credit") or 0) > 0:
             gpa_pairs.append((g, float(u["credit"])))
