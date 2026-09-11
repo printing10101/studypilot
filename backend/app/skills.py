@@ -3,7 +3,7 @@
 import json
 import time
 
-from . import db, difficulty, experts, llm, rag, velocity
+from . import bkt_fit, db, difficulty, experts, learning_methods, llm, rag, velocity
 
 
 def _as_list(data) -> list:
@@ -111,14 +111,27 @@ def quiz_grade(space_id: str, quiz_id: str, answers: list[dict]) -> dict:
     results = clean
     db.update_quiz(quiz_id, results)
 
-    # 错题沉淀到 L3 记忆 + 更新知识点掌握度模型（BKT：按题型给蒙对概率 guess）
+    # 错题沉淀到 L3 记忆 + 更新知识点掌握度模型
+    # 优先使用个性化 BKT 参数（Baum-Welch EM 拟合），否则用默认参数
     for r in results:
         point = r.get("knowledge_point", "")
         verdict = r.get("verdict", "")
         if verdict in _VERDICT_TO_MASTERY and point:
             qtype = (questions.get(r.get("qid")) or {}).get("type", "")
-            guess = 0.25 if qtype in ("选择", "判断") else 0.05
-            db.adjust_mastery(space_id, point, _VERDICT_TO_MASTERY[verdict], guess=guess)
+            # 尝试用个性化 BKT 参数更新；失败则回退默认 adjust_mastery
+            try:
+                params = bkt_fit.get_params(space_id, point, qtype)
+                if params.get("source") == "fitted":
+                    correct = verdict == "对"
+                    new_score = bkt_fit.update_mastery_bkt(space_id, point, correct, qtype)
+                    db.adjust_mastery(space_id, point, _VERDICT_TO_MASTERY[verdict],
+                                      guess=params["p_g"], override_score=new_score)
+                else:
+                    guess = 0.25 if qtype in ("选择", "判断") else 0.05
+                    db.adjust_mastery(space_id, point, _VERDICT_TO_MASTERY[verdict], guess=guess)
+            except Exception:
+                guess = 0.25 if qtype in ("选择", "判断") else 0.05
+                db.adjust_mastery(space_id, point, _VERDICT_TO_MASTERY[verdict], guess=guess)
         if verdict != "对":
             db.add_memory(space_id, 3, f"测验错题（{point}）：{r.get('analysis', '')}", kind="error")
         # 题库使用统计：来自题库的题标记使用次数与正确率
@@ -127,9 +140,25 @@ def quiz_grade(space_id: str, quiz_id: str, answers: list[dict]) -> dict:
             db.mark_question_used(qid_raw[3:], r.get("verdict") == "对")
     correct = sum(1 for r in results if r.get("verdict") == "对")
     missing = len(questions) - len(results)
+    actual = correct / len(questions) if questions else 0.0
+    try:
+        from . import study_metrics
+        study_metrics.record_quiz_actual(quiz_id, actual)
+        cal = study_metrics.calibration(space_id)
+        # 学生若曾预测，把偏差写进跟进
+        followup = learning_methods.grade_followup(results, space_id=space_id)
+        if cal.get("n", 0) >= 2:
+            followup += (f"\n校准：预测均 {cal['avg_predicted']:.0%} vs 实际 {cal['avg_actual']:.0%}"
+                         f"（偏差 {cal['avg_bias']:+.0%}，{cal['label']}）")
+        db.add_message(space_id, "craft", "assistant",
+                       f"【方法跟进】\n{followup}", expert="学习方法教练")
+    except Exception:
+        followup = learning_methods.grade_followup(results, space_id=space_id)
     return {"quiz_id": quiz_id, "results": results,
             "score": f"{correct}/{len(questions)}",
-            "ungraded": missing if missing > 0 else 0}
+            "accuracy": round(actual, 3),
+            "ungraded": missing if missing > 0 else 0,
+            "method_followup": followup}
 
 
 # ---------- 错题重做 ----------
@@ -181,17 +210,36 @@ def wrong_variants(space_id: str, qids: list[str] | None = None, per_question: i
              "source_points": sorted({q["knowledge_point"] for q in pool if q.get("knowledge_point")})}]
 
 
-# ---------- review.generate（薄弱点间隔复习） ----------
+# ---------- review.generate（薄弱点间隔复习 + 交错） ----------
+
+def _sample_interleaved_points(space_id: str, count: int = 5) -> list[str]:
+    """交错采样：到期 ∪ 薄弱 ∪ 中等掌握，打乱顺序，避免阻塞式同点连刷。"""
+    import random
+    due = [p["point"] for p in db.due_points(space_id)]
+    weak = [p["point"] for p in db.weak_points(space_id, 8)]
+    mid = [p["point"] for p in db.list_mastery(space_id) if 0.4 <= p["score"] < 0.75]
+    buckets = [due[: max(1, count // 2)], weak[: count], mid[: max(1, count // 3)]]
+    seen: list[str] = []
+    for b in buckets:
+        for p in b:
+            if p not in seen:
+                seen.append(p)
+    random.shuffle(seen)
+    return seen[:count] if seen else []
+
 
 def review_generate(space_id: str, count: int = 5) -> list[dict]:
-    """从到期/最薄弱的知识点出复习题（Leitner 间隔复习调度）。"""
+    """从到期/最薄弱的知识点出复习题；知识点交错混合，贴近考试检索。"""
     due = db.due_points(space_id)
     pool = due or db.weak_points(space_id, 5)
-    points = [p["point"] for p in pool[:5]]
+    points = _sample_interleaved_points(space_id, count=max(3, min(count, 6)))
+    if not points:
+        points = [p["point"] for p in pool[:5]]
     topic = "；".join(points) if points else ""
     made = quiz_generate(space_id, topic or "课程核心概念", count)
     made[0]["review_points"] = points
-    made[0]["topic"] = f"薄弱点复习：{topic[:60]}" if points else "综合复习"
+    made[0]["interleaved"] = True
+    made[0]["topic"] = f"交错复习：{topic[:60]}" if points else "综合复习"
     db.set_quiz_topic(made[0]["quiz_id"], made[0]["topic"])
     return made
 
@@ -199,21 +247,25 @@ def review_generate(space_id: str, count: int = 5) -> list[dict]:
 # ---------- 模拟考试 ----------
 
 def exam_mock(space_id: str, count: int = 10, minutes: int = 30) -> list[dict]:
-    """按掌握度采样知识点组卷，前端限时作答。"""
-    points = [p["point"] for p in db.weak_points(space_id, 8)]
+    """按掌握度交错采样组卷（到期+薄弱+中等），前端限时作答。"""
+    points = _sample_interleaved_points(space_id, count=max(5, min(count, 12)))
+    if not points:
+        points = [p["point"] for p in db.weak_points(space_id, 8)]
     topic = "、".join(points) if points else "课程核心概念"
     made = quiz_generate(space_id, topic, count)
-    db.set_quiz_topic(made[0]["quiz_id"], "模拟考试")
-    made[0]["topic"] = "模拟考试"
+    db.set_quiz_topic(made[0]["quiz_id"], "模拟考试（交错）")
+    made[0]["topic"] = "模拟考试（交错）"
     made[0]["exam_minutes"] = minutes
     made[0]["coverage"] = points
+    made[0]["interleaved"] = True
+    made[0]["note"] = "组卷已混排多知识点，用于练习「识别该用哪种方法」，而非同型题连刷。"
     return made
 
 
 # ---------- 闪卡 ----------
 
-def flashcard_generate(space_id: str, topic: str = "", count: int = 10) -> list[dict]:
-    """从讲义片段生成问答闪卡；不指定主题时优先覆盖薄弱知识点。"""
+def flashcard_generate(space_id: str, topic: str = "", count: int = 10) -> dict:
+    """从讲义片段生成问答闪卡；混入精细追问「指令卡」促进生成式加工。"""
     if not topic:
         weak = db.weak_points(space_id, 5)
         topic = "、".join(p["point"] for p in weak) if weak else "课程核心概念"
@@ -222,15 +274,21 @@ def flashcard_generate(space_id: str, topic: str = "", count: int = 10) -> list[
     context = rag.build_context(hits, budget=budget) if hits else "（无讲义片段，按通识生成）"
     cards = _as_list(llm.chat_json([
         {"role": "system", "content": (
-            "你是记忆卡片设计师。依据讲义片段生成问答式闪卡：卡面是一个具体的问题或提示，"
-            "卡背是简明答案（50字内），并在卡面覆盖不同的知识点。输出严格 JSON 数组："
-            "[{\"front\":\"问题/提示\",\"back\":\"答案\",\"point\":\"知识点(10字内)\"}]，不要多余文字。")},
+            "你是记忆卡片设计师。依据讲义片段生成闪卡，输出严格 JSON 数组，每项："
+            "{\"front\":\"问题/提示\",\"back\":\"答案\",\"point\":\"知识点(10字内)\","
+            "\"kind\":\"qa|instruction\"}。"
+            "其中约 70% 为传统问答卡（kind=qa）；约 30% 为「指令卡」（kind=instruction）："
+            "front 是精细追问提示（如「用一句话向高中生解释」「举一个反例」「和上一章哪个概念容易混」），"
+            "back 是简短示范或提示骨架（50字内），不要多余文字。")},
         {"role": "user", "content": f"生成 {count} 张闪卡，围绕「{topic}」。\n\n讲义片段：\n{context}"},
     ], temperature=0.5, max_tokens=2600, task="quiz"))
     if not cards:
         raise ValueError("闪卡生成格式异常")
     cards = [c for c in cards if isinstance(c, dict) and c.get("front") and c.get("back")]
-    return db.add_flashcards(space_id, cards[:count])
+    added = db.add_flashcards(space_id, cards[:count])
+    n_inst = sum(1 for c in added if (c.get("kind") or "") == "instruction")
+    return {"cards": added, "count": len(added), "instruction_cards": n_inst,
+            "note": "含精细追问指令卡：翻到指令卡时先口头/书面作答，再对照提示。" if n_inst else ""}
 
 
 # ---------- 费曼讲解检验 ----------
@@ -299,11 +357,13 @@ def plan_study(space_id: str, goal: str) -> dict:
     """生成结构化学习计划：拆为阶段任务（含截止日期）存库可打卡，同时渲染 Markdown 存入对话。"""
     memory_ctx = experts.build_memory_context(space_id) or "（暂无学习记录）"
     today = time.strftime("%Y-%m-%d")
+    method_block = learning_methods.planner_prompt_block(space_id)
     data = llm.chat_json([
-        {"role": "system", "content": experts.EXPERTS["planner"]["system"] +
+        {"role": "system", "content": experts.EXPERTS["planner"]["system"] + method_block +
             "\n输出严格 JSON：{\"summary\":\"总方针(40字内)\",\"phases\":[{\"name\":\"阶段名（含时间范围，如：第1-2周）\","
-            "\"goal\":\"阶段目标\",\"tasks\":[{\"content\":\"具体行动（具体到知识点与练习方式）\","
+            "\"goal\":\"阶段目标\",\"tasks\":[{\"content\":\"具体行动（具体到知识点、练习方式与所用学习方法）\","
             "\"accept\":\"验收标准\",\"due\":\"截止日期 YYYY-MM-DD（按阶段时间范围从今天起推算）\","
+            "\"method\":\"使用的学习方法名（如：检索练习/间隔重复/交错练习/样例学习/自我解释/费曼讲解）\","
             "\"points\":[\"涉及知识点\"]}]}]}，"
             "3-5 个阶段，每阶段 2-4 条任务，不要多余文字。"},
         {"role": "user", "content": f"今天是 {today}。学习目标：{goal or '系统掌握本课程'}\n\n学生记忆档案：\n{memory_ctx}"},
@@ -327,6 +387,7 @@ def plan_study(space_id: str, goal: str) -> dict:
             tasks.append({"phase": name, "phase_goal": phase.get("goal", ""),
                           "content": t.get("content", ""),
                           "accept": t.get("accept", ""), "due_date": due,
+                          "method": (t.get("method") or "").strip()[:20],
                           "points": t.get("points") or []})
     if not tasks:
         raise ValueError("计划生成格式异常")
@@ -341,7 +402,8 @@ def plan_study(space_id: str, goal: str) -> dict:
             lines.append(f"### {t['phase']}——{t.get('phase_goal', '')}")
         idx += 1
         due_cn = f"（{t['due_date']} 前完成）" if t.get("due_date") else ""
-        lines.append(f"{idx}. {t['content']}{due_cn}（验收：{t['accept']}）")
+        method_cn = f"［{t['method']}］" if t.get("method") else ""
+        lines.append(f"{idx}. {method_cn}{t['content']}{due_cn}（验收：{t['accept']}）")
     lines.append("")
     plan_md = "\n".join(lines)
     db.add_message(space_id, "plan", "user", goal)

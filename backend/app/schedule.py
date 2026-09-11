@@ -175,6 +175,137 @@ def parse_csv(path: str) -> list[dict]:
     raise ValueError("CSV 编码无法识别（支持 UTF-8 / GBK）")
 
 
+# ---------- WakeUp 课程表格式直连（社区通用导入/备份格式） ----------
+
+_WAKEUP_JSON_KEYS = ("courseName", "name", "课程名", "course")
+
+
+def parse_wakeup_rows(rows: list[list[str]]) -> list[dict] | None:
+    """WakeUp CSV 行解析：`课程名,星期(1-7),开始节次,结束节次,教师,地点,周次`。
+
+    带表头（课程名称/星期/…，含「节次」合并列写法）或无表头均可。
+    返回 None 表示不是 WakeUp 行格式（交回通用网格解析）。
+    """
+    if not rows:
+        return None
+
+    def _col(headers: list[str], *keys: str) -> int:
+        for k in keys:
+            for j, h in enumerate(headers):
+                if k in h:
+                    return j
+        return -1
+
+    start, colmap = 0, {}
+    head = [_norm_line(str(c)) for c in rows[0]]
+    if any("课程名称" in h or h == "课程名" for h in head):
+        start = 1
+        colmap = {
+            "name": _col(head, "课程名称", "课程名", "name"),
+            "day": _col(head, "星期", "周几"),
+            "start": _col(head, "开始节次", "start"),
+            "end": _col(head, "结束节次", "end"),
+            "period": _col(head, "节次"),      # 合并列（如 "1-2节"）
+            "teacher": _col(head, "教师", "老师"),
+            "room": _col(head, "教室", "地点", "上课地点"),
+            "weeks": _col(head, "周次"),
+        }
+
+    out = []
+    for row in rows[start:]:
+        cells = [str(c).strip() for c in row]
+        while cells and not cells[-1]:
+            cells.pop()
+        if not cells or not cells[0]:
+            continue
+
+        def _at(key: str, default_idx: int) -> str:
+            j = colmap.get(key, -1) if colmap else default_idx
+            return cells[j] if 0 <= j < len(cells) else ""
+
+        name = _at("name", 0)
+        if not name:
+            continue
+        day_s, period = _at("day", 1), ""
+        start_s, end_s = _at("start", 2), _at("end", 3)
+        if colmap.get("period", -1) >= 0 and not (start_s and end_s):
+            period = _at("period", 2)          # 合并列兜底
+        try:
+            dm = re.search(r"\d+", day_s)
+            if dm:
+                day = int(dm.group())
+            else:
+                dmy = re.search(r"(?:周|星期)([一二三四五六日天])", day_s)
+                day = DAYS[dmy.group(1)] if dmy else 0
+            if not period:
+                start_p = int(re.search(r"\d+", start_s).group())
+                end_p = int(re.search(r"\d+", end_s).group()) if end_s else start_p
+            else:
+                pm = re.search(r"(\d{1,2})\s*[-–~]\s*(\d{1,2})", period)
+                if not pm:
+                    pm = re.search(r"\d{1,2}", period)
+                    start_p = end_p = int(pm.group())
+                else:
+                    start_p, end_p = int(pm.group(1)), int(pm.group(2))
+        except (AttributeError, ValueError):
+            continue
+        if not (1 <= day <= 7 and 1 <= start_p <= 15 and start_p <= end_p <= 15):
+            continue
+        weeks = _at("weeks", 6) or ""
+        out.append({"course": name[:80], "day": day,
+                    "period": f"{start_p}-{end_p}", "weeks": weeks[:40],
+                    "teacher": _at("teacher", 4)[:40], "room": _at("room", 5)[:40],
+                    "kind": ""})
+    return out or None
+
+
+def parse_wakeup_json(text: str) -> list[dict] | None:
+    """WakeUp JSON 备份格式：[{courseName, day, startNode, endNode, teacher,
+    classRoom, startWeek, endWeek, type}]（type: 1全部/2单/3双）。"""
+    import json
+    try:
+        data = json.loads(text or "")
+    except ValueError:
+        return None
+    if isinstance(data, dict):
+        data = data.get("courses") or data.get("courseList") or []
+    if not isinstance(data, list) or not data:
+        return None
+    first = data[0]
+    if not isinstance(first, dict) or not any(k in first for k in _WAKEUP_JSON_KEYS):
+        return None
+    out = []
+    for r in data:
+        name = str(r.get("courseName") or r.get("name") or r.get("课程名")
+                   or r.get("course") or "").strip()
+        if not name:
+            continue
+        try:
+            day = int(r.get("day") or 0)
+            start_p = int(r.get("startNode") or r.get("startSection") or 0)
+            end_p = int(r.get("endNode") or r.get("endSection") or start_p)
+        except (TypeError, ValueError):
+            continue
+        sw = r.get("startWeek")
+        ew = r.get("endWeek")
+        try:
+            weeks = f"{int(sw)}-{int(ew)}周" if sw and ew else ""
+        except (TypeError, ValueError):
+            weeks = ""
+        wtype = str(r.get("type") or "")
+        if wtype in ("2", "单", "单周"):
+            weeks = (weeks + "单") if weeks else "单周"
+        elif wtype in ("3", "双", "双周"):
+            weeks = (weeks + "双") if weeks else "双周"
+        out.append({"course": name[:80], "day": min(7, max(0, day)),
+                    "period": f"{start_p}-{end_p}" if start_p else "",
+                    "weeks": weeks[:40],
+                    "teacher": str(r.get("teacher") or "").strip()[:40],
+                    "room": str(r.get("classRoom") or r.get("room") or r.get("地点") or "").strip()[:40],
+                    "kind": ""})
+    return out or None
+
+
 def _dedupe(items: list[dict]) -> list[dict]:
     seen, uniq = set(), []
     for it in items:
@@ -223,6 +354,10 @@ def import_from_text(text: str) -> dict:
     text = (text or "").strip()
     if len(text) < 4:
         raise ValueError("课程表文本为空")
+    if text[0] in "[{":  # WakeUp JSON 备份直连
+        wk = parse_wakeup_json(text)
+        if wk:
+            return {"courses": _dedupe(wk), "method": "wakeup-json"}
     courses = parse_text(text)
     method = "rules"
     if len(courses) < 2:
@@ -243,12 +378,30 @@ def import_from_file(path: str, filename: str) -> dict:
     elif ext == ".xlsx":
         courses, method, raw = parse_xlsx(path), "xlsx-grid", ""
     elif ext == ".csv":
-        courses, method, raw = parse_csv(path), "csv-grid", ""
+        for enc in ("utf-8-sig", "utf-8", "gb18030"):  # WakeUp CSV 优先直连
+            try:
+                with open(path, encoding=enc, newline="") as f:
+                    rows = [row for row in csv.reader(f)]
+                break
+            except (UnicodeDecodeError, ValueError):
+                continue
+        else:
+            raise ValueError("CSV 编码无法识别（支持 UTF-8 / GBK）")
+        wk = parse_wakeup_rows(rows)
+        if wk:
+            return {"courses": _dedupe(wk), "method": "wakeup-csv"}
+        courses, method, raw = parse_grid(rows), "csv-grid", ""
+    elif ext == ".json":
+        text = rag._read_text(path)
+        wk = parse_wakeup_json(text)
+        if wk:
+            return {"courses": _dedupe(wk), "method": "wakeup-json"}
+        courses, method, raw = parse_text(text), "rules", text
     elif ext in (".txt", ".md", ".markdown"):
         text = rag._read_text(path)
         courses, method, raw = parse_text(text), "rules", text
     else:
-        raise ValueError("课程表支持：截图(png/jpg/webp/bmp) / Excel(.xlsx) / CSV / 文本(txt/md)")
+        raise ValueError("课程表支持：截图(png/jpg/webp/bmp) / Excel(.xlsx) / CSV / JSON(WakeUp) / 文本(txt/md)")
     if len(courses) < 2 and raw:
         alt = _llm_parse(raw)
         if len(alt) > len(courses):

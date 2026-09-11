@@ -165,6 +165,7 @@ CREATE TABLE IF NOT EXISTS plan_tasks(
   accept TEXT DEFAULT '',          -- 验收标准
   points TEXT DEFAULT '[]',        -- 涉及知识点 json
   due_date TEXT DEFAULT '',        -- 截止日期 YYYY-MM-DD（今日学习页排期用）
+  method TEXT DEFAULT '',          -- 证据导向学习方法名（检索/间隔/交错等）
   source_plan TEXT DEFAULT '',     -- 来源学涯计划 id（push 同步写入，幂等/回溯用）
   done INTEGER DEFAULT 0,
   done_at REAL DEFAULT 0,
@@ -183,6 +184,7 @@ CREATE TABLE IF NOT EXISTS student_profile(
   target_major TEXT DEFAULT '',
   timeline TEXT DEFAULT '',
   notes TEXT DEFAULT '',
+  learner_personas TEXT DEFAULT '[]',  -- 学习者画像 id json（可多选，与行为推断合并）
   updated_at REAL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS concept_edges(
@@ -229,6 +231,16 @@ CREATE TABLE IF NOT EXISTS syllabus_custom(
   updated_at REAL,
   PRIMARY KEY(school, major)
 );
+CREATE TABLE IF NOT EXISTS taken_courses(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,              -- 课程名
+  credit REAL DEFAULT 0,           -- 学分（0=未知）
+  grade TEXT DEFAULT '',           -- 原始成绩（92 / 优秀 / A-…）
+  gpa REAL DEFAULT -1,             -- 换算绩点（4.0 制，-1=无法换算）
+  semester TEXT DEFAULT '',        -- 修读学期（自由文本）
+  status TEXT DEFAULT 'done',      -- done 已修 / taking 修读中
+  created_at REAL
+);
 CREATE TABLE IF NOT EXISTS question_bank(
   id TEXT PRIMARY KEY,
   space_id TEXT NOT NULL,
@@ -243,6 +255,15 @@ CREATE TABLE IF NOT EXISTS question_bank(
 );
 CREATE INDEX IF NOT EXISTS idx_qb_space ON question_bank(space_id);
 CREATE INDEX IF NOT EXISTS idx_qb_point ON question_bank(space_id, knowledge_point);
+CREATE TABLE IF NOT EXISTS campus_items(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL,            -- 信息源 id（如 mech_notice）
+  title TEXT NOT NULL,
+  url TEXT NOT NULL UNIQUE,        -- 绝对链接，按 URL 判重
+  published TEXT DEFAULT '',       -- 页面标注的发布日期 YYYY-MM-DD
+  fetched_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_campus_source ON campus_items(source, published);
 """
 
 _local = threading.local()  # 线程本地连接：FastAPI 线程池并发共享单连接会触发 sqlite3 InterfaceError
@@ -261,6 +282,11 @@ def get_conn() -> sqlite3.Connection:
             conn.execute("ALTER TABLE plan_tasks ADD COLUMN due_date TEXT DEFAULT ''")
         if "source_plan" not in cols:
             conn.execute("ALTER TABLE plan_tasks ADD COLUMN source_plan TEXT DEFAULT ''")
+        if "method" not in cols:
+            conn.execute("ALTER TABLE plan_tasks ADD COLUMN method TEXT DEFAULT ''")
+        pcols = {r[1] for r in conn.execute("PRAGMA table_info(student_profile)")}
+        if "learner_personas" not in pcols:
+            conn.execute("ALTER TABLE student_profile ADD COLUMN learner_personas TEXT DEFAULT '[]'")
         # FSRS 调度列（老 Leitner 数据零迁移：box 折算初始稳定性的逻辑在 app.fsrs 里）
         mcols = {r[1] for r in conn.execute("PRAGMA table_info(mastery)")}
         if "state" not in mcols:
@@ -759,11 +785,13 @@ def _find_mastery(space_id: str, point: str) -> dict[str, Any] | None:
     return best if best and best_ratio >= 0.5 else None
 
 
-def adjust_mastery(space_id: str, point: str, verdict: str, guess: float | None = None) -> dict[str, Any] | None:
-    """按证据更新知识点掌握度（BKT）并调度 Leitner 复习盒。
+def adjust_mastery(space_id: str, point: str, verdict: str, guess: float | None = None,
+                   override_score: float | None = None) -> dict[str, Any] | None:
+    """按证据更新知识点掌握度（BKT）并调度 FSRS 复习。
 
     verdict: correct / partial / wrong / confused / progress
     guess: 该次观测的蒙对概率（未给则按默认；选择/判断题应由调用方传更高值）
+    override_score: 直接指定新的掌握度（个性化 BKT 拟合参数算出的值），跳过内部 BKT 更新
     """
     point = point.strip()[:80]
     if not point:
@@ -775,12 +803,13 @@ def adjust_mastery(space_id: str, point: str, verdict: str, guess: float | None 
     if row:
         score, attempts, correct, wrong, box = (row["score"], row["attempts"],
                                                 row["correct"], row["wrong"], row["box"])
-        # 模糊命中的是同义表述（如"高数"→"高等数学"）：归并到既有名称，
-        # 否则 upsert 会按新名字另开一行，同一知识点分裂成多行各自演化
         point = row["point"]
     else:
         score, attempts, correct, wrong, box = _BKT_PRIOR, 0, 0, 0, 1
-    score = _bkt_update(score, evidence, _DEFAULT_GUESS if guess is None else min(max(guess, 0.01), 0.6))
+    if override_score is not None:
+        score = max(0.0, min(1.0, override_score))
+    else:
+        score = _bkt_update(score, evidence, _DEFAULT_GUESS if guess is None else min(max(guess, 0.01), 0.6))
     attempts += 1
     if verdict == "correct":
         correct += 1
@@ -969,12 +998,12 @@ def add_plan_task(space_id: str, t: dict, source_plan: str = "",
     c = get_conn()
     tid = new_id()
     due = (t.get("due_date") or t.get("due") or "").strip()[:10]
-    c.execute("INSERT INTO plan_tasks(id,space_id,phase,content,accept,points,due_date,source_plan,done,done_at,created_at) "
-              "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+    c.execute("INSERT INTO plan_tasks(id,space_id,phase,content,accept,points,due_date,method,source_plan,done,done_at,created_at) "
+              "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
               (tid, space_id, (t.get("phase") or "").strip()[:80],
                (t.get("content") or "").strip(), (t.get("accept") or "").strip(),
                json.dumps(t.get("points") or [], ensure_ascii=False),
-               due, source_plan, done, done_at, now()))
+               due, (t.get("method") or "").strip()[:40], source_plan, done, done_at, now()))
     c.commit()
     return tid
 
@@ -1044,12 +1073,26 @@ def today_snapshot(space_id: str) -> dict[str, Any]:
 
 def toggle_plan_task(space_id: str, task_id: str, done: bool) -> dict[str, Any] | None:
     c = get_conn()
-    r = c.execute("SELECT id FROM plan_tasks WHERE id=? AND space_id=?", (task_id, space_id)).fetchone()
+    r = c.execute("SELECT * FROM plan_tasks WHERE id=? AND space_id=?", (task_id, space_id)).fetchone()
     if not r:
         return None
     c.execute("UPDATE plan_tasks SET done=?, done_at=? WHERE id=?",
               (1 if done else 0, now() if done else 0, task_id))
     c.commit()
+    if done:
+        row = dict(r)
+        try:
+            from . import study_metrics
+            points = []
+            try:
+                points = json.loads(row.get("points") or "[]")
+            except ValueError:
+                points = []
+            study_metrics.record_method_use(
+                space_id, row.get("method") or "", kind="task_done",
+                meta={"task_id": task_id, "points": points[:6], "content": (row.get("content") or "")[:80]})
+        except Exception:
+            pass
     return {"id": task_id, "done": done}
 
 
@@ -1065,6 +1108,57 @@ def set_meta(key: str, value: str) -> None:
     c.execute("INSERT INTO meta(key,value) VALUES(?,?) "
               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
     c.commit()
+
+
+# ---------- 校园网信息（campus_net.py 的存储层） ----------
+
+def campus_upsert(source: str, title: str, url: str, published: str) -> str:
+    """按 URL 判重入库：新条目返回 added，已存在返回 dup（不覆盖首次抓到的日期）。"""
+    c = get_conn()
+    if c.execute("SELECT 1 FROM campus_items WHERE url=?", (url,)).fetchone():
+        return "dup"
+    c.execute("INSERT INTO campus_items(source,title,url,published,fetched_at) VALUES(?,?,?,?,?)",
+              (source, title, url, published, now()))
+    c.commit()
+    return "added"
+
+
+def campus_list(source: str = "", limit: int = 60, q: str = "") -> list[dict[str, Any]]:
+    sql = "SELECT * FROM campus_items WHERE 1=1"
+    args: list[Any] = []
+    if source:
+        sql += " AND source=?"
+        args.append(source)
+    if q.strip():
+        sql += " AND title LIKE ? ESCAPE '\\'"
+        esc = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        args.append(f"%{esc}%")
+    sql += " ORDER BY published DESC, id DESC LIMIT ?"
+    args.append(max(1, min(int(limit), 200)))
+    return rows_to_dicts(get_conn().execute(sql, args).fetchall())
+
+
+def campus_counts() -> dict[str, int]:
+    return {r["source"]: r["n"] for r in get_conn().execute(
+        "SELECT source, COUNT(*) AS n FROM campus_items GROUP BY source").fetchall()}
+
+
+def campus_total() -> int:
+    return get_conn().execute("SELECT COUNT(*) AS n FROM campus_items").fetchone()["n"]
+
+
+def campus_prune(keep_per_source: int = 300) -> int:
+    """每个信息源只保留最近 keep_per_source 条，防止长期运行无限膨胀。"""
+    c = get_conn()
+    removed = 0
+    for (src,) in c.execute("SELECT DISTINCT source FROM campus_items").fetchall():
+        cur = c.execute("""DELETE FROM campus_items WHERE source=? AND id NOT IN (
+                       SELECT id FROM campus_items WHERE source=?
+                       ORDER BY published DESC, id DESC LIMIT ?)""",
+                  (src, src, keep_per_source))
+        removed += cur.rowcount
+    c.commit()
+    return removed
 
 
 # ---------- 成长手册 ----------
@@ -1108,13 +1202,14 @@ def get_student_profile() -> dict[str, Any]:
     r = get_conn().execute("SELECT * FROM student_profile WHERE id=1").fetchone()
     if not r:
         empty = {k: "" for k in _PROFILE_FIELDS}
-        empty.update({"flags": [], "updated_at": 0})
+        empty.update({"flags": [], "learner_personas": [], "updated_at": 0})
         return empty
     d = dict(r)
-    try:
-        d["flags"] = json.loads(d["flags"] or "[]")
-    except ValueError:
-        d["flags"] = []
+    for key in ("flags", "learner_personas"):
+        try:
+            d[key] = json.loads(d.get(key) or "[]")
+        except ValueError:
+            d[key] = []
     return d
 
 
@@ -1123,19 +1218,21 @@ def save_student_profile(fields: dict) -> dict[str, Any]:
     clean = {k: (fields.get(k) or "").strip()[:120] for k in _PROFILE_FIELDS}
     flags = json.dumps([str(f).strip()[:40] for f in (fields.get("flags") or []) if str(f).strip()],
                        ensure_ascii=False)
+    personas = json.dumps([str(p).strip()[:40] for p in (fields.get("learner_personas") or []) if str(p).strip()],
+                          ensure_ascii=False)
     c = get_conn()
     c.execute(
         "INSERT INTO student_profile(id,current_school,major,year,rank_hint,flags,goal_type,"
-        "target_school,target_major,timeline,notes,updated_at) "
-        "VALUES(1,?,?,?,?,?,?,?,?,?,?,?) "
+        "target_school,target_major,timeline,notes,learner_personas,updated_at) "
+        "VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(id) DO UPDATE SET current_school=excluded.current_school, major=excluded.major, "
         "year=excluded.year, rank_hint=excluded.rank_hint, flags=excluded.flags, "
         "goal_type=excluded.goal_type, target_school=excluded.target_school, "
         "target_major=excluded.target_major, timeline=excluded.timeline, notes=excluded.notes, "
-        "updated_at=excluded.updated_at",
+        "learner_personas=excluded.learner_personas, updated_at=excluded.updated_at",
         (clean["current_school"], clean["major"], clean["year"], clean["rank_hint"], flags,
          clean["goal_type"] or "考研", clean["target_school"], clean["target_major"],
-         clean["timeline"], clean["notes"], now()))
+         clean["timeline"], clean["notes"], personas, now()))
     c.commit()
     return get_student_profile()
 
@@ -1331,6 +1428,59 @@ def list_syllabus_custom(school: str = "") -> list[dict[str, Any]]:
         rows = get_conn().execute(
             "SELECT school,major,source,updated_at FROM syllabus_custom ORDER BY school, major").fetchall()
     return rows_to_dicts(rows)
+
+
+# ---------- 已修课程（完成度审核的数据源，用户级、不绑空间） ----------
+
+def add_taken_course(name: str, credit: float = 0.0, grade: str = "",
+                     semester: str = "", status: str = "done") -> dict[str, Any]:
+    """新增一门已修/修读中课程；同名（归一化后）幂等覆盖。绩点在此统一换算。"""
+    from . import audit
+    name = (name or "").strip()[:100]
+    if not name:
+        raise ValueError("课程名不能为空")
+    c = get_conn()
+    norm = audit.norm_name(name)
+    existing = None
+    for row in c.execute("SELECT id,name FROM taken_courses").fetchall():
+        if audit.norm_name(row["name"]) == norm:
+            existing = row["id"]
+            break
+    gpa = audit.grade_to_gpa(grade)
+    if existing:
+        c.execute("UPDATE taken_courses SET name=?, credit=?, grade=?, gpa=?, semester=?, status=? WHERE id=?",
+                  (name, round(float(credit or 0), 2), (grade or "").strip()[:20], gpa,
+                   (semester or "").strip()[:30], status if status in ("done", "taking") else "done", existing))
+        tid = existing
+    else:
+        tid = new_id()
+        c.execute("INSERT INTO taken_courses(id,name,credit,grade,gpa,semester,status,created_at) "
+                  "VALUES(?,?,?,?,?,?,?,?)",
+                  (tid, name, round(float(credit or 0), 2), (grade or "").strip()[:20], gpa,
+                   (semester or "").strip()[:30], status if status in ("done", "taking") else "done", now()))
+    c.commit()
+    r = c.execute("SELECT * FROM taken_courses WHERE id=?", (tid,)).fetchone()
+    return dict(r)
+
+
+def list_taken_courses() -> list[dict[str, Any]]:
+    return rows_to_dicts(get_conn().execute(
+        "SELECT * FROM taken_courses ORDER BY semester, created_at").fetchall())
+
+
+def delete_taken_course(cid: str) -> bool:
+    c = get_conn()
+    n = c.execute("DELETE FROM taken_courses WHERE id=?", (cid,)).rowcount
+    c.commit()
+    return n > 0
+
+
+def clear_taken_courses() -> int:
+    c = get_conn()
+    n = c.execute("SELECT COUNT(*) AS n FROM taken_courses").fetchone()["n"]
+    c.execute("DELETE FROM taken_courses")
+    c.commit()
+    return n
 
 
 # ---------- 全局题库（出过的题入库复用，省 token + 正确率可统计） ----------

@@ -58,6 +58,20 @@ def report_md(space_id: str) -> str:
         for m in l3[-15:]:
             lines.append(f"- [{kind_cn.get(m['kind'], m['kind'] or '记录')}] {m['content']}")
         lines.append("")
+
+    # 证据导向学习方法建议
+    try:
+        from . import learning_methods
+        advice = learning_methods.advise_for_space(space_id, limit=4)
+        if advice.methods:
+            lines += ["## 学习方法建议", "", advice.tip, ""]
+            for m in advice.methods:
+                lines.append(f"- **{m['name']}**（{m['utility']}）：{m['how']}")
+                if m.get("avoid"):
+                    lines.append(f"  - 避免：{m['avoid']}")
+            lines.append("")
+    except Exception:
+        pass
     return "\n".join(lines)
 
 
@@ -101,9 +115,20 @@ def plan_md(space_id: str) -> str:
             lines += [f"## {current or '任务'}", ""]
         mark = "x" if t["done"] else " "
         due_cn = f"（{t['due_date']} 前完成）" if t.get("due_date") else ""
-        lines.append(f"- [{mark}] {t['content']}{due_cn}")
+        method_cn = f"［{t['method']}］" if t.get("method") else ""
+        lines.append(f"- [{mark}] {method_cn}{t['content']}{due_cn}")
         if t["accept"]:
             lines.append(f"  - 验收：{t['accept']}")
+    # 附方法目录摘要（零 LLM）
+    try:
+        from . import learning_methods
+        advice = learning_methods.advise_for_space(space_id, limit=4)
+        if advice.methods:
+            lines += ["", "## 推荐学习方法", "", advice.tip, ""]
+            for m in advice.methods:
+                lines.append(f"- **{m['name']}**：{m['how']}")
+    except Exception:
+        pass
     return "\n".join(lines)
 
 

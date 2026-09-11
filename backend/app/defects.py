@@ -168,9 +168,27 @@ def diagnose(space_id: str) -> dict:
             worst = min(weak_ups, key=lambda x: x["p_known"])
             note_parts.append(f"前置「{worst['point']}」薄弱（{int(worst['p_known'] * 100)}%），先补根因")
         if retention < 0.5 and p_known >= 0.6:
-            note_parts.append("遗忘明显，安排一次复习比学新内容收益更高")
+            note_parts.append("遗忘明显，安排一次检索复习比学新内容收益更高")
         if p["wrong"] >= 2 and p["wrong"] >= p["correct"]:
             note_parts.append(f"已错 {p['wrong']} 次，进入重点盯防")
+        # 证据导向方法：错因 → 方法；无错因时按掌握档位
+        try:
+            from . import learning_methods
+            et_stats = _error_type_stats(space_id, name)
+            if et_stats:
+                primary_et = max(et_stats, key=et_stats.get)
+                recs = learning_methods.methods_for_error(primary_et, limit=2)
+                if recs:
+                    note_parts.append("方法：" + "、".join(
+                        f"{m['name']}（{m['how'][:28]}…）" for m in recs))
+            elif retention < 0.5:
+                note_parts.append("方法：间隔重复 + 检索练习（先闭卷回忆再对答案）")
+            elif p_known < 0.4:
+                note_parts.append("方法：样例学习 + 自我解释（读例题→仿做→闭卷做）")
+            elif p_known >= 0.75:
+                note_parts.append("方法：交错变式 + 合意困难（换情境/混题型）")
+        except Exception:
+            pass
         diagnosed.append({
             "point": name,
             "p_known": round(p_known, 3),

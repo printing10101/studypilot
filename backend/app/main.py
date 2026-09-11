@@ -4,12 +4,13 @@ import os
 import pathlib
 import shutil
 import tempfile
+import urllib.parse
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import connectors, db, defects, experts, export, handbook, ingest, library, llm, planner, rag, schedule, skills, syllabus, velocity
+from . import anki_io, audit, bkt_fit, campus_net, competitions, connectors, db, defects, experts, export, handbook, ingest, learning_methods, library, llm, note_review, planner, rag, schedule, skills, study_metrics, syllabus, velocity
 from .config import settings
 
 app = FastAPI(title="StudyPilot", version="0.1.0")
@@ -108,6 +109,21 @@ class HandbookIn(BaseModel):
     notes: str = ""
 
 
+class CompetitionIn(BaseModel):
+    goal: str = ""              # 考研 / 推免/保研 / 就业 / 出国；留空按档案 goal_type 归一
+    use_llm: bool = True        # 是否追加 LLM 备赛策略
+    current_school: str = ""
+    major: str = ""
+    year: str = ""
+    rank_hint: str = ""
+    flags: list[str] = []
+    goal_type: str = "考研"
+    target_school: str = ""
+    target_major: str = ""
+    timeline: str = ""
+    notes: str = ""
+
+
 class ProfileIn(BaseModel):
     current_school: str = ""
     major: str = ""
@@ -119,6 +135,7 @@ class ProfileIn(BaseModel):
     target_major: str = ""
     timeline: str = ""
     notes: str = ""
+    learner_personas: list[str] = []
 
 
 # ---------- 个人学生档案（单用户） ----------
@@ -164,6 +181,60 @@ def health():
     return {"status": "ok", "llm": llm_ok, "model": settings.llm_model, "models": models}
 
 
+# ---------- 已修课程 · 培养方案完成度审核 ----------
+
+class TakenCourseIn(BaseModel):
+    name: str
+    credit: float = 0.0
+    grade: str = ""
+    semester: str = ""
+    status: str = "done"    # done 已修 / taking 修读中
+
+
+class TextImportIn(BaseModel):
+    text: str
+
+
+@app.get("/api/audit/courses")
+def api_audit_courses():
+    return {"courses": db.list_taken_courses()}
+
+
+@app.post("/api/audit/courses")
+def api_audit_add_course(body: TakenCourseIn):
+    try:
+        return db.add_taken_course(body.name, body.credit, body.grade, body.semester, body.status)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/audit/courses/import")
+def api_audit_import_courses(body: TextImportIn):
+    """粘贴成绩单文本批量导入：规则解析优先，LLM 兜底。"""
+    try:
+        return audit.import_courses_text(body.text)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/api/audit/courses/{cid}")
+def api_audit_delete_course(cid: str):
+    if not db.delete_taken_course(cid):
+        raise HTTPException(404, "课程不存在")
+    return {"ok": True}
+
+
+@app.post("/api/audit/courses/clear")
+def api_audit_clear_courses():
+    return {"removed": db.clear_taken_courses()}
+
+
+@app.get("/api/audit/run")
+def api_audit_run(school: str = "", major: str = ""):
+    """完成度审核：学校/专业缺省时回退个人档案。"""
+    return audit.run_audit(school, major)
+
+
 # ---------- 教材书库 ----------
 
 @app.on_event("startup")
@@ -173,6 +244,51 @@ def _seed_library():
         library.seed()
     except Exception:
         pass  # 书目预置失败不阻塞服务启动，可在前端重试
+
+
+class CampusConfigIn(BaseModel):
+    auto_sync: bool | None = None
+    interval_min: int | None = None
+    campus_hosts: list[str] | None = None
+    internal_hosts: list[str] | None = None
+    public_cidrs: list[str] | None = None
+    sources: list[dict] | None = None
+
+
+# ---------- 校园网感知 · 校园信息自动同步 ----------
+
+@app.get("/api/campus/status")
+def api_campus_status(force: int = 0):
+    """网络状态（校园网/公网/离线）+ 上次同步 + 信息源配置；force=1 跳过检测缓存。"""
+    if force:
+        campus_net.detect(force=True)
+    return campus_net.status()
+
+
+@app.post("/api/campus/sync")
+def api_campus_sync():
+    """立即同步全部信息源（离线时返回 skipped）。"""
+    return campus_net.sync()
+
+
+@app.get("/api/campus/items")
+def api_campus_items(source: str = "", limit: int = 60, q: str = ""):
+    """已抓取的校园信息条目（按发布日期倒序；q 按标题模糊过滤，如 q=四六级）。"""
+    return {"items": campus_net.list_items(source, limit, q=q)}
+
+
+@app.put("/api/campus/config")
+def api_campus_config(body: CampusConfigIn):
+    try:
+        campus_net.save_cfg(body.model_dump(exclude_none=True))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return campus_net.status()
+
+
+@app.on_event("startup")
+def _start_campus_sync():
+    campus_net.start_background_loop()
 
 
 @app.get("/api/library")
@@ -534,6 +650,27 @@ def api_today(sid: str):
     except Exception:
         snap["velocity"] = None
         snap["forecast"] = None
+    # 证据导向学习方法建议（零 LLM）
+    try:
+        advice = learning_methods.advise_for_space(sid, limit=3)
+        snap["methods"] = {
+            "tip": advice.tip,
+            "focus": advice.focus,
+            "items": advice.methods,
+            "daily": learning_methods.daily_tip(sid),
+            "persona": advice.persona,
+        }
+    except Exception:
+        snap["methods"] = None
+    try:
+        snap["metrics"] = {
+            "consistency": study_metrics.consistency(sid),
+            "load": study_metrics.daily_load(sid),
+            "calibration": study_metrics.calibration(sid),
+            "countdown": study_metrics.exam_countdown(sid),
+        }
+    except Exception:
+        snap["metrics"] = None
     return snap
 
 
@@ -563,6 +700,84 @@ def api_daily_question(sid: str):
 def api_transfer_opportunities():
     """跨空间迁移检测：已掌握概念可加速学习的关联概念。"""
     return velocity.detect_cross_space_transfer()
+
+
+@app.get("/api/learning-methods")
+def api_learning_methods():
+    """证据导向学习方法目录。"""
+    return {"methods": learning_methods.list_catalog()}
+
+
+@app.get("/api/spaces/{sid}/methods")
+def api_space_methods(sid: str):
+    """空间个性化学习方法建议（诊断信号 × 学习者画像 → 方法映射，零 LLM）。"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    advice = learning_methods.advise_for_space(sid, limit=5)
+    from . import learner_persona
+    return {
+        "tip": advice.tip,
+        "focus": advice.focus,
+        "methods": advice.methods,
+        "persona": advice.persona,
+        "signals": learning_methods.space_signals(sid),
+        "inferred": learner_persona.infer_personas(sid),
+    }
+
+
+@app.get("/api/learner-personas")
+def api_learner_personas():
+    """学习者画像目录。"""
+    from . import learner_persona
+    return {"personas": learner_persona.list_catalog()}
+
+
+@app.get("/api/spaces/{sid}/persona")
+def api_space_persona(sid: str):
+    """当前空间解析出的学习者画像（档案勾选 + 行为推断）。"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    from . import learner_persona
+    profile = learner_persona.resolve_profile(sid)
+    primary = learner_persona.PERSONAS.get(profile.primary)
+    return {
+        "primary": profile.primary,
+        "primary_name": primary.name if primary else "",
+        "primary_blurb": primary.blurb if primary else "",
+        "primary_tip": primary.tip if primary else "",
+        "session": primary.session if primary else "",
+        "labels": profile.labels(),
+        "explicit": profile.explicit,
+        "inferred": profile.inferred,
+        "evidence": profile.evidence,
+    }
+
+
+@app.get("/api/spaces/{sid}/metrics")
+def api_space_metrics(sid: str):
+    """一致性 / 负载 / 校准 / 方法效果 / 考试倒计时。"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    return study_metrics.space_metrics(sid)
+
+
+@app.post("/api/spaces/{sid}/quiz/{qid}/predict")
+def api_quiz_predict(sid: str, qid: str, body: dict):
+    """交卷前记录自我预测正确率（0~1），用于校准过度/不足自信。"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    if "predicted" not in body:
+        raise HTTPException(400, "缺少 predicted")
+    try:
+        return study_metrics.set_quiz_prediction(qid, float(body["predicted"]))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/study-load")
+def api_study_load():
+    """跨课程今日负载统筹。"""
+    return {"spaces": study_metrics.cross_space_load()}
 
 
 @app.get("/api/spaces/{sid}/mastery/history")
@@ -638,6 +853,21 @@ def api_handbook_generate(body: HandbookIn):
         raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(502, f"手册生成失败（检查模型通道）：{str(e)[:200]}")
+
+
+@app.get("/api/competitions/catalog")
+def api_competition_catalog():
+    """内置竞赛目录：级别 / 窗口 / 备赛周期 / 专业匹配 / 各路径价值。"""
+    return competitions.catalog()
+
+
+@app.post("/api/competitions/analyze")
+def api_competition_analyze(body: CompetitionIn):
+    """目标导向竞赛分析：至少参加哪些（分级推荐）+ 可选 LLM 备赛策略。"""
+    try:
+        return competitions.analyze(body.model_dump(), goal=body.goal, use_llm=body.use_llm)
+    except Exception as e:
+        raise HTTPException(502, f"竞赛分析失败：{str(e)[:200]}")
 
 
 @app.get("/api/handbook")
@@ -785,8 +1015,8 @@ def api_schedule_import_text(body: ScheduleTextIn):
 def api_schedule_import_file(file: UploadFile = File(...)):
     display_name = (file.filename or "未命名").replace("\\", "/").rsplit("/", 1)[-1] or "未命名"
     ext = ingest.ext_of(display_name)
-    if ext not in ingest.IMAGE_EXTS + (".xlsx", ".csv", ".txt", ".md", ".markdown"):
-        raise HTTPException(400, "课程表支持：截图(png/jpg/webp/bmp) / Excel(.xlsx) / CSV / 文本")
+    if ext not in ingest.IMAGE_EXTS + (".xlsx", ".csv", ".json", ".txt", ".md", ".markdown"):
+        raise HTTPException(400, "课程表支持：截图(png/jpg/webp/bmp) / Excel(.xlsx) / CSV / JSON(WakeUp) / 文本")
     fd, tmp_path = tempfile.mkstemp(dir=UPLOAD_ROOT, suffix=ext)
     with os.fdopen(fd, "wb") as f:
         shutil.copyfileobj(file.file, f)
@@ -879,26 +1109,37 @@ def api_llm_update(body: LlmConfigIn):
 
 @app.post("/api/llm/test")
 def api_llm_test():
-    """实测两个通道：各发一条 1 token 的补全，报告连通性与延迟。"""
-    import time
-    out = {}
-    for profile in ("local", "cloud"):
-        if profile == "cloud" and not llm._cloud_profile():
-            out[profile] = {"ok": False, "error": "未配置（在上方填入云端地址与模型）"}
-            continue
-        try:
-            t0 = time.time()
-            client = llm._get_client(profile)
-            r = client.post("/chat/completions", json={
-                "model": llm._model_of(profile),
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 1,
-            })
-            r.raise_for_status()
-            out[profile] = {"ok": True, "latency_ms": int((time.time() - t0) * 1000)}
-        except Exception as e:
-            out[profile] = {"ok": False, "error": str(e)[:200]}
-    return out
+    """实测两个通道：各发一条极短补全，报告连通性与延迟。"""
+    return {
+        "local": llm.probe_latency("local"),
+        "cloud": llm.probe_latency("cloud") if llm._cloud_profile()
+                 else {"ok": False, "error": "未配置"},
+    }
+
+
+@app.get("/api/llm/stats")
+def api_llm_stats(hours: int = 24):
+    """最近 N 小时的 LLM 调用统计：按通道/任务的延迟分布与成功率。"""
+    from . import llm_stats
+    return {
+        "summary": llm_stats.summary(hours=hours),
+        "health": llm_stats.channel_health(),
+        "task_routing": {k: v["priority"] for k, v in llm.TASK_ROUTING.items()},
+    }
+
+
+@app.get("/api/llm/usage")
+def api_llm_usage(days: int = 30):
+    """用量仪表盘：按天/通道/任务/模型聚合 Token 与调用次数。"""
+    from . import llm_stats
+    return llm_stats.usage_dashboard(days=max(1, min(days, 90)))
+
+
+@app.post("/api/llm/stats/clear")
+def api_llm_stats_clear():
+    from . import llm_stats
+    llm_stats.clear_history()
+    return {"ok": True}
 
 
 @app.get("/api/spaces/{sid}/quizzes")
@@ -950,6 +1191,105 @@ def api_remove_mcp(name: str):
     if not connectors.remove_mcp(name):
         raise HTTPException(404, "未注册的 MCP server")
     return {"ok": True}
+
+
+# ---------- 启动迁移 ----------
+
+@app.on_event("startup")
+def _startup_migrations():
+    note_review.ensure_doc_fsrs_columns()
+
+
+# ---------- Anki 导入导出 ----------
+
+@app.post("/api/spaces/{sid}/anki/import")
+async def api_anki_import(sid: str, file: UploadFile = File(...)):
+    """导入 .apkg 牌组到指定空间。"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    if not file.filename or not file.filename.endswith(".apkg"):
+        raise HTTPException(400, "请上传 .apkg 文件")
+    data = await file.read()
+    if len(data) > 100 * 1024 * 1024:  # 100MB 上限
+        raise HTTPException(400, "文件过大（上限 100MB）")
+    result = anki_io.import_apkg(data, sid)
+    return result
+
+
+@app.get("/api/spaces/{sid}/anki/export")
+def api_anki_export(sid: str):
+    """导出空间闪卡为 .apkg。"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    data = anki_io.export_apkg(sid)
+    space = db.get_space(sid)
+    fname = f"StudyPilot_{space['name'] if space else sid}.apkg"
+    # HTTP 头只能 latin-1：中文空间名走 RFC 5987 filename*，ASCII 名走普通 filename
+    quoted = urllib.parse.quote(fname, safe="")
+    from fastapi.responses import Response
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename=\"deck.apkg\"; filename*=UTF-8''{quoted}"},
+    )
+
+
+# ---------- 讲义笔记级 FSRS 复习 ----------
+
+@app.get("/api/spaces/{sid}/doc-reviews/due")
+def api_due_doc_reviews(sid: str):
+    """列出到期需要复习的讲义文档。"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    return note_review.list_due_doc_reviews(sid)
+
+
+@app.post("/api/spaces/{sid}/doc-reviews/{did}/grade")
+def api_grade_doc_review(sid: str, did: str, body: dict):
+    """对讲义做 FSRS 复习评分。body: {"rating": 1..4}"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    rating = body.get("rating", 3)
+    if rating not in (1, 2, 3, 4):
+        raise HTTPException(400, "rating 必须是 1(忘了)/2(困难)/3(良好)/4(轻松)")
+    result = note_review.schedule_doc_review(did, rating)
+    if not result:
+        raise HTTPException(404, "文档不存在")
+    return result
+
+
+@app.get("/api/spaces/{sid}/doc-reviews/{did}/preview")
+def api_preview_doc_review(sid: str, did: str):
+    """预览四档评分的下次间隔。"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    result = note_review.doc_review_preview(did)
+    if not result:
+        raise HTTPException(404, "文档不存在")
+    return result
+
+
+# ---------- BKT 参数个性化拟合 ----------
+
+@app.post("/api/spaces/{sid}/bkt/fit")
+def api_bkt_fit(sid: str):
+    """对空间内有足够答题记录的知识点做 Baum-Welch EM 个性化拟合。"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    fitted = bkt_fit.fit_for_space(sid)
+    return {"fitted_count": len(fitted), "params": fitted}
+
+
+@app.get("/api/spaces/{sid}/bkt/params")
+def api_bkt_params(sid: str):
+    """查看当前使用的 BKT 参数（个性化或默认）。"""
+    if not db.get_space(sid):
+        raise HTTPException(404, "空间不存在")
+    mastery_list = db.list_mastery(sid)
+    result = {}
+    for m in mastery_list[:50]:
+        result[m["point"]] = bkt_fit.get_params(sid, m["point"])
+    return result
 
 
 # ---------- 桌面模式：托管前端构建产物（SPA） ----------

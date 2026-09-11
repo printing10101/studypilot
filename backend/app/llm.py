@@ -4,26 +4,52 @@
 - 云端通道：任意 OpenAI 兼容 API（.env 或运行时经 /api/llm/config 配置，持久化到 data/llm_config.json）
 - 路由策略 routing：
     local  全部走本地（默认）
-    auto   重任务（出题/判卷/分析/规划/抽取）走云端（若已配置），其余本地
+    auto   按任务类型智能路由：重推理/结构化生成走云端（若已配置），轻任务本地，
+           且会参考最近实测延迟动态调整
     cloud  全部走云端，云端失败自动回退本地
 - 连接复用：httpx.Client 连接池常驻；配置文件只允许位于 data 目录内，文件 I/O 全部走
   os.open + os.fdopen 描述符方式（不按路径打开，杜绝路径逃逸与 TOCTOU）。
+- 每次调用记录延迟/Token/通道到 llm_stats，供模型设置页展示与 auto 路由决策。
 """
 import json
 import os
 import threading
+import time
 from typing import Iterator
 from urllib.parse import urlparse
 
 import httpx
 
+from . import llm_stats
 from .config import settings
 
 # 嵌入模型的离线开关延后到首次加载时决定（见 _configure_embed_offline）：
 # 新环境模型还没缓存时不能强制离线，否则下载被禁、聊天/出题/索引全瘫痪
 
-# 任务权重：auto 策略下这些任务优先走云端（重推理、长输出、结构化生成）
-HEAVY_TASKS = {"quiz", "grade", "analyze", "plan", "extract"}
+# 任务路由配置：auto 策略下按任务类型选择通道，同时携带推荐温度
+# priority: "cloud" = 优先云端（重推理/结构化）；"local" = 优先本地（轻量/延迟敏感）
+# temp: 该任务类型的推荐温度（调用方未显式指定时使用）
+TASK_ROUTING: dict[str, dict] = {
+    # 重推理 / 结构化 JSON 生成 → 云端
+    "quiz":    {"priority": "cloud", "temp": 0.5,  "max_tokens": 2600},
+    "grade":   {"priority": "cloud", "temp": 0.2,  "max_tokens": 1600},
+    "analyze": {"priority": "cloud", "temp": 0.2,  "max_tokens": 800},
+    "plan":    {"priority": "cloud", "temp": 0.4,  "max_tokens": 2000},
+    "extract": {"priority": "cloud", "temp": 0.2,  "max_tokens": 600},
+    "handbook": {"priority": "cloud", "temp": 0.3, "max_tokens": 2600},
+    "competition": {"priority": "cloud", "temp": 0.4, "max_tokens": 1800},
+    "syllabus": {"priority": "cloud", "temp": 0.1, "max_tokens": 1600},
+    # 轻量 / 延迟敏感 → 本地
+    "chat":    {"priority": "local", "temp": 0.6,  "max_tokens": 2048},
+    "summary": {"priority": "local", "temp": 0.3,  "max_tokens": 500},
+    "flashcard": {"priority": "local", "temp": 0.4, "max_tokens": 1600},
+    "teach":   {"priority": "local", "temp": 0.5,  "max_tokens": 800},
+}
+# 兼容旧 HEAVY_TASKS 集合（其他模块可能引用）
+HEAVY_TASKS = {k for k, v in TASK_ROUTING.items() if v["priority"] == "cloud"}
+
+# auto 路由下本地延迟超过此阈值（ms）时，轻任务也尝试云端
+_LOCAL_LATENCY_THRESHOLD_MS = 8000
 
 _cfg_lock = threading.RLock()  # 可重入：_get_client 持锁时会再经 _cloud_profile 触发 _ensure_runtime
 _clients: dict[str, httpx.Client] = {}
@@ -107,7 +133,7 @@ def update_runtime_config(cloud_base_url: str | None = None, cloud_api_key: str 
 
 
 def get_status() -> dict:
-    """供 /api/llm/config 展示（api_key 只回掩码）。"""
+    """供 /api/llm/config 展示（api_key 只回掩码）。附带最近调用统计。"""
     rt = _ensure_runtime()
     cloud_ok = bool(rt.get("cloud_base_url") and rt.get("cloud_model"))
     key = rt.get("cloud_api_key", "")
@@ -118,7 +144,39 @@ def get_status() -> dict:
                   "api_key_masked": (key[:4] + "****" + key[-4:]) if len(key) > 8 else ("已配置" if key else ""),
                   "configured": cloud_ok},
         "max_context_chars": settings.max_context_chars,
+        "task_routing": {k: v["priority"] for k, v in TASK_ROUTING.items()},
+        "stats": llm_stats.summary(hours=24),
+        "health": llm_stats.channel_health(),
     }
+
+
+def probe_latency(profile: str = "local", timeout: float = 15.0) -> dict:
+    """主动探测通道延迟：发一个极短请求测响应时间。供模型设置页「测速」按钮。"""
+    t0 = time.monotonic()
+    try:
+        p = _local_profile() if profile == "local" else _cloud_profile()
+        if not p:
+            return {"ok": False, "error": "通道未配置", "latency_ms": 0}
+        client = httpx.Client(
+            base_url=p["base_url"],
+            headers={"Authorization": f"Bearer {p['api_key']}"},
+            timeout=httpx.Timeout(timeout, connect=5.0),
+        )
+        r = client.post("/chat/completions", json={
+            "model": p["model"],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            "temperature": 0,
+        })
+        r.raise_for_status()
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        llm_stats.record("probe", profile, p["model"], latency_ms, ok=True)
+        client.close()
+        return {"ok": True, "latency_ms": latency_ms, "model": p["model"]}
+    except Exception as e:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        llm_stats.record("probe", profile, "", latency_ms, ok=False, error=str(e))
+        return {"ok": False, "error": str(e)[:200], "latency_ms": latency_ms}
 
 
 def _local_profile() -> dict:
@@ -139,13 +197,46 @@ def _routing() -> str:
 
 
 def _pick_profile(task: str) -> str:
-    """决定本次请求走哪个通道。"""
+    """决定本次请求走哪个通道。
+
+    local → 始终本地（用户隐私承诺）
+    cloud → 始终云端（配置了才用，否则回退本地）
+    auto  → 按任务类型 + 实测延迟智能选择：
+            - 重推理任务（quiz/grade/analyze/plan/extract）优先云端
+            - 轻任务优先本地，但本地最近延迟过高时也尝试云端
+    """
     routing = _routing()
     if routing == "cloud":
         return "cloud" if _cloud_profile() else "local"
-    if routing == "auto" and task in HEAVY_TASKS:
-        return "cloud" if _cloud_profile() else "local"
+    if routing == "auto":
+        if not _cloud_profile():
+            return "local"
+        cfg = TASK_ROUTING.get(task, {"priority": "local"})
+        if cfg["priority"] == "cloud":
+            return "cloud"
+        # 轻任务：本地最近延迟过高时切云端
+        health = llm_stats.channel_health()
+        local_h = health.get("local", {})
+        if (local_h.get("available") and
+                local_h.get("avg_latency_ms", 0) > _LOCAL_LATENCY_THRESHOLD_MS and
+                health.get("cloud", {}).get("available")):
+            return "cloud"
+        return "local"
     return "local"
+
+
+def _task_temp(task: str, explicit: float | None) -> float:
+    """获取任务推荐温度：显式指定优先，否则用任务配置。"""
+    if explicit is not None:
+        return explicit
+    return TASK_ROUTING.get(task, {}).get("temp", 0.6)
+
+
+def _task_max_tokens(task: str, explicit: int | None) -> int:
+    """获取任务推荐 max_tokens。"""
+    if explicit is not None:
+        return explicit
+    return TASK_ROUTING.get(task, {}).get("max_tokens", 2048)
 
 
 def _fallback_order(primary: str) -> list[str]:
@@ -187,23 +278,41 @@ def _strip_think(text: str) -> str:
     return text.strip()
 
 
-def chat(messages: list[dict], temperature: float = 0.6, max_tokens: int = 2048,
+def chat(messages: list[dict], temperature: float | None = None, max_tokens: int | None = None,
          task: str = "chat") -> str:
-    """带通道路由与回退的补全：首选通道失败时自动回退（routing=local 时只用本地）。"""
+    """带通道路由与回退的补全：首选通道失败时自动回退（routing=local 时只用本地）。
+
+    temperature/max_tokens 未指定时按任务类型自动选择推荐值。
+    每次调用记录延迟/Token 到 llm_stats。
+    """
+    temp = _task_temp(task, temperature)
+    mt = _task_max_tokens(task, max_tokens)
     order = _fallback_order(_pick_profile(task))
     last_err: Exception | None = None
+    tokens_in = llm_stats.estimate_messages_tokens(messages)
     for profile in order:
+        t0 = time.monotonic()
         try:
             r = _get_client(profile).post("/chat/completions", json={
-                "model": _model_of(profile), "messages": messages, "temperature": temperature,
-                "max_tokens": max_tokens,
+                "model": _model_of(profile), "messages": messages, "temperature": temp,
+                "max_tokens": mt,
             })
             r.raise_for_status()
-            text = r.json()["choices"][0]["message"]["content"]
+            data = r.json()
+            text = data["choices"][0]["message"]["content"]
             if not text or not text.strip():
                 raise ValueError("模型返回空内容")
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            usage = data.get("usage", {})
+            llm_stats.record(task, profile, _model_of(profile), latency_ms,
+                             tokens_in=usage.get("prompt_tokens", tokens_in),
+                             tokens_out=usage.get("completion_tokens", llm_stats.estimate_tokens(text)),
+                             ok=True)
             return _strip_think(text)
         except Exception as e:  # 网络/超时/云端报错 → 回退
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            llm_stats.record(task, profile, _model_of(profile), latency_ms,
+                             tokens_in=tokens_in, ok=False, error=str(e))
             last_err = e
             if profile == order[-1]:
                 break
@@ -251,18 +360,26 @@ class _ThinkFilter:
         return "" if self.in_think else rest
 
 
-def chat_stream(messages: list[dict], temperature: float = 0.6, max_tokens: int = 2048,
+def chat_stream(messages: list[dict], temperature: float | None = None, max_tokens: int | None = None,
                 task: str = "chat") -> Iterator[str]:
     """流式补全：出首个可见内容前失败时回退备用通道；已开始输出后失败直接抛错，
-    避免换通道重发导致回答前半截重复拼接。"""
+    避免换通道重发导致回答前半截重复拼接。
+
+    temperature/max_tokens 未指定时按任务类型自动选择推荐值。
+    """
+    temp = _task_temp(task, temperature)
+    mt = _task_max_tokens(task, max_tokens)
     order = _fallback_order(_pick_profile(task))
     last_err: Exception | None = None
+    tokens_in = llm_stats.estimate_messages_tokens(messages)
     for profile in order:
         filt = _ThinkFilter()
         emitted = False
+        out_chars = 0
+        t0 = time.monotonic()
         try:
-            body = {"model": _model_of(profile), "messages": messages, "temperature": temperature,
-                    "stream": True, "max_tokens": max_tokens}
+            body = {"model": _model_of(profile), "messages": messages, "temperature": temp,
+                    "stream": True, "max_tokens": mt}
             client = _get_client(profile)
             with client.stream("POST", "/chat/completions", json=body) as resp:
                 resp.raise_for_status()
@@ -281,14 +398,24 @@ def chat_stream(messages: list[dict], temperature: float = 0.6, max_tokens: int 
                     piece = filt.feed(delta)
                     if piece:
                         emitted = True
+                        out_chars += len(piece)
                         yield piece
                 tail = filt.flush()
                 if tail:
+                    out_chars += len(tail)
                     yield tail
                 if not emitted and not tail:
                     raise ValueError("模型未返回可见内容（thinking 段未闭合或输出为空）")
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                llm_stats.record(task, profile, _model_of(profile), latency_ms,
+                                 tokens_in=tokens_in,
+                                 tokens_out=llm_stats.estimate_tokens("x" * out_chars),
+                                 ok=True)
                 return
         except Exception as e:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            llm_stats.record(task, profile, _model_of(profile), latency_ms,
+                             tokens_in=tokens_in, ok=not emitted, error=str(e))
             if emitted:
                 raise  # 前半段已发给用户，重发只会拼接出重复内容
             last_err = e
@@ -300,13 +427,18 @@ def chat_stream(messages: list[dict], temperature: float = 0.6, max_tokens: int 
 _JSON_RETRY = "\n\n注意：刚才的输出不是合法 JSON。重新输出，只输出严格 JSON，不要任何解释、前后缀或代码块标记。"
 
 
-def chat_json(messages: list[dict], temperature: float = 0.4, max_tokens: int = 2048,
+def chat_json(messages: list[dict], temperature: float | None = None, max_tokens: int | None = None,
               task: str = "analyze") -> object:
-    """要求模型输出 JSON 并稳健解析：截取最外层 [..] / {..}，失败自动纠错重试一次。"""
+    """要求模型输出 JSON 并稳健解析：截取最外层 [..] / {..}，失败自动纠错重试一次。
+
+    temperature/max_tokens 未指定时按任务类型自动选择推荐值（JSON 任务默认低温）。
+    """
+    temp = _task_temp(task, temperature)
+    mt = _task_max_tokens(task, max_tokens)
     attempt_messages = list(messages)
     for attempt in range(2):
-        raw = chat(attempt_messages, temperature=temperature if attempt == 0 else 0.2,
-                   max_tokens=max_tokens, task=task)
+        raw = chat(attempt_messages, temperature=temp if attempt == 0 else 0.15,
+                   max_tokens=mt, task=task)
         parsed = _extract_json(raw)
         if parsed is not None:
             return parsed
