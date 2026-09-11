@@ -380,6 +380,32 @@ def _safe_url(url: str) -> str:
     return url
 
 
+def _strip_default_port(url: str) -> str:
+    """显式默认端口规范化（示例大学 WAF 对 https://…:443/ 返回 404），与 campus_net 同款。"""
+    p = urllib.parse.urlsplit(url)
+    try:
+        port = p.port
+    except ValueError:
+        return url
+    if port is None or (p.scheme, port) not in (("https", 443), ("http", 80)):
+        return url
+    netloc = p.hostname or ""
+    if ":" in netloc:  # IPv6 字面量
+        netloc = f"[{netloc}]"
+    return p._replace(netloc=netloc).geturl()
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """重定向逐跳复检 SSRF：公网直链可能 302 跳到内网/本机服务（对齐 campus_net）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _safe_url(_strip_default_port(newurl))
+        return super().redirect_request(req, fp, code, msg, headers, _strip_default_port(newurl))
+
+
+_opener = urllib.request.build_opener(_SafeRedirectHandler())
+
+
 def fetch_pdf(bid: str) -> dict:
     """从官方直链下载开放教材全文到本地书库。"""
     book = db.get_book(bid)
@@ -387,12 +413,12 @@ def fetch_pdf(bid: str) -> dict:
         raise ValueError("书目不存在")
     if not book["pdf_url"]:
         raise ValueError("该书目没有官方直链，请从来源页手动下载后导入")
-    url = _safe_url(book["pdf_url"])
+    url = _safe_url(_strip_default_port(book["pdf_url"]))
     f, dst = _new_book_file(".pdf")
     req = urllib.request.Request(url, headers={"User-Agent": "StudyPilot/0.1 (local study assistant)"})
     total = 0
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp, f:
+        with _opener.open(req, timeout=60) as resp, f:
             while True:
                 block = resp.read(256 * 1024)
                 if not block:
@@ -476,10 +502,10 @@ def _html_to_text(raw: bytes, charset: str) -> tuple[str, str]:
 
 def import_url(url: str, title: str = "") -> dict:
     """抓取公开网页正文，存为 local 书目（可像教材一样挂载到空间参与 RAG）。"""
-    url = _safe_url(url.strip())
+    url = _safe_url(_strip_default_port(url.strip()))
     req = urllib.request.Request(url, headers={"User-Agent": "StudyPilot/0.1 (local study assistant)"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _opener.open(req, timeout=30) as resp:
             ctype = (resp.headers.get("Content-Type") or "").lower()
             raw = resp.read(MAX_PAGE_BYTES + 1)
     except ValueError:
