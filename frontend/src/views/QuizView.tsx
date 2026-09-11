@@ -150,15 +150,35 @@ export function QuizView({ sid }: { sid: string }) {
                         <td style={{ width: 36, color: 'var(--faint)' }}>{i + 1}</td>
                         <td>
                           <div><span className="badge">{q.type}</span> <b>{q.question}</b></div>
-                          {q.options.length > 0 && (
+                          {q.options.length > 0 && graded && (
                             <div style={{ color: 'var(--muted)', margin: '7px 0' }}>{q.options.join('　')}</div>
                           )}
                           {!graded ? (
-                            <input type="text" style={{ maxWidth: 420 }} placeholder="输入你的答案"
-                              value={userAnswers[quiz.id]?.[q.id] ?? ''}
-                              onChange={(e) => setUserAnswers((u) => ({
-                                ...u, [quiz.id]: { ...u[quiz.id], [q.id]: e.target.value },
-                              }))} />
+                            q.options.length > 0 ? (
+                              <div style={{ margin: '7px 0', display: 'grid', gap: 6, maxWidth: 480 }}>
+                                {q.options.map((opt, oi) => {
+                                  const active = (userAnswers[quiz.id]?.[q.id] ?? '') === opt
+                                  const label = /^[a-d][.、．]/i.test(opt) ? opt : `${String.fromCharCode(65 + oi)}. ${opt}`
+                                  return (
+                                    <button key={oi} type="button" onClick={() => setUserAnswers((u) => ({
+                                      ...u, [quiz.id]: { ...u[quiz.id], [q.id]: opt },
+                                    }))}
+                                      style={{ textAlign: 'left', padding: '7px 11px', borderRadius: 8, cursor: 'pointer',
+                                        fontSize: 13, color: 'inherit',
+                                        border: `1px solid ${active ? 'var(--accent)' : 'var(--hairline-2)'}`,
+                                        background: active ? 'rgba(154,143,240,.12)' : 'transparent' }}>
+                                      {label}
+                                    </button>
+                                  )
+                                })}
+                              </div>
+                            ) : (
+                              <input type="text" style={{ maxWidth: 420 }} placeholder="输入你的答案"
+                                value={userAnswers[quiz.id]?.[q.id] ?? ''}
+                                onChange={(e) => setUserAnswers((u) => ({
+                                  ...u, [quiz.id]: { ...u[quiz.id], [q.id]: e.target.value },
+                                }))} />
+                            )
                           ) : (
                             <div style={{ fontSize: 13, marginTop: 7, display: 'grid', gap: 4 }}>
                               <span>

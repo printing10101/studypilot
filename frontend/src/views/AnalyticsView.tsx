@@ -147,10 +147,11 @@ function forceLayout(nodes: GraphNode[], edges: GraphEdge[]) {
     y: H / 2 + Math.sin((i / n) * Math.PI * 2) * (H / 3),
   }))
   const idx = new Map(nodes.map((nd, i) => [nd.point, i]))
-  const es: [number, number][] = []
+  // es 携带原始边的 source：布局会过滤缺端点/自环的边，渲染样式不能按 data.edges 下标取
+  const es: { a: number; b: number; src: string }[] = []
   edges.forEach((e) => {
     const a = idx.get(e.from_point), b = idx.get(e.to_point)
-    if (a !== undefined && b !== undefined && a !== b) es.push([a, b])
+    if (a !== undefined && b !== undefined && a !== b) es.push({ a, b, src: e.source })
   })
   const k = Math.sqrt((W * H) / Math.max(n, 1)) * 0.85
   for (let iter = 0; iter < 300; iter++) {
@@ -168,7 +169,7 @@ function forceLayout(nodes: GraphNode[], edges: GraphEdge[]) {
         fx[j] -= (dx / d) * f; fy[j] -= (dy / d) * f
       }
     }
-    for (const [a, b] of es) {
+    for (const { a, b } of es) {
       const dx = pos[a].x - pos[b].x, dy = pos[a].y - pos[b].y
       const d = Math.sqrt(dx * dx + dy * dy) || 1
       const f = (d - k) * 0.09
@@ -218,14 +219,14 @@ function GraphCard({ sid, data, onGoto }: { sid: string; data: GraphData | null;
                 <path d="M 0 1 L 9 5 L 0 9 z" fill="rgba(255,255,255,.4)" />
               </marker>
             </defs>
-            {layout.es.map(([a, b], i) => {
+            {layout.es.map(({ a, b, src }, i) => {
               const pa = layout.pos[a], pb = layout.pos[b]
               const active = selIdx >= 0 && (a === selIdx || b === selIdx)
               return (
                 <line key={i} x1={pa.x} y1={pa.y} x2={pb.x} y2={pb.y}
                   stroke={active ? 'rgba(154,143,240,.9)' : 'rgba(255,255,255,.15)'}
                   strokeWidth={active ? 1.8 : 1} markerEnd="url(#g-arrow)"
-                  strokeDasharray={data.edges[i]?.source === 'curriculum' ? '4 3' : undefined} />
+                  strokeDasharray={src === 'curriculum' ? '4 3' : undefined} />
               )
             })}
             {data.nodes.map((nd, i) => {
@@ -334,7 +335,9 @@ function MasteryTab({ sid }: { sid: string }) {
   const trend = (() => {
     const byDay: Record<string, { sum: number; n: number }> = {}
     for (const h of history) {
-      const d = new Date(h.created_at * 1000).toISOString().slice(0, 10)
+      // 本地时区按天分桶（toISOString 是 UTC，东八区 0-8 点会被算进前一天）
+      const t = new Date(h.created_at * 1000)
+      const d = `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`
       byDay[d] = byDay[d] || { sum: 0, n: 0 }
       byDay[d].sum += h.score; byDay[d].n++
     }
