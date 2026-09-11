@@ -42,6 +42,21 @@ export interface LlmStatus {
   cloud: { base_url: string; model: string; api_key_masked: string; configured: boolean }
   max_context_chars: number
 }
+export interface UsageDashboard {
+  window_days: number
+  totals: { calls: number; success_rate: number; tokens_in: number; tokens_out: number; tokens_total: number }
+  by_channel: Record<string, {
+    calls: number; success_rate: number; tokens_in: number; tokens_out: number
+    tokens_total: number; avg_latency_ms: number; p50_latency_ms: number
+  }>
+  daily: {
+    date: string; calls: number; tokens_in: number; tokens_out: number
+    local_in: number; local_out: number; cloud_in: number; cloud_out: number
+  }[]
+  by_task: Record<string, { calls: number; tokens_in: number; tokens_out: number; tokens_total: number; success_rate: number }>
+  by_model: Record<string, { calls: number; tokens_in: number; tokens_out: number; tokens_total: number; channel: string; success_rate: number }>
+  recent: { ts: number; task: string; channel: string; model: string; latency_ms: number; tokens_in: number; tokens_out: number; ok: boolean }[]
+}
 export interface HandbookMeta { id: string; title: string; space_id: string; created_at: number }
 export interface Handbook {
   id: string; title: string; profile: Record<string, unknown>
@@ -53,6 +68,22 @@ export interface WrongQ {
   knowledge_point: string; verdict: string; analysis: string; user_answer: string
   quiz_id: string; quiz_topic: string; quiz_created_at: number
 }
+export interface TakenCourse {
+  id: string; name: string; credit: number; grade: string
+  gpa: number; semester: string; status: string
+}
+export interface AuditResult {
+  program_found: boolean; school?: string; major?: string; coverage?: string
+  note?: string; taken_count?: number
+  requirements?: { total: number; done: number; taking: number; missing: number }
+  core_states?: { name: string; category: string; state: string; expected_term: string; credit: number; grade: string }[]
+  credits?: { total_required: number; total_earned: number; progress: number | null
+    by_category: { category: string; required: number; earned: number; done: number; total: number }[] }
+  gpa?: number | null
+  prereq_violations?: { course: string; missing_prereqs: string[] }[]
+  ready_next?: { name: string; expected_term: string; credit: number }[]
+  unmatched?: { name: string; credit: number; grade: string }[]
+}
 export interface Flashcard {
   id: string; front: string; back: string; point: string
   box: number; due_at: number
@@ -62,6 +93,11 @@ export interface Flashcard {
 export interface PlanTask {
   id: string; phase: string; content: string; accept: string
   points: string[]; due_date: string; done: number; done_at: number
+  method?: string
+}
+export interface LearningMethodItem {
+  id: string; name: string; utility: string
+  summary: string; how: string; avoid?: string; evidence?: string; why?: string
 }
 export interface TodayData {
   date: string
@@ -83,6 +119,17 @@ export interface TodayData {
     optimistic_days: number | null; expected_days: number | null; pessimistic_days: number | null
     optimistic_date: string | null; expected_date: string | null; pessimistic_date: string | null
   } | null
+  methods?: {
+    tip: string; focus: string; daily: string; items: LearningMethodItem[]
+    persona?: PersonaSummary | null
+  } | null
+  metrics?: {
+    consistency: { streak: number; active_7d: number; active_30d: number; last_active: string }
+    load: { due_points: number; flash_due: number; tasks_today: number; load_score: number
+      band: string; suggested_minutes: number; advice: string }
+    calibration: { n: number; avg_bias: number; label: string; avg_predicted?: number; avg_actual?: number }
+    countdown: { deadline: string; days_left: number; phase: string; strategy: string; goal_type: string } | null
+  } | null
 }
 export interface GraphNode {
   point: string; p_known: number | null; status: string
@@ -99,7 +146,16 @@ export interface StudentProfile {
   current_school: string; major: string; year: string; rank_hint: string
   flags: string[]; goal_type: string; target_school: string
   target_major: string; timeline: string; notes: string
+  learner_personas?: string[]
   updated_at?: number
+}
+export interface LearnerPersonaMeta {
+  id: string; name: string; blurb: string; tip: string; session: string
+}
+export interface PersonaSummary {
+  primary: string; name: string; labels: string[]
+  explicit: string[]; inferred: string[]; evidence: string[]
+  session?: string; tone?: string; tip?: string
 }
 export interface SpaceOverview {
   id: string; name: string; points: number; weak: number; mastered: number
@@ -119,6 +175,39 @@ export interface DefectDiag {
   repair_order: string[]; chains: string[][]; points: DefectPoint[]
 }
 export interface CurriculumMeta { file: string; course: string; concepts: number }
+export interface DueDocReview {
+  id: string; filename: string; due_at: number; state: number
+  stability: number; reps: number; never_reviewed: boolean
+}
+export interface BktParam { point: string; p_l0: number; p_t: number; p_g: number; p_s: number; source: string }
+export interface TransferOpportunity {
+  source_concept: string; source_space: string; source_mastery: number
+  target_concept: string; target_space: string; target_space_id: string
+  target_mastery: number; similarity: number; recommendation: string
+}
+// ---- 竞赛规划 ----
+export interface CompetitionItem {
+  id: string; name: string; abbr: string; tier: string; organizer: string
+  window_label: string; team: string; prep_weeks: number
+  majors: string[]; goals: Record<string, number>; why: string
+}
+export interface CompetitionPick {
+  id: string; name: string; abbr: string; tier: string; organizer: string
+  window_label: string; team: string; prep_weeks: number; why: string
+  value: number; major_match: boolean; specialist: boolean
+  suggested_date: string | null
+  lands_in_time: boolean; enough_prep: boolean; feasible: boolean
+  score: number; note?: string
+}
+export interface CompetitionAnalysis {
+  goal: string; goal_label: string
+  school: string; major: string; target: string
+  deadline: string | null; deadline_source: string
+  months_left: number | null
+  tier1: CompetitionPick[]; tier2: CompetitionPick[]; tier3: CompetitionPick[]
+  catalog_count: number
+  strategy_md: string; strategy_error: string
+}
 
 // ---- 学涯规划 ----
 export interface SyllabusSchool {
@@ -172,6 +261,30 @@ export interface CareerPlanMeta {
 }
 export interface CareerPlan extends CareerPlanMeta {
   tasks: CareerTask[]; markdown: string
+}
+export interface CampusSourceCfg { id: string; name: string; url: string }
+export interface CampusItem {
+  id: number; source: string; title: string; url: string
+  published: string; fetched_at: number
+}
+export interface CampusStatus {
+  network: {
+    state: 'campus' | 'campus_likely' | 'public' | 'offline'
+    label: string; detail: string
+    latency_campus_ms: number | null; latency_external_ms: number | null
+    checked_at: number
+  }
+  last_sync: {
+    ts: number; added: number; network: string; skipped: boolean
+    sources: { id: string; name: string; ok: boolean; new?: number; error?: string }[]
+  } | null
+  counts: Record<string, number>
+  total: number
+  config: {
+    auto_sync: boolean; interval_min: number
+    sources: CampusSourceCfg[]
+    campus_hosts: string[]; internal_hosts: string[]; public_cidrs: string[]
+  }
 }
 
 const BASE = ''
@@ -284,6 +397,30 @@ export const api = {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ due_date: dueDate }),
     })),
   today: (sid: string) => j<TodayData>(fetch(`${BASE}/api/spaces/${sid}/today`)),
+  learnerPersonas: () => j<{ personas: LearnerPersonaMeta[] }>(fetch(`${BASE}/api/learner-personas`)),
+  spacePersona: (sid: string) => j<{
+    primary: string; primary_name: string; primary_blurb: string; primary_tip: string
+    session: string; labels: string[]; explicit: string[]; inferred: string[]; evidence: string[]
+  }>(fetch(`${BASE}/api/spaces/${sid}/persona`)),
+  spaceMetrics: (sid: string) => j<Record<string, unknown>>(fetch(`${BASE}/api/spaces/${sid}/metrics`)),
+  predictQuiz: (sid: string, quizId: string, predicted: number) =>
+    j<{ quiz_id: string; predicted: number }>(fetch(`${BASE}/api/spaces/${sid}/quiz/${quizId}/predict`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ predicted }),
+    })),
+  studyLoad: () => j<{ spaces: Array<Record<string, unknown>> }>(fetch(`${BASE}/api/study-load`)),
+  auditCourses: () => j<{ courses: TakenCourse[] }>(fetch(`${BASE}/api/audit/courses`)),
+  addAuditCourse: (body: { name: string; credit: number; grade: string; semester: string; status: string }) =>
+    j<TakenCourse>(fetch(`${BASE}/api/audit/courses`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })),
+  importAuditCourses: (text: string) =>
+    j<{ added: number; method: string }>(fetch(`${BASE}/api/audit/courses/import`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }),
+    })),
+  deleteAuditCourse: (cid: string) => ok(fetch(`${BASE}/api/audit/courses/${cid}`, { method: 'DELETE' })),
+  clearAuditCourses: () => j<{ removed: number }>(fetch(`${BASE}/api/audit/courses/clear`, { method: 'POST' })),
+  runAudit: (school = '', major = '') =>
+    j<AuditResult>(fetch(`${BASE}/api/audit/run?school=${encodeURIComponent(school)}&major=${encodeURIComponent(major)}`)),
   graph: (sid: string) => j<GraphData>(fetch(`${BASE}/api/spaces/${sid}/graph`)),
   masteryHistory: (sid: string) => j<MasteryHistoryPoint[]>(fetch(`${BASE}/api/spaces/${sid}/mastery/history`)),
   importUrl: (url: string, title: string) =>
@@ -366,6 +503,69 @@ export const api = {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ space_id: spaceId, replace }),
     })),
   deleteCareerPlan: (pid: string) => ok(fetch(`${BASE}/api/planner/${pid}`, { method: 'DELETE' })),
+
+  // ---- 竞品借鉴新功能 ----
+  velocity: (sid: string) => j<{ velocity: TodayData['velocity']; forecast: TodayData['forecast'] }>(
+    fetch(`${BASE}/api/spaces/${sid}/velocity`)),
+  dailyQuestion: (sid: string) => j<{
+    source: string; point: string; quiz_id?: string
+    questions?: QuizQ[]; p_correct: number | null; note?: string
+  }>(fetch(`${BASE}/api/spaces/${sid}/daily-question`)),
+  transferOpportunities: () => j<TransferOpportunity[]>(fetch(`${BASE}/api/transfer-opportunities`)),
+  // 竞赛规划
+  competitionCatalog: () => j<{ items: CompetitionItem[]; count: number; note: string }>(
+    fetch(`${BASE}/api/competitions/catalog`)),
+  competitionAnalyze: (body: { goal?: string; use_llm?: boolean } & Partial<StudentProfile>) =>
+    j<CompetitionAnalysis>(fetch(`${BASE}/api/competitions/analyze`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })),
+  // Anki 导入导出
+  ankiImport: (sid: string, file: File) => {
+    const fd = new FormData(); fd.append('file', file)
+    return j<{ imported: number; skipped: number; errors: string[] }>(
+      fetch(`${BASE}/api/spaces/${sid}/anki/import`, { method: 'POST', body: fd }))
+  },
+  ankiExportUrl: (sid: string) => `${BASE}/api/spaces/${sid}/anki/export`,
+  // 讲义笔记级 FSRS 复习
+  dueDocReviews: (sid: string) => j<DueDocReview[]>(fetch(`${BASE}/api/spaces/${sid}/doc-reviews/due`)),
+  gradeDocReview: (sid: string, did: string, rating: number) =>
+    j<{ id: string; interval_human: string; reps: number }>(fetch(
+      `${BASE}/api/spaces/${sid}/doc-reviews/${did}/grade`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rating }),
+    })),
+  previewDocReview: (sid: string, did: string) => j<{
+    id: string; filename: string
+    preview: Record<string, { seconds: number; human: string }>
+  }>(fetch(`${BASE}/api/spaces/${sid}/doc-reviews/${did}/preview`)),
+  // BKT 参数个性化拟合
+  bktFit: (sid: string) => j<{ fitted_count: number; params: Record<string, unknown> }>(
+    fetch(`${BASE}/api/spaces/${sid}/bkt/fit`, { method: 'POST' })),
+  bktParams: (sid: string) => j<Record<string, Omit<BktParam, 'point'>>>(
+    fetch(`${BASE}/api/spaces/${sid}/bkt/params`)),
+  // LLM 调用统计
+  llmStats: (hours = 24) => j<{
+    summary: {
+      total: number; window_hours: number
+      by_channel: Record<string, { count: number; success_rate: number; avg_latency_ms: number; p50_latency_ms: number; p95_latency_ms: number; total_tokens_out?: number }>
+      by_task: Record<string, { count: number; success_rate: number; avg_latency_ms: number; p50_latency_ms: number; p95_latency_ms: number }>
+    }
+    health: Record<string, { available: boolean | null; avg_latency_ms: number; success_rate: number; recent_calls?: number }>
+    task_routing: Record<string, string>
+  }>(fetch(`${BASE}/api/llm/stats?hours=${hours}`)),
+  llmUsage: (days = 30) => j<UsageDashboard>(fetch(`${BASE}/api/llm/usage?days=${days}`)),
+  clearLlmStats: () => ok(fetch(`${BASE}/api/llm/stats/clear`, { method: 'POST' })),
+  // 校园网感知 · 校园信息自动同步
+  campusStatus: (force = false) =>
+    j<CampusStatus>(fetch(`${BASE}/api/campus/status${force ? '?force=1' : ''}`)),
+  campusSync: () => j<{ added: number; network: string; skipped: boolean }>(
+    fetch(`${BASE}/api/campus/sync`, { method: 'POST' })),
+  campusItems: (source = '', limit = 100, q = '') =>
+    j<{ items: CampusItem[] }>(fetch(`${BASE}/api/campus/items?source=${encodeURIComponent(source)}&limit=${limit}&q=${encodeURIComponent(q)}`)),
+  campusConfig: (patch: Record<string, unknown>) =>
+    j<CampusStatus>(fetch(`${BASE}/api/campus/config`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
+    })),
 }
 
 export function chatStream(

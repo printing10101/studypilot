@@ -318,7 +318,7 @@ table.quiz tr:last-child td { border-bottom: none; }
 .fb-btn.fb-on { color: var(--text, #fff); border-color: var(--text, #fff); background: rgba(99,140,255,.18); }
 
 /* ---- 今日学习仪表盘 ---- */
-.today-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.today-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
 .today-tile {
   background: var(--panel-2); border: 1px solid var(--hairline); border-radius: var(--r-md);
   padding: 13px 16px; display: grid; gap: 3px; transition: border-color .18s ease, transform .18s ease;
@@ -342,3 +342,135 @@ table.quiz tr:last-child td { border-bottom: none; }
 }
 .week-cell b { font-size: 12.5px; line-height: 1.3; }
 .week-cell span { font-size: 11px; color: var(--faint); line-height: 1.3; }
+
+/* ============ Toast 通知 ============ */
+.toast-wrap {
+  position: fixed; bottom: 24px; right: 24px; z-index: 9999;
+  display: flex; flex-direction: column; gap: 8px; pointer-events: none;
+}
+.toast {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 18px; border-radius: 14px; font-size: 13.5px; font-weight: 500;
+  backdrop-filter: blur(16px); border: 1px solid var(--hairline);
+  box-shadow: 0 8px 32px rgba(0,0,0,.35); pointer-events: auto; cursor: pointer;
+  animation: toastIn .3s cubic-bezier(.21,1.02,.73,1); max-width: 420px;
+  color: var(--text);
+}
+@keyframes toastIn { from { opacity: 0; transform: translateY(12px) scale(.96); } to { opacity: 1; transform: none; } }
+.toast-success { background: rgba(30,60,40,.85); border-color: rgba(130,207,159,.35); }
+.toast-success svg { color: var(--green); }
+.toast-error { background: rgba(60,30,35,.85); border-color: rgba(238,154,169,.35); }
+.toast-error svg { color: var(--red); }
+.toast-warn { background: rgba(60,50,30,.85); border-color: rgba(238,196,136,.35); }
+.toast-warn svg { color: var(--orange); }
+.toast-info { background: rgba(35,40,60,.85); border-color: rgba(154,143,240,.35); }
+.toast-info svg { color: var(--accent); }
+
+/* ============ Modal 对话框 ============ */
+.modal-mask {
+  position: fixed; inset: 0; z-index: 9000;
+  background: rgba(8,10,20,.6); backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+  animation: fadeIn .2s ease;
+}
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+.modal {
+  background: var(--panel-solid); border: 1px solid var(--hairline-2); border-radius: var(--r-lg);
+  width: calc(100vw - 48px); box-shadow: 0 24px 80px rgba(0,0,0,.5);
+  animation: modalIn .25s cubic-bezier(.21,1.02,.73,1);
+}
+@keyframes modalIn { from { opacity: 0; transform: translateY(16px) scale(.97); } to { opacity: 1; transform: none; } }
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 20px 12px; border-bottom: 1px solid var(--hairline);
+}
+.modal-head b { font-size: 15px; }
+.modal-x {
+  width: 28px; height: 28px; border-radius: 8px; border: none; background: transparent;
+  color: var(--muted); cursor: pointer; display: flex; align-items: center; justify-content: center;
+  transition: all .15s;
+}
+.modal-x:hover { background: var(--panel-2); color: var(--text); }
+.modal-body { padding: 16px 20px 20px; }
+
+/* ============ Select 选项列表 ============ */
+.select-opt {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  width: 100%; padding: 12px 14px; border-radius: var(--r-md); cursor: pointer;
+  border: 1px solid var(--hairline); background: var(--panel-2); color: var(--text);
+  font-family: inherit; text-align: left; transition: all .15s;
+}
+.select-opt:hover { border-color: rgba(154,143,240,.4); background: rgba(154,143,240,.08); }
+.select-opt svg { opacity: .5; flex: none; }
+
+/* ============ 空状态 ============ */
+.empty-state {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 60px 20px; text-align: center;
+}
+.empty-icon {
+  width: 64px; height: 64px; border-radius: 20px; display: flex; align-items: center; justify-content: center;
+  background: var(--grad-soft); border: 1px solid rgba(154,143,240,.2); color: var(--accent);
+}
+
+/* ============ 响应式布局 ============ */
+@media (max-width: 900px) {
+  .sidebar { width: 200px; padding: 10px 8px; }
+  .content { padding: 18px 16px; }
+  .hero-title { font-size: 28px; }
+  .hero-steps { grid-template-columns: repeat(2, 1fr); }
+  .today-grid { grid-template-columns: repeat(2, 1fr); }
+  .grid2 { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 640px) {
+  .sidebar {
+    position: fixed; left: -260px; top: 0; bottom: 0; z-index: 100;
+    width: 240px; transition: left .25s ease;
+  }
+  .sidebar.open { left: 0; }
+  .topbar { padding: 10px 14px; }
+  .brand-sub { display: none; }
+  .content { padding: 14px 12px; }
+  .hero { margin-top: 5vh; }
+  .hero-title { font-size: 22px; }
+  .hero-steps { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .hero-step { padding: 12px 10px; }
+  .today-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .today-tile .num { font-size: 20px; }
+  .card { padding: 14px 14px; border-radius: 14px; }
+  .card h3 { font-size: 14px; }
+  .btn { padding: 8px 14px; font-size: 12.5px; }
+  .msg { max-width: 100%; }
+  .bubble { padding: 10px 14px; font-size: 13px; }
+  .toast-wrap { bottom: 12px; right: 12px; left: 12px; }
+  .toast { max-width: 100%; }
+  .modal { width: calc(100vw - 24px); }
+  table.quiz { font-size: 11px; }
+  table.quiz th, table.quiz td { padding: 5px 6px; }
+  .mode-tabs { flex-wrap: wrap; }
+}
+
+/* 移动端侧边栏遮罩 */
+@media (max-width: 640px) {
+  .sidebar-overlay {
+    position: fixed; inset: 0; z-index: 99;
+    background: rgba(0,0,0,.4); backdrop-filter: blur(2px);
+  }
+  .mobile-menu-btn { display: inline-flex !important; }
+}
+
+@media (min-width: 641px) {
+  .mobile-menu-btn { display: none !important; }
+  .sidebar-overlay { display: none; }
+}
+
+/* 校园网页 · 信息条目列表 */
+.campus-list { display: grid; gap: 2px; }
+.campus-list a {
+  display: flex; gap: 12px; align-items: baseline;
+  padding: 9px 10px; border-radius: 10px;
+  text-decoration: none; color: inherit;
+}
+.campus-list a:hover { background: rgba(127, 127, 127, .08); }
+.campus-list a + a { border-top: 1px solid rgba(127, 127, 127, .08); border-top-left-radius: 0; border-top-right-radius: 0; }
