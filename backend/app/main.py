@@ -422,7 +422,8 @@ def api_delete_document(sid: str, did: str):
     doc = db.get_document(did)
     if not doc or doc["space_id"] != sid:
         raise HTTPException(404, "文档不存在")
-    db.delete_document(did)
+    # 挂载教材的文档与书库文件同路径且可被多空间共享，只解除挂载、不删磁盘文件
+    db.delete_document(did, remove_file=not db.document_is_book(did))
     return {"ok": True}
 
 

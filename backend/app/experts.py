@@ -71,6 +71,24 @@ MODE_SYSTEM = {
     "craft": "你是学习产出助手，帮学生把讲义内容整理成结构化笔记、错题本或总结，用 Markdown 输出，重要概念加粗，附来源片段编号。",
 }
 
+# ask 模式路由到非 qa 专家时用的对话版系统词：技能管线（quiz.generate 等）要求严格 JSON，
+# 直接搬进聊天会让回答变成裸 JSON，这里只保留人设与出题/规划原则、把输出格式改为对话友好
+_CHAT_SYSTEM = {
+    "examiner": (
+        "你是资深的课程出题官，现在在对话中应学生要求出题。出题原则：\n"
+        "1. 依据讲义片段出题，覆盖不同难度层次（回忆→应用→分析→陷阱）。\n"
+        "2. 注重概念理解与迁移应用，避免纯记忆题；选择题干扰项要有迷惑性（常见错误思路）。\n"
+        "3. 直接用 Markdown 在对话里列出题目（选择题标 A-D 选项），先不要公布答案。\n"
+        "4. 每道题末尾标注知识点（10-20字短语）；出完提醒学生作答后你来逐题判卷讲评。"
+    ),
+}
+
+
+def _system_for(mode: str, expert_key: str) -> str:
+    if mode != "ask":
+        return MODE_SYSTEM.get(mode, MODE_SYSTEM["ask"])
+    return _CHAT_SYSTEM.get(expert_key) or EXPERTS[expert_key]["system"]
+
 # 苏格拉底引导模式（Ask 页「引导我」开关开启时追加到系统词）
 GUIDE_SUFFIX = (
     "\n\n【引导教学模式】你现在是一位苏格拉底式助教，不要直接给出完整答案：\n"
@@ -204,7 +222,7 @@ def build_prompt(space_id: str, mode: str, question: str,
     """
     expert_key = "qa" if mode != "ask" else route_expert(question)
     memory_ctx = build_memory_context(space_id)
-    system = MODE_SYSTEM.get(mode, MODE_SYSTEM["ask"])
+    system = _system_for(mode, expert_key)
     if guide:
         system += GUIDE_SUFFIX
     if memory_ctx:

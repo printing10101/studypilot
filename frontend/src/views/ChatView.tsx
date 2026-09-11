@@ -161,7 +161,7 @@ export function ChatView({ sid }: { sid: string }) {
               ? '向助教提问…（引导模式：会先提示思路，而不是直接给答案）'
               : '向助教提问…（包含「出题」「计划」等关键词会自动路由到对应专家）'}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }} />
+            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send() } }} />
           <button className="send-btn" disabled={busy} onClick={send}><Icon name="send" /></button>
         </div>
       </div>

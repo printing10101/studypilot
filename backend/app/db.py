@@ -652,6 +652,12 @@ def get_book_document(bid: str, sid: str) -> str:
     return r["document_id"] if r else ""
 
 
+def document_is_book(did: str) -> bool:
+    """该文档是否为教材书库挂载（文件与书库共享，删文档时不可删磁盘文件）。"""
+    c = get_conn()
+    return c.execute("SELECT 1 FROM book_documents WHERE document_id=?", (did,)).fetchone() is not None
+
+
 def add_book_document(bid: str, sid: str, did: str) -> None:
     c = get_conn()
     c.execute("INSERT OR REPLACE INTO book_documents(book_id,space_id,document_id,created_at) VALUES(?,?,?,?)",
