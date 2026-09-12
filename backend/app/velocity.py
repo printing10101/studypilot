@@ -14,23 +14,28 @@ def compute_velocity(space_id: str, window_days: int = 14) -> dict:
     """滑动窗口内计算学习速度：每天新掌握几个知识点、趋势。"""
     t = db.now()
     window_start = t - window_days * 86400
-    history = db.list_mastery_history(space_id)
-    # 按知识点取窗口内首次达到 threshold 的时间（首次达标即视为掌握日）
+    history = db.list_mastery_history(space_id, limit=50000)
+    # 按知识点取窗口内首次达到 threshold 的时间（首次达标即视为掌握日）。
+    # 窗口开启前就已 ≥ 阈值的老掌握点不算「新掌握」：mastery 行达标后会长期保持，
+    # 窗口内任何一条复习记录都会产生 history 行，不排除会把全部存量掌握点重复计入，
+    # 让速度与完成日期预测系统性偏乐观。
+    before_state: dict[str, bool] = {}
     first_mastered: dict[str, float] = {}
     for h in history:
+        pt = h["point"]
         if h["created_at"] < window_start:
+            before_state[pt] = h["score"] >= _MASTERY_THRESHOLD
             continue
-        if h["score"] >= _MASTERY_THRESHOLD:
-            pt = h["point"]
-            if pt not in first_mastered:
-                first_mastered[pt] = h["created_at"]
+        if before_state.get(pt):
+            continue
+        if h["score"] >= _MASTERY_THRESHOLD and pt not in first_mastered:
+            first_mastered[pt] = h["created_at"]
     mastered_in_window = len(first_mastered)
     # 窗口内按天统计，算日均与趋势
     daily: dict[str, int] = {}
     for ts in first_mastered.values():
         day = time.strftime("%Y-%m-%d", time.localtime(ts))
         daily[day] = daily.get(day, 0) + 1
-    days_active = max(1, len(daily))
     # 分母用有效天数：空间建库不满一个窗口时按 14 天算会系统性低估日均速度、
     # 把完成日期预测得偏晚
     if history:

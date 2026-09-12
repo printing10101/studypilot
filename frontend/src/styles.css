@@ -9,7 +9,7 @@
   --hairline-2: rgba(255, 255, 255, 0.13);
   --text: #e8eaf2;
   --muted: #9aa3ba;
-  --faint: #6e7689;
+  --faint: #7d8598;  /* 提亮一档：#6e7689 在 #0f1322 上对比度约 4.06:1，低于小字号 AA 标准 4.5:1 */
   --accent: #9a8ff0;
   --accent-2: #74c4c9;
   --grad: linear-gradient(135deg, #9a8ff0 0%, #74c4c9 100%);
@@ -79,6 +79,8 @@ body {
   display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: var(--r-md);
   cursor: pointer; font-size: 13.5px; color: var(--muted); border: 1px solid transparent;
   transition: all .18s ease; position: relative; user-select: none;
+  /* div→button 化（键盘可达）：重置按钮默认外观，视觉与原导航项一致 */
+  width: 100%; background: none; font-family: inherit; text-align: left;
 }
 .nav-item svg { width: 16px; height: 16px; flex: none; opacity: .8; }
 .nav-item:hover { background: var(--panel-2); color: var(--text); }
@@ -130,14 +132,15 @@ body {
 .btn.danger { background: transparent; border: 1px solid rgba(238,154,169,.38); color: var(--red); box-shadow: none; }
 .btn.danger:hover:not(:disabled) { background: rgba(238,154,169,.08); }
 
-input[type="text"], input[type="date"], textarea, select {
+/* 覆盖全部文本类输入（password/number 等此前漏掉，走 UA 默认白底，在暗色界面里是刺眼的白块） */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]), textarea, select {
   background: rgba(255,255,255,.045); border: 1px solid var(--hairline); color: var(--text);
   border-radius: 12px; padding: 9px 14px; font-size: 13.5px; outline: none; font-family: inherit;
   transition: border-color .18s, box-shadow .18s; width: 100%;
 }
-input[type="date"] { color-scheme: dark; }
+input[type="date"], input[type="number"], input[type="time"], input[type="datetime-local"] { color-scheme: dark; }
 input::placeholder, textarea::placeholder { color: var(--faint); }
-input:focus, textarea:focus { border-color: rgba(154,143,240,.55); box-shadow: 0 0 0 3px rgba(154,143,240,.12); }
+input:focus, textarea:focus, select:focus { border-color: rgba(154,143,240,.55); box-shadow: 0 0 0 3px rgba(154,143,240,.12); }
 
 /* ============ 英雄区（未选择空间） ============ */
 .hero { max-width: 780px; margin: 9vh auto 0; text-align: center; }
@@ -195,6 +198,10 @@ input:focus, textarea:focus { border-color: rgba(154,143,240,.55); box-shadow: 0
 .md th, .md td { border: 1px solid var(--hairline); padding: 7px 10px; text-align: left; }
 .md th { background: rgba(255,255,255,.04); }
 .md hr { border: none; border-top: 1px solid var(--hairline); margin: 14px 0; }
+/* 宽表格/长公式在气泡内横向滚动，而不是撑破气泡把整个内容列顶出横向滚动条 */
+.md table { display: block; overflow-x: auto; }
+.md .katex-display { overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
+.md .katex { font-size: 1.05em; }
 
 .citations { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 6px; }
 .citation {
@@ -242,12 +249,25 @@ input:focus, textarea:focus { border-color: rgba(154,143,240,.55); box-shadow: 0
 .send-btn:hover:not(:disabled) { transform: translateY(-1px) scale(1.03); }
 .send-btn:disabled { opacity: .4; cursor: default; }
 .send-btn svg { width: 18px; height: 18px; }
+/* 生成中替代发送按钮的「停止」 */
+.send-btn.stop { background: transparent; border: 1px solid rgba(238,154,169,.45); color: var(--red); box-shadow: none; }
+.send-btn.stop:hover:not(:disabled) { background: rgba(238,154,169,.08); transform: none; }
+
+/* 对话页 · 模型未连接时输入区上方的可操作提示 */
+.llm-hint {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 0 0 10px; padding: 9px 14px; border-radius: 12px;
+  font-size: 12.5px; color: var(--orange);
+  border: 1px solid rgba(238,196,136,.35); background: rgba(238,196,136,.07);
+}
 
 /* ============ 表格（测验/知识库） ============ */
 table.quiz { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 table.quiz td, table.quiz th { border-bottom: 1px solid var(--hairline); padding: 11px 10px; text-align: left; vertical-align: top; }
 table.quiz th { color: var(--faint); font-size: 11.5px; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
 table.quiz tr:last-child td { border-bottom: none; }
+/* 深链定位：从今日页 / 图谱跳转过来的那卷短暂高亮 */
+.quiz-focus { border-color: rgba(154,143,240,.65) !important; box-shadow: 0 0 0 2px rgba(154,143,240,.22), var(--shadow); }
 .verdict-对 { color: var(--green); font-weight: 700; }
 .verdict-错 { color: var(--red); font-weight: 700; }
 .verdict-部分对 { color: var(--orange); font-weight: 700; }
@@ -355,6 +375,8 @@ table.quiz tr:last-child td { border-bottom: none; }
   box-shadow: 0 8px 32px rgba(0,0,0,.35); pointer-events: auto; cursor: pointer;
   animation: toastIn .3s cubic-bezier(.21,1.02,.73,1); max-width: 420px;
   color: var(--text);
+  /* 批量导入失败清单等带 \n 的文案按行显示，不被折叠成一坨 */
+  white-space: pre-line;
 }
 @keyframes toastIn { from { opacity: 0; transform: translateY(12px) scale(.96); } to { opacity: 1; transform: none; } }
 .toast-success { background: rgba(30,60,40,.85); border-color: rgba(130,207,159,.35); }
@@ -402,6 +424,33 @@ table.quiz tr:last-child td { border-bottom: none; }
 }
 .select-opt:hover { border-color: rgba(154,143,240,.4); background: rgba(154,143,240,.08); }
 .select-opt svg { opacity: .5; flex: none; }
+
+/* ============ 命令面板（Ctrl+K） ============ */
+.palette { width: 520px; padding: 10px; outline: none; }
+.palette-list {
+  max-height: 320px; overflow-y: auto; margin-top: 8px;
+  display: grid; gap: 2px;
+}
+.palette-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px; border-radius: 10px; cursor: pointer;
+  border: 1px solid transparent; background: none; color: var(--text);
+  font-family: inherit; font-size: 13.5px; text-align: left;
+}
+.palette-item svg { opacity: .65; flex: none; }
+.palette-item.active { background: rgba(154,143,240,.12); border-color: rgba(154,143,240,.3); }
+.palette-item .sub { margin-left: auto; }
+
+/* 减少动态效果偏好：关掉装饰性动画与平滑滚动 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+  html { scroll-behavior: auto !important; }
+  .content { scroll-behavior: auto; }
+}
 
 /* ============ 空状态 ============ */
 .empty-state {

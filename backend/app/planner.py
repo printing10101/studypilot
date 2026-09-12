@@ -222,17 +222,23 @@ def push_to_space(pid: str, space_id: str, replace: bool = False) -> dict:
         "SELECT content, done, done_at, due_date FROM plan_tasks WHERE space_id=? AND source_plan=?",
         (space_id, pid)).fetchall())
     prev_by_content = {p["content"]: p for p in prev}
-    db.delete_plan_tasks_by_source(space_id, pid)
     tasks = plan["tasks"] or []
     if not tasks:
+        # 校验必须放在删除之前：tasks JSON 损坏时 get_career_plan 会归一成 []，
+        # 先删后校验会把空间侧已同步的任务连完成状态一起抹掉
         raise ValueError("计划中没有可同步的任务")
+    db.delete_plan_tasks_by_source(space_id, pid)
     for t in tasks:
         old = prev_by_content.get(t["content"]) or {}
         done, done_at = old.get("done", 0), old.get("done_at", 0)
         if replace:
             done, done_at = 0, 0
-        # course 不是知识点，不再塞进 points（语义错位）；课程信息保留在计划任务原文里
-        db.add_plan_task(space_id, {"phase": t["phase"], "content": t["content"],
+        # course 不是知识点，不塞进 points（语义错位）；拼进任务原文保住课程归属信息
+        content = t["content"]
+        course = (t.get("course") or "").strip()
+        if course and course not in content:
+            content = f"【{course}】{content}"
+        db.add_plan_task(space_id, {"phase": t["phase"], "content": content,
                                     "accept": t.get("accept", ""), "points": [],
                                     "due_date": old.get("due_date", "")},
                          source_plan=pid, done=int(bool(done)), done_at=done_at or 0)

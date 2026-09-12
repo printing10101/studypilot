@@ -1,47 +1,67 @@
 // 学习分析：薄弱诊断（缺陷 + 依赖图谱）· 掌握度趋势（含 BKT 个性化拟合）· 记忆档案（L1/L2/L3）
 // 原名「记忆图谱」，一页塞了四件事；现按用途拆成三个子页签，构建图谱按钮只保留一个
-import { useEffect, useMemo, useState } from 'react'
-import { api, BktParam, DefectDiag, GraphData, GraphEdge, GraphNode, MasteryData, MasteryHistoryPoint, MemoryData } from '../api'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { api, BktParam, DefectDiag, GraphData, GraphEdge, GraphNode, MasteryData, MasteryHistoryPoint, MemoryData, NavExtra, runSkillStream } from '../api'
 import { downloadMd, Icon, SubTabs } from '../ui'
 import { Md } from '../md'
 import { useUX } from '../ux'
 
-export function AnalyticsView({ sid, onGoto }: { sid: string; onGoto: (t: string) => void }) {
+export function AnalyticsView({ sid, onGoto }: { sid: string; onGoto: (t: string, extra?: NavExtra) => void }) {
   const [sub, setSub] = useState('defects')
   return (
     <div className="content">
       <SubTabs value={sub} onChange={setSub}
         tabs={[['defects', '薄弱诊断'], ['mastery', '掌握度趋势'], ['memory', '记忆档案']]} />
       {sub === 'defects' && <DefectTab sid={sid} onGoto={onGoto} />}
-      {sub === 'mastery' && <MasteryTab sid={sid} />}
+      {sub === 'mastery' && <MasteryTab sid={sid} onGoto={onGoto} />}
       {sub === 'memory' && <MemoryTab sid={sid} />}
     </div>
   )
 }
 
+// runSkill 的出卷类技能返回 [{quiz_id, ...}]，取第一个卷 id 供测验页定位高亮
+function madeQuizId(r: any): string | undefined {
+  const made = Array.isArray(r) ? r[0] : r
+  return made?.quiz_id || undefined
+}
+
 // ---------- 子页 1：薄弱诊断（缺陷传播 + 依赖图谱，共用一个构建按钮） ----------
 
-function DefectTab({ sid, onGoto }: { sid: string; onGoto: (t: string) => void }) {
+function DefectTab({ sid, onGoto }: { sid: string; onGoto: (t: string, extra?: NavExtra) => void }) {
   const { toast } = useUX()
   const [diag, setDiag] = useState<DefectDiag | null>(null)
   const [graph, setGraph] = useState<GraphData | null>(null)
   const [building, setBuilding] = useState(false)
+  const [phase, setPhase] = useState('')
   const [open, setOpen] = useState('')
+  const [loadErr, setLoadErr] = useState(false)
+  const seq = useRef(0)
 
   const load = () => {
-    api.defects(sid).then(setDiag).catch(() => {})
-    api.graph(sid).then(setGraph).catch(() => {})
+    const id = ++seq.current
+    // 此前 catch(() => {}) 吞错：加载失败后 diag 永远 null，spinner 永转
+    api.defects(sid).then((d) => { if (id === seq.current) { setDiag(d); setLoadErr(false) } })
+      .catch(() => { if (id === seq.current) setLoadErr(true) })
+    api.graph(sid).then((g) => { if (id === seq.current) setGraph(g) }).catch(() => {})
   }
-  useEffect(() => { setDiag(null); setGraph(null); load() }, [sid]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    seq.current++
+    setDiag(null); setGraph(null); setLoadErr(false); load()
+  }, [sid]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const build = async () => {
+  const build = () => {
+    // SSE 流式：按钮实时显示「检索/抽取/合并」阶段
     setBuilding(true)
-    try {
-      const r = await api.runSkill(sid, 'graph.build', {})
-      toast('success', `知识图谱已构建：${r.total} 条依赖边（讲义抽取 ${r.llm_edges} + 内置课程图谱匹配 ${r.curriculum_edges}）`)
-      load()
-    } catch (e: any) { toast('error', e.message) }
-    setBuilding(false)
+    setPhase('准备中…')
+    runSkillStream(sid, 'graph.build', {}, {
+      onPhase: setPhase,
+      onDone: (r: any) => {
+        toast('success', `知识图谱已构建：${r.total} 条依赖边（讲义抽取 ${r.llm_edges} + 内置课程图谱匹配 ${r.curriculum_edges}）`)
+        setBuilding(false); setPhase('')
+        load()
+      },
+      onError: (m: string) => { setBuilding(false); setPhase(''); toast('error', m) },
+    })
   }
 
   const hasGraph = !!graph && graph.edges.length > 0
@@ -51,10 +71,17 @@ function DefectTab({ sid, onGoto }: { sid: string; onGoto: (t: string) => void }
         <span className="sub">掌握度由贝叶斯知识追踪（BKT）更新，叠加遗忘曲线估算「此刻留存」，再沿依赖图把前置缺陷向下游传播。</span>
         <div style={{ flex: 1 }} />
         <button className="btn small" disabled={building} onClick={build}>
-          <Icon name="brain" size={12} /> {building ? '构建中…' : hasGraph ? '重建知识图谱' : '构建知识图谱'}
+          <Icon name="brain" size={12} /> {building ? (phase || '构建中…') : hasGraph ? '重建知识图谱' : '构建知识图谱'}
         </button>
       </div>
-      <DefectPanel diag={diag} open={open} setOpen={setOpen} hasGraph={hasGraph} />
+      {loadErr && !diag ? (
+        <div className="card" style={{ marginBottom: 18 }}>
+          <span className="sub">缺陷诊断加载失败（服务可能正在重启）。</span>{' '}
+          <button className="btn small" onClick={() => { setLoadErr(false); load() }}>重试</button>
+        </div>
+      ) : (
+        <DefectPanel diag={diag} open={open} setOpen={setOpen} hasGraph={hasGraph} />
+      )}
       <GraphCard sid={sid} data={graph} onGoto={onGoto} />
     </>
   )
@@ -187,7 +214,7 @@ function forceLayout(nodes: GraphNode[], edges: GraphEdge[]) {
   return { pos, es, W, H }
 }
 
-function GraphCard({ sid, data, onGoto }: { sid: string; data: GraphData | null; onGoto: (t: string) => void }) {
+function GraphCard({ sid, data, onGoto }: { sid: string; data: GraphData | null; onGoto: (t: string, extra?: NavExtra) => void }) {
   const { toast } = useUX()
   const [sel, setSel] = useState('')
   useEffect(() => { setSel('') }, [data])
@@ -239,7 +266,7 @@ function GraphCard({ sid, data, onGoto }: { sid: string; data: GraphData | null;
                     stroke={sel === nd.point ? '#fff' : 'rgba(0,0,0,.35)'} strokeWidth={sel === nd.point ? 1.6 : 1} />
                   <text x={p.x} y={p.y + r + 12} textAnchor="middle" fontSize="9.5"
                     fill={sel === nd.point ? '#e8eaf2' : 'var(--muted)'}>
-                    {nd.point.length > 9 ? nd.point.slice(0, 9) + '…' : nd.point}
+                    {nd.point.length > 12 ? nd.point.slice(0, 12) + '…' : nd.point}
                   </text>
                   <title>{`${nd.point}（${statusCn(nd)}${nd.status !== 'unknown' ? ` ${Math.round((nd.p_known || 0) * 100)}%` : ''}）`}</title>
                 </g>
@@ -276,12 +303,7 @@ function GraphCard({ sid, data, onGoto }: { sid: string; data: GraphData | null;
               </span>
               {nd.attempts > 0 && <span className="sub">练 {nd.attempts} 次 · 对 {nd.correct} / 错 {nd.wrong}</span>}
               <div style={{ flex: 1 }} />
-              <button className="btn small" onClick={async () => {
-                try {
-                  await api.runSkill(sid, 'quiz.generate', { topic: nd.point, count: 3 })
-                  onGoto('quiz')
-                } catch (e: any) { toast('error', e.message) }
-              }}>出 3 题练它</button>
+              <QuizDrillButton sid={sid} point={nd.point} onGoto={onGoto} />
             </div>
             <span className="sub">
               前置：{ups.join('、') || '（无）'}　→　后继：{downs.join('、') || '（无）'}
@@ -295,26 +317,74 @@ function GraphCard({ sid, data, onGoto }: { sid: string; data: GraphData | null;
 
 // ---------- 子页 2：掌握度趋势（知识点掌握 + 折线 + BKT 个性化拟合） ----------
 
-function MasteryTab({ sid }: { sid: string }) {
+// 「出 N 题练它」：流式端点带阶段进度与取消（同步版是约 1 分钟的黑盒长请求，
+// 此前连点会连出多份卷，现在有 busy 态 + 阶段提示）
+function QuizDrillButton({ sid, point, onGoto }: {
+  sid: string; point: string; onGoto: (t: string, extra?: NavExtra) => void
+}) {
+  const { toast } = useUX()
+  const [busy, setBusy] = useState(false)
+  const [phase, setPhase] = useState('')
+  const abortRef = useRef<AbortController | null>(null)
+  useEffect(() => () => abortRef.current?.abort(), [])
+  const run = () => {
+    const ctrl = new AbortController()
+    abortRef.current = ctrl
+    setBusy(true); setPhase('准备中…')
+    runSkillStream(sid, 'quiz.generate', { topic: point, count: 3 }, {
+      onPhase: setPhase,
+      onDone: (r: any) => { setBusy(false); setPhase(''); onGoto('quiz', { quizId: madeQuizId(r) }) },
+      onError: (m: string) => { setBusy(false); setPhase(''); toast('error', m) },
+      onAbort: () => { setBusy(false); setPhase('') },
+    }, ctrl.signal)
+  }
+  return (
+    <span style={{ display: 'inline-flex', gap: 6 }}>
+      <button className="btn small" disabled={busy} onClick={run}>
+        {busy ? <><span className="spin" /> {phase || '出题中…'}</> : '出 3 题练它'}
+      </button>
+      {busy && <button className="btn ghost small" onClick={() => abortRef.current?.abort()}>停止</button>}
+    </span>
+  )
+}
+
+function MasteryTab({ sid, onGoto }: { sid: string; onGoto?: (t: string, extra?: NavExtra) => void }) {
   const { toast } = useUX()
   const [mastery, setMastery] = useState<MasteryData | null>(null)
   const [history, setHistory] = useState<MasteryHistoryPoint[]>([])
   const [bkt, setBkt] = useState<Record<string, Omit<BktParam, 'point'>> | null>(null)
   const [busy, setBusy] = useState(false)
+  const [reviewPhase, setReviewPhase] = useState('')
+  const reviewAbort = useRef<AbortController | null>(null)
+  const [showAllPoints, setShowAllPoints] = useState(false)
+  const [showAllBkt, setShowAllBkt] = useState(false)
+  const [loadErr, setLoadErr] = useState(false)
+  const seq = useRef(0)
   const refresh = () => {
-    api.mastery(sid).then(setMastery).catch(() => {})
-    api.masteryHistory(sid).then(setHistory).catch(() => {})
-    api.bktParams(sid).then(setBkt).catch(() => {})
+    const id = ++seq.current
+    // 此前三个 catch 全空：加载失败后卡片静默空白，看起来像"没有数据"
+    api.mastery(sid).then((r) => { if (id === seq.current) { setMastery(r); setLoadErr(false) } })
+      .catch(() => { if (id === seq.current) setLoadErr(true) })
+    api.masteryHistory(sid).then((r) => { if (id === seq.current) setHistory(r) }).catch(() => {})
+    api.bktParams(sid).then((r) => { if (id === seq.current) setBkt(r) }).catch(() => {})
   }
-  useEffect(() => { refresh() }, [sid]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { setMastery(null); refresh() }, [sid]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const makeReview = async () => {
-    setBusy(true)
-    try {
-      await api.runSkill(sid, 'review.generate', { count: 5 })
-      toast('info', '已按薄弱点生成复习测验，请切到「测验」页作答；答对会自动推进复习间隔')
-    } catch (e: any) { toast('error', e.message) }
-    setBusy(false)
+  const makeReview = () => {
+    // 流式端点：分钟级长任务需要阶段进度与取消，黑盒转圈会让人以为卡死
+    const ctrl = new AbortController()
+    reviewAbort.current = ctrl
+    setBusy(true); setReviewPhase('准备中…')
+    runSkillStream(sid, 'review.generate', { count: 5 }, {
+      onPhase: setReviewPhase,
+      onDone: (r: any) => {
+        setBusy(false); setReviewPhase('')
+        toast('info', '已按薄弱点生成复习测验；答对会自动推进复习间隔')
+        onGoto?.('quiz', { quizId: madeQuizId(r) })
+      },
+      onError: (m: string) => { setBusy(false); setReviewPhase(''); toast('error', m) },
+      onAbort: () => { setBusy(false); setReviewPhase('') },
+    }, ctrl.signal)
   }
 
   const fitBkt = async () => {
@@ -347,6 +417,12 @@ function MasteryTab({ sid }: { sid: string }) {
   const fittedCount = bkt ? Object.values(bkt).filter((p) => p.source === 'fitted').length : 0
   return (
     <>
+      {loadErr && !mastery && (
+        <div className="card" style={{ marginBottom: 18 }}>
+          <span className="sub">掌握度数据加载失败（服务可能正在重启）。</span>{' '}
+          <button className="btn small" onClick={() => { setLoadErr(false); refresh() }}>重试</button>
+        </div>
+      )}
       <div className="card" style={{ marginBottom: 18 }}>
         {mastery && mastery.points.length > 0 ? (
           <>
@@ -358,14 +434,15 @@ function MasteryTab({ sid }: { sid: string }) {
               {mastery.due.length > 0 && <span className="badge expert">{mastery.due.length} 个到复习时间</span>}
               <div style={{ flex: 1 }} />
               <button className="btn small" disabled={busy} onClick={makeReview}>
-                <Icon name="quiz" size={12} /> 生成薄弱点复习题
+                {busy ? <><span className="spin" /> {reviewPhase || '生成中…'}</> : <><Icon name="quiz" size={12} /> 生成薄弱点复习题</>}
               </button>
+              {busy && <button className="btn ghost small" onClick={() => reviewAbort.current?.abort()}>停止</button>}
               <button className="btn ghost small" onClick={exportReport}>
                 <Icon name="book" size={12} /> 导出学习报告
               </button>
             </div>
             <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
-              {mastery.points.slice(0, 20).map((p) => {
+              {(showAllPoints ? mastery.points : mastery.points.slice(0, 20)).map((p) => {
                 const pct = Math.round(p.score * 100)
                 const statusCn = p.status === 'weak' ? '薄弱' : p.status === 'mastered' ? '已掌握' : '学习中'
                 const dueIn = p.due_at - Date.now()
@@ -383,15 +460,21 @@ function MasteryTab({ sid }: { sid: string }) {
                   </div>
                 )
               })}
+              {mastery.points.length > 20 && (
+                <button className="btn ghost small" style={{ justifySelf: 'start' }} onClick={() => setShowAllPoints((v) => !v)}>
+                  {showAllPoints ? '收起' : `显示全部 ${mastery.points.length} 个知识点`}
+                </button>
+              )}
             </div>
             {trend.length >= 2 && (
               <div style={{ marginTop: 16 }}>
                 <b style={{ fontSize: 13 }}>掌握度趋势（按日平均）</b>
-                <svg viewBox="0 0 300 90" style={{ width: '100%', maxWidth: 560, display: 'block', marginTop: 6 }}>
+                <svg viewBox="0 0 300 96" style={{ width: '100%', maxWidth: 560, display: 'block', marginTop: 6 }}>
                   <line x1="0" y1="12" x2="300" y2="12" stroke="var(--hairline)" strokeDasharray="3 3" strokeWidth="1" />
                   <line x1="0" y1="62" x2="300" y2="62" stroke="var(--hairline)" strokeDasharray="3 3" strokeWidth="1" />
-                  <text x="302" y="15" fontSize="7" fill="var(--muted)">100%</text>
-                  <text x="302" y="65" fontSize="7" fill="var(--muted)">35%</text>
+                  {/* 轴标签画在 viewBox 内并右对齐：此前 x=302 超出宽度 300 被裁剪不可见 */}
+                  <text x="298" y="10" fontSize="7" textAnchor="end" fill="var(--muted)">100%</text>
+                  <text x="298" y="60" fontSize="7" textAnchor="end" fill="var(--muted)">35%</text>
                   <polyline fill="none" stroke="var(--accent, #7aa2f7)" strokeWidth="2"
                     points={trend.map((t, i) => {
                       const x = trend.length === 1 ? 150 : (i / (trend.length - 1)) * 296 + 2
@@ -403,6 +486,13 @@ function MasteryTab({ sid }: { sid: string }) {
                     const y = 84 - t.avg * 72
                     return <circle key={t.day} cx={x} cy={y} r="2.5" fill="var(--accent, #7aa2f7)"><title>{`${t.day} ${Math.round(t.avg * 100)}%`}</title></circle>
                   })}
+                  {/* 首末日期刻度：没有日期轴看不出趋势覆盖的时间范围 */}
+                  {trend.length > 1 && (
+                    <>
+                      <text x="2" y="94" fontSize="6.5" fill="var(--muted)">{trend[0].day.slice(5)}</text>
+                      <text x="298" y="94" fontSize="6.5" textAnchor="end" fill="var(--muted)">{trend[trend.length - 1].day.slice(5)}</text>
+                    </>
+                  )}
                 </svg>
               </div>
             )}
@@ -414,7 +504,7 @@ function MasteryTab({ sid }: { sid: string }) {
 
       <div className="card">
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-          <h3 style={{ margin: 0 }}>BKT 学习参数个性化</h3>
+          <h3 style={{ margin: 0 }}>掌握度模型个性化</h3>
           {bkt && <span className="badge">{Object.keys(bkt).length} 个知识点</span>}
           {fittedCount > 0 && <span className="badge expert">{fittedCount} 个已按你的作答历史拟合</span>}
           <div style={{ flex: 1 }} />
@@ -423,14 +513,20 @@ function MasteryTab({ sid }: { sid: string }) {
           </button>
         </div>
         <p className="sub" style={{ marginTop: 6 }}>
-          贝叶斯知识追踪有 4 个参数：初始掌握 p(L0)、每次练习学会 p(T)、猜对 p(G)、失误 p(S)。
-          默认用通用值；有足够作答记录后可拟合出你自己的参数，掌握度估计会更准。
+          系统会按你的答题记录逐步校准每个知识点的掌握度估计；做过「拟合」后估计更准。
+          参数细节默认折叠，供想深究的同学查看。
         </p>
         {bkt && Object.keys(bkt).length > 0 && (
-          <table className="quiz" style={{ marginTop: 10, maxWidth: 720 }}>
-            <thead><tr><th>知识点</th><th>p(L0) 初始</th><th>p(T) 学会</th><th>p(G) 猜对</th><th>p(S) 失误</th><th>来源</th></tr></thead>
-            <tbody>
-              {Object.entries(bkt).slice(0, 12).map(([point, p]) => (
+          <details style={{ marginTop: 8 }}>
+            <summary className="sub" style={{ cursor: 'pointer' }}>高级：查看模型参数明细（{Object.keys(bkt).length} 个知识点）</summary>
+            <p className="sub" style={{ marginTop: 6 }}>
+              贝叶斯知识追踪 4 参数：初始掌握 p(L0)、每次练习学会 p(T)、猜对 p(G)、失误 p(S)；
+              「个性化拟合」由 Baum-Welch EM 算法从你的作答序列估计。
+            </p>
+            <table className="quiz" style={{ marginTop: 10, maxWidth: 720 }}>
+              <thead><tr><th>知识点</th><th>p(L0) 初始</th><th>p(T) 学会</th><th>p(G) 猜对</th><th>p(S) 失误</th><th>来源</th></tr></thead>
+              <tbody>
+                {Object.entries(bkt).slice(0, showAllBkt ? undefined : 12).map(([point, p]) => (
                 <tr key={point}>
                   <td><b>{point}</b></td>
                   <td>{(p.p_l0 * 100).toFixed(0)}%</td>
@@ -441,7 +537,13 @@ function MasteryTab({ sid }: { sid: string }) {
                 </tr>
               ))}
             </tbody>
-          </table>
+            </table>
+            {Object.keys(bkt).length > 12 && (
+              <button className="btn ghost small" style={{ marginTop: 10 }} onClick={() => setShowAllBkt((v) => !v)}>
+                {showAllBkt ? '收起' : `显示全部 ${Object.keys(bkt).length} 个知识点`}
+              </button>
+            )}
+          </details>
         )}
       </div>
     </>
@@ -453,8 +555,18 @@ function MasteryTab({ sid }: { sid: string }) {
 function MemoryTab({ sid }: { sid: string }) {
   const { toast, confirm: uxConfirm } = useUX()
   const [mem, setMem] = useState<MemoryData | null>(null)
-  const refresh = () => api.memory(sid).then(setMem).catch(() => setMem({ l1_count: 0, l2: [], l3: [] }))
-  useEffect(() => { refresh() }, [sid])
+  const [loadErr, setLoadErr] = useState(false)
+  // 此前失败伪装成空档案（l1_count=0）：用户会误以为记忆被清空
+  const refresh = () => api.memory(sid).then((m) => { setMem(m); setLoadErr(false) }).catch(() => setLoadErr(true))
+  useEffect(() => { refresh() }, [sid]) // eslint-disable-line react-hooks/exhaustive-deps
+  if (loadErr && !mem) {
+    return (
+      <div className="card">
+        <span className="sub">记忆档案加载失败（服务可能正在重启）。</span>{' '}
+        <button className="btn small" onClick={() => { setLoadErr(false); refresh() }}>重试</button>
+      </div>
+    )
+  }
   if (!mem) return <div className="empty"><span className="spin" /> 加载中…</div>
 
   const R = [118, 168, 212]
@@ -471,7 +583,7 @@ function MemoryTab({ sid }: { sid: string }) {
           {mem.l2.length ? mem.l2.map((m) => (
             <div key={m.id} className="card" style={{ margin: '8px 0', fontSize: 13, padding: '12px 14px' }}><Md>{m.content}</Md></div>
           )) : <p className="sub">对话累计到 8 条后自动生成摘要</p>}
-          <p style={{ marginTop: 18 }}><span className="badge expert">L3 长期档案</span>　{l3.length} 条记录</p>
+          <p style={{ marginTop: 18 }}><span className="badge expert">L3 长期档案</span>　{mem.l3.length > 12 ? `最新 ${l3.length} / 共 ${mem.l3.length} 条` : `${mem.l3.length} 条记录`}</p>
           <div style={{ display: 'grid', gap: 7, marginTop: 8 }}>
             {l3.slice().reverse().map((m) => (
               <div key={m.id} className={`mem-node ${m.kind}`} style={{ position: 'static', transform: 'none', whiteSpace: 'normal' }}>

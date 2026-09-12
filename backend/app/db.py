@@ -1,5 +1,6 @@
 """SQLite 持久化层：项目空间、文档、消息、测验、三层记忆、向量。"""
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -9,6 +10,8 @@ from typing import Any
 
 from .config import settings
 from . import fsrs as _fsrs
+
+log = logging.getLogger("studypilot.db")
 
 os.makedirs(settings.data_dir, exist_ok=True)
 os.makedirs(settings.upload_dir, exist_ok=True)
@@ -30,6 +33,7 @@ CREATE TABLE IF NOT EXISTS documents(
   status TEXT DEFAULT 'pending',   -- pending/ready/error
   chunks INTEGER DEFAULT 0,
   error TEXT DEFAULT '',
+  content_hash TEXT DEFAULT '',    -- 上传文件 sha256，同空间判重用
   created_at REAL
 );
 CREATE TABLE IF NOT EXISTS messages(
@@ -267,6 +271,8 @@ CREATE INDEX IF NOT EXISTS idx_campus_source ON campus_items(source, published);
 """
 
 _local = threading.local()  # 线程本地连接：FastAPI 线程池并发共享单连接会触发 sqlite3 InterfaceError
+_migrate_lock = threading.Lock()
+_migrated = False  # SCHEMA + 列迁移进程内只跑一次：并发首连各自 ALTER 会 duplicate column
 
 
 def get_conn() -> sqlite3.Connection:
@@ -275,48 +281,67 @@ def get_conn() -> sqlite3.Connection:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")  # 多线程并发写友好（读写不互斥）
-        conn.executescript(SCHEMA)
-        # 轻量迁移：老库没有的列在此补齐
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_tasks)")}
-        if "due_date" not in cols:
-            conn.execute("ALTER TABLE plan_tasks ADD COLUMN due_date TEXT DEFAULT ''")
-        if "source_plan" not in cols:
-            conn.execute("ALTER TABLE plan_tasks ADD COLUMN source_plan TEXT DEFAULT ''")
-        if "method" not in cols:
-            conn.execute("ALTER TABLE plan_tasks ADD COLUMN method TEXT DEFAULT ''")
-        pcols = {r[1] for r in conn.execute("PRAGMA table_info(student_profile)")}
-        if "learner_personas" not in pcols:
-            conn.execute("ALTER TABLE student_profile ADD COLUMN learner_personas TEXT DEFAULT '[]'")
-        # FSRS 调度列（老 Leitner 数据零迁移：box 折算初始稳定性的逻辑在 app.fsrs 里）
-        mcols = {r[1] for r in conn.execute("PRAGMA table_info(mastery)")}
-        if "state" not in mcols:
-            conn.execute("ALTER TABLE mastery ADD COLUMN state INTEGER DEFAULT 0")
-        if "step" not in mcols:
-            conn.execute("ALTER TABLE mastery ADD COLUMN step INTEGER")
-        if "stability" not in mcols:
-            conn.execute("ALTER TABLE mastery ADD COLUMN stability REAL DEFAULT 0")
-        if "difficulty" not in mcols:
-            conn.execute("ALTER TABLE mastery ADD COLUMN difficulty REAL DEFAULT 0")
-        if "last_review" not in mcols:
-            conn.execute("ALTER TABLE mastery ADD COLUMN last_review REAL DEFAULT 0")
-        fcols = {r[1] for r in conn.execute("PRAGMA table_info(flashcards)")}
-        if "state" not in fcols:
-            conn.execute("ALTER TABLE flashcards ADD COLUMN state INTEGER DEFAULT 0")
-        if "step" not in fcols:
-            conn.execute("ALTER TABLE flashcards ADD COLUMN step INTEGER")
-        if "stability" not in fcols:
-            conn.execute("ALTER TABLE flashcards ADD COLUMN stability REAL DEFAULT 0")
-        if "difficulty" not in fcols:
-            conn.execute("ALTER TABLE flashcards ADD COLUMN difficulty REAL DEFAULT 0")
-        if "last_review" not in fcols:
-            conn.execute("ALTER TABLE flashcards ADD COLUMN last_review REAL DEFAULT 0")
-        if "reps" not in fcols:
-            conn.execute("ALTER TABLE flashcards ADD COLUMN reps INTEGER DEFAULT 0")
-        if "lapses" not in fcols:
-            conn.execute("ALTER TABLE flashcards ADD COLUMN lapses INTEGER DEFAULT 0")
-        conn.commit()
+        global _migrated
+        if not _migrated:
+            with _migrate_lock:
+                if not _migrated:
+                    _run_migrations(conn)
+                    _migrated = True
         _local.conn = conn
     return conn
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA)
+    # 轻量迁移：老库没有的列在此补齐
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_tasks)")}
+    if "due_date" not in cols:
+        conn.execute("ALTER TABLE plan_tasks ADD COLUMN due_date TEXT DEFAULT ''")
+    if "source_plan" not in cols:
+        conn.execute("ALTER TABLE plan_tasks ADD COLUMN source_plan TEXT DEFAULT ''")
+    if "method" not in cols:
+        conn.execute("ALTER TABLE plan_tasks ADD COLUMN method TEXT DEFAULT ''")
+    pcols = {r[1] for r in conn.execute("PRAGMA table_info(student_profile)")}
+    if "learner_personas" not in pcols:
+        conn.execute("ALTER TABLE student_profile ADD COLUMN learner_personas TEXT DEFAULT '[]'")
+    dcols = {r[1] for r in conn.execute("PRAGMA table_info(documents)")}
+    if "content_hash" not in dcols:
+        conn.execute("ALTER TABLE documents ADD COLUMN content_hash TEXT DEFAULT ''")
+    # FSRS 调度列（老 Leitner 数据零迁移：box 折算初始稳定性的逻辑在 app.fsrs 里）
+    mcols = {r[1] for r in conn.execute("PRAGMA table_info(mastery)")}
+    if "state" not in mcols:
+        conn.execute("ALTER TABLE mastery ADD COLUMN state INTEGER DEFAULT 0")
+    if "step" not in mcols:
+        conn.execute("ALTER TABLE mastery ADD COLUMN step INTEGER")
+    if "stability" not in mcols:
+        conn.execute("ALTER TABLE mastery ADD COLUMN stability REAL DEFAULT 0")
+    if "difficulty" not in mcols:
+        conn.execute("ALTER TABLE mastery ADD COLUMN difficulty REAL DEFAULT 0")
+    if "last_review" not in mcols:
+        conn.execute("ALTER TABLE mastery ADD COLUMN last_review REAL DEFAULT 0")
+    fcols = {r[1] for r in conn.execute("PRAGMA table_info(flashcards)")}
+    if "state" not in fcols:
+        conn.execute("ALTER TABLE flashcards ADD COLUMN state INTEGER DEFAULT 0")
+    if "step" not in fcols:
+        conn.execute("ALTER TABLE flashcards ADD COLUMN step INTEGER")
+    if "stability" not in fcols:
+        conn.execute("ALTER TABLE flashcards ADD COLUMN stability REAL DEFAULT 0")
+    if "difficulty" not in fcols:
+        conn.execute("ALTER TABLE flashcards ADD COLUMN difficulty REAL DEFAULT 0")
+    if "last_review" not in fcols:
+        conn.execute("ALTER TABLE flashcards ADD COLUMN last_review REAL DEFAULT 0")
+    if "reps" not in fcols:
+        conn.execute("ALTER TABLE flashcards ADD COLUMN reps INTEGER DEFAULT 0")
+    if "lapses" not in fcols:
+        conn.execute("ALTER TABLE flashcards ADD COLUMN lapses INTEGER DEFAULT 0")
+    # 一次性清洗：strptime 曾放过非补零日期（"2026-9-1"），字符串比较会失真，这里统一补零
+    for r in conn.execute("SELECT id, due_date FROM plan_tasks WHERE due_date != ''").fetchall():
+        try:
+            conn.execute("UPDATE plan_tasks SET due_date=? WHERE id=?",
+                         (time.strftime("%Y-%m-%d", time.strptime(r["due_date"], "%Y-%m-%d")), r["id"]))
+        except ValueError:
+            pass  # 本就非法的值留给校验层拒绝
+    conn.commit()
 
 
 def new_id() -> str:
@@ -325,6 +350,19 @@ def new_id() -> str:
 
 def now() -> float:
     return time.time()
+
+
+def like_escape(s: str) -> str:
+    """LIKE 通配符转义（配合 `LIKE ? ESCAPE '\\'` 使用），防止用户输入里的 % _ 误匹配。"""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _safe_json(text: Any, default: Any) -> Any:
+    """历史脏数据容错：单行 JSON 损坏不应让整个列表接口 500。"""
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return default
 
 
 def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
@@ -353,17 +391,20 @@ def get_space(sid: str) -> dict[str, Any] | None:
 
 def delete_space(sid: str) -> None:
     c = get_conn()
-    # 先删该空间文档对应的磁盘文件（路径须在上传目录内，防误删）
+    # 先收集该空间文档的磁盘路径（须在上传目录内，防误删）
     upload_root = os.path.realpath(settings.upload_dir)
-    for r in c.execute("SELECT path FROM documents WHERE space_id=?", (sid,)).fetchall():
+    # 挂载教材的文档与书库共享同一磁盘文件（与 delete_document 的 remove_file=False 口径一致），
+    # 删空间时只删库记录、跳过文件，否则书库条目变「文件丢失」、其他空间无法再挂载
+    book_doc_ids = {r["document_id"] for r in c.execute("SELECT document_id FROM book_documents").fetchall()}
+    paths: list[str] = []
+    for r in c.execute("SELECT id, path FROM documents WHERE space_id=?", (sid,)).fetchall():
         p = r["path"]
-        if not p:
-            continue
-        try:
-            if os.path.realpath(p).startswith(upload_root + os.sep):
-                os.remove(p)
-        except OSError:
-            pass  # 文件可能已被移动/删除，不阻塞空间清理
+        if p and r["id"] not in book_doc_ids:
+            try:
+                if os.path.realpath(p).startswith(upload_root + os.sep):
+                    paths.append(p)
+            except OSError:
+                pass
     for t in ("documents", "messages", "quiz_records", "memory", "vectors",
               "feedback", "mastery", "mastery_history", "flashcards",
               "plan_tasks", "concept_edges", "book_documents", "question_bank"):
@@ -374,22 +415,98 @@ def delete_space(sid: str) -> None:
             c.execute(f"DELETE FROM {t} WHERE space_id=?", (sid,))
         except sqlite3.OperationalError:
             pass  # 表未创建，自然也没有该空间的行
+    c.execute("DELETE FROM handbooks WHERE space_id=?", (sid,))
+    # meta 里挂着该空间的 KV（分析位点 analyzed_*、个性化 BKT 参数 bkt_params:*），一并清掉
+    try:
+        c.execute("DELETE FROM meta WHERE key LIKE ? ESCAPE '\\'",
+                  (f"%{like_escape(sid)}%",))
+    except sqlite3.OperationalError:
+        pass
     c.execute("DELETE FROM spaces WHERE id=?", (sid,))
     c.commit()
+    # 提交成功后再删磁盘文件：中途失败时记录还在、文件也还在，可重试
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass  # 文件可能已被移动/删除，不阻塞空间清理
 
 
 # ---------- 文档 ----------
 
-def add_document(space_id: str, filename: str, path: str, doc_id: str = "") -> str:
+def add_document(space_id: str, filename: str, path: str, doc_id: str = "",
+                 content_hash: str = "") -> str:
     c = get_conn()
     did = doc_id or new_id()
-    c.execute("INSERT INTO documents(id,space_id,filename,path,status,created_at) VALUES(?,?,?,?, 'pending',?)",
-              (did, space_id, filename, path, now()))
+    c.execute("INSERT INTO documents(id,space_id,filename,path,status,content_hash,created_at) "
+              "VALUES(?,?,?,?,'pending',?,?)",
+              (did, space_id, filename, path, content_hash, now()))
     c.commit()
     return did
 
 
+def find_doc_by_hash(space_id: str, content_hash: str) -> dict[str, Any] | None:
+    """同空间内按内容哈希找已就绪文档：重复上传同一文件时向量化结果会全量翻倍，
+    检索里重复片段挤占上下文预算、引用列表也重复，上传入口据此判重。"""
+    if not content_hash:
+        return None
+    r = get_conn().execute(
+        "SELECT id, filename FROM documents WHERE space_id=? AND content_hash=? AND status='ready' "
+        "ORDER BY created_at DESC LIMIT 1", (space_id, content_hash)).fetchone()
+    return dict(r) if r else None
+
+
+def reset_stale_pending() -> int:
+    """启动时清扫：进程中途被杀（如直接关窗）会让文档永远停在 pending「处理中」转圈，
+    没有任何自愈路径；这里统一置为 error 并提示可重新索引。"""
+    c = get_conn()
+    rows = c.execute("SELECT id FROM documents WHERE status='pending'").fetchall()
+    if not rows:
+        return 0
+    c.execute("UPDATE documents SET status='error', error='上次处理被中断（应用退出），请点「重新索引」重试' "
+              "WHERE status='pending'")
+    c.commit()
+    return len(rows)
+
+
+def backup_database(keep: int = 7) -> str | None:
+    """滚动整库备份到 data/backups/（SQLite 在线 backup API，不阻塞写入）。
+    库损坏或误删空间后掌握度历史/记忆档案才有一线恢复机会。"""
+    try:
+        backup_root = os.path.realpath(os.path.join(os.path.realpath(settings.data_dir), "backups"))
+        os.makedirs(backup_root, exist_ok=True)
+        # 文件名仅由时间戳构成、不含任何外部输入；仍做目录边界校验防呆
+        dest_path = os.path.realpath(os.path.join(
+            backup_root, f"studypilot-{time.strftime('%Y%m%d-%H%M%S')}.db"))
+        if os.path.commonpath([dest_path, backup_root]) != backup_root:
+            return None
+        src = get_conn()
+        dest = sqlite3.connect(dest_path)
+        with dest:
+            src.backup(dest)
+        dest.close()
+        # 只保留最近 keep 份
+        olds = sorted(
+            p for p in os.listdir(backup_root)
+            if p.startswith("studypilot-") and p.endswith(".db")
+            and os.path.commonpath([os.path.realpath(os.path.join(backup_root, p)), backup_root]) == backup_root)
+        for p in olds[:-keep] if len(olds) > keep else []:
+            try:
+                os.remove(os.path.join(backup_root, p))
+            except OSError:
+                pass
+        return dest_path
+    except Exception:
+        return None  # 备份失败不阻塞启动
+
+
+_DOC_UPDATABLE_COLS = {"status", "error", "chunks", "filename", "path"}  # 防御性白名单：SET 列名不拼接任意输入
+
+
 def update_document(did: str, **kw: Any) -> None:
+    bad = set(kw) - _DOC_UPDATABLE_COLS
+    if bad:
+        raise ValueError(f"documents 不允许更新的列: {bad}")
     c = get_conn()
     sets = ",".join(f"{k}=?" for k in kw)
     c.execute(f"UPDATE documents SET {sets} WHERE id=?", (*kw.values(), did))
@@ -402,9 +519,25 @@ def list_documents(space_id: str) -> list[dict[str, Any]]:
         (space_id,)).fetchall())
 
 
+def list_documents_with_review(space_id: str) -> list[dict[str, Any]]:
+    """带 FSRS 复习调度列的文档列表（note_review 到期计算专用；
+    普通 list_documents 的窄列 SELECT 不含 review_*，会让到期判断恒为「从未复习」）。"""
+    return rows_to_dicts(get_conn().execute(
+        "SELECT id,filename,status,created_at,review_state,review_stability,review_reps,review_lapses,review_due_at "
+        "FROM documents WHERE space_id=? AND status='ready' ORDER BY created_at DESC",
+        (space_id,)).fetchall())
+
+
 def get_document(did: str) -> dict[str, Any] | None:
     r = get_conn().execute("SELECT * FROM documents WHERE id=?", (did,)).fetchone()
     return dict(r) if r else None
+
+
+def clear_vectors(did: str) -> None:
+    """清空文档已有向量（重新索引前调用，避免新旧 chunk 混杂）。"""
+    c = get_conn()
+    c.execute("DELETE FROM vectors WHERE document_id=?", (did,))
+    c.commit()
 
 
 def delete_document(did: str, remove_file: bool = True) -> None:
@@ -442,9 +575,27 @@ def list_messages(space_id: str, limit: int = 200) -> list[dict[str, Any]]:
         "SELECT * FROM messages WHERE space_id=? ORDER BY created_at DESC LIMIT ?", (space_id, limit)).fetchall()
     out = rows_to_dicts(rows)
     for m in out:
-        m["citations"] = json.loads(m["citations"])
+        m["citations"] = _safe_json(m["citations"], [])
     out.reverse()
     return out
+
+
+def list_messages_paged(space_id: str, limit: int = 50, before_ts: float | None = None):
+    """分页取最近消息（时间正序）。before_ts 为上一页最早一条的时间戳；has_more 提示是否还有更早消息。"""
+    sql = "SELECT * FROM messages WHERE space_id=?"
+    args: list = [space_id]
+    if before_ts is not None:
+        sql += " AND created_at < ?"
+        args.append(before_ts)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    args.append(limit + 1)
+    rows = get_conn().execute(sql, args).fetchall()
+    has_more = len(rows) > limit
+    out = rows_to_dicts(rows[:limit])
+    for m in out:
+        m["citations"] = _safe_json(m["citations"], [])
+    out.reverse()
+    return out, has_more
 
 
 def recent_messages(space_id: str, n: int = 12) -> list[dict[str, Any]]:
@@ -483,8 +634,20 @@ def list_quizzes(space_id: str) -> list[dict[str, Any]]:
     rows = rows_to_dicts(get_conn().execute(
         "SELECT * FROM quiz_records WHERE space_id=? ORDER BY created_at DESC", (space_id,)).fetchall())
     for q in rows:
-        q["questions"] = json.loads(q["questions"])
-        q["answers"] = json.loads(q["answers"])
+        q["questions"] = _safe_json(q["questions"], [])
+        q["answers"] = _safe_json(q["answers"], [])
+    return rows
+
+
+def recent_quizzes(space_id: str, n: int = 5) -> list[dict[str, Any]]:
+    """最近 n 份测验（新→旧，含 answers）。SQL LIMIT 取行：
+    list_quizzes 会解析全空间每份卷的 questions/answers JSON，只为取最近几份时开销线性膨胀。"""
+    rows = rows_to_dicts(get_conn().execute(
+        "SELECT * FROM quiz_records WHERE space_id=? ORDER BY created_at DESC LIMIT ?",
+        (space_id, max(1, n))).fetchall())
+    for q in rows:
+        q["questions"] = _safe_json(q["questions"], [])
+        q["answers"] = _safe_json(q["answers"], [])
     return rows
 
 
@@ -589,14 +752,14 @@ def add_book(title: str, author: str = "", subject: str = "", publisher: str = "
 
 
 def list_books(query: str = "", subject: str = "") -> list[dict[str, Any]]:
-    like = f"%{query}%"
+    like = f"%{like_escape(query)}%" if query else ""
     if query and subject:
         rows = get_conn().execute(
-            "SELECT * FROM books WHERE subject=? AND (title LIKE ? OR author LIKE ? OR note LIKE ?)"
+            "SELECT * FROM books WHERE subject=? AND (title LIKE ? ESCAPE '\\' OR author LIKE ? ESCAPE '\\' OR note LIKE ? ESCAPE '\\')"
             " ORDER BY subject,created_at", (subject, like, like, like)).fetchall()
     elif query:
         rows = get_conn().execute(
-            "SELECT * FROM books WHERE title LIKE ? OR author LIKE ? OR note LIKE ?"
+            "SELECT * FROM books WHERE title LIKE ? ESCAPE '\\' OR author LIKE ? ESCAPE '\\' OR note LIKE ? ESCAPE '\\'"
             " ORDER BY subject,created_at", (like, like, like)).fetchall()
     elif subject:
         rows = get_conn().execute(
@@ -781,20 +944,22 @@ def _mastery_status(score: float) -> str:
 
 
 def _find_mastery(space_id: str, point: str) -> dict[str, Any] | None:
-    """精确匹配，再按字符相似度匹配（LLM 对同一知识点的表述会有差异）。"""
-    import difflib
+    """精确匹配，再做包含关系匹配（LLM 对同一知识点的表述会有差异，
+    如「牛顿第二定律」vs「牛顿第二运动定律」）。不用纯字符相似度：
+    ratio≥0.5 会把「光的干涉/光的衍射」这类相邻概念误并成同一个点。"""
     r = get_conn().execute("SELECT * FROM mastery WHERE space_id=? AND point=?",
                            (space_id, point)).fetchone()
     if r:
         return dict(r)
+    if len(point) < 4:
+        return None  # 短名没有可靠的模糊匹配依据，宁可不并
     rows = rows_to_dicts(get_conn().execute(
         "SELECT * FROM mastery WHERE space_id=?", (space_id,)).fetchall())
-    best, best_ratio = None, 0.0
     for row in rows:
-        ratio = difflib.SequenceMatcher(None, row["point"], point).ratio()
-        if ratio > best_ratio:
-            best, best_ratio = row, ratio
-    return best if best and best_ratio >= 0.5 else None
+        a, b = row["point"], point
+        if len(a) >= 4 and (a in b or b in a):
+            return row
+    return None
 
 
 def adjust_mastery(space_id: str, point: str, verdict: str, guess: float | None = None,
@@ -859,10 +1024,15 @@ def add_mastery_history(space_id: str, point: str, score: float, verdict: str = 
     c.commit()
 
 
-def list_mastery_history(space_id: str) -> list[dict[str, Any]]:
-    return rows_to_dicts(get_conn().execute(
-        "SELECT point,score,verdict,created_at FROM mastery_history WHERE space_id=? ORDER BY created_at",
-        (space_id,)).fetchall())
+def list_mastery_history(space_id: str, limit: int = 500) -> list[dict[str, Any]]:
+    """掌握度变更流水（时间正序）。该表每次判卷/反馈都会插行，必须限量：
+    默认取最近 limit 条；趋势分析等需要更长历史时显式传大值。"""
+    rows = get_conn().execute(
+        "SELECT point,score,verdict,created_at FROM ("
+        "  SELECT point,score,verdict,created_at FROM mastery_history WHERE space_id=?"
+        "  ORDER BY created_at DESC LIMIT ?"
+        ") ORDER BY created_at", (space_id, max(1, limit))).fetchall()
+    return rows_to_dicts(rows)
 
 
 def get_mastery_point(space_id: str, point: str) -> dict[str, Any] | None:
@@ -998,25 +1168,48 @@ def clear_flashcards(space_id: str) -> None:
 
 # ---------- 学习计划任务 ----------
 
+def _norm_due_date(due: str) -> str:
+    """归一化为补零的 YYYY-MM-DD：strptime 接受 "2026-9-1"，原样入库会让
+    today_snapshot 的字符串比较（"2026-9-1" <= "2026-09-12" 为 False）漏掉到期任务。"""
+    due = (due or "").strip()[:10]
+    if not due:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%d", time.strptime(due, "%Y-%m-%d"))
+    except ValueError:
+        raise ValueError("日期格式应为 YYYY-MM-DD")
+
+
 def replace_plan_tasks(space_id: str, tasks: list[dict]) -> None:
-    """重新生成计划时整体替换（含已完成历史，生成即代表重开一版计划）。"""
+    """重新生成计划时整体替换（含已完成历史，生成即代表重开一版计划）。
+
+    只替换 AI 生成的任务（source_plan=''）；学涯计划推送的任务（source_plan=pid）
+    不属于本空间计划的版本管理，误删会让完成状态无法在重推时找回。单事务写入。
+    """
     c = get_conn()
-    c.execute("DELETE FROM plan_tasks WHERE space_id=?", (space_id,))
+    c.execute("DELETE FROM plan_tasks WHERE space_id=? AND source_plan=''", (space_id,))
     for t in tasks:
-        add_plan_task(space_id, t)
+        _insert_plan_task(c, space_id, t)
+    c.commit()
 
 
-def add_plan_task(space_id: str, t: dict, source_plan: str = "",
-                  done: int = 0, done_at: float = 0) -> str:
-    c = get_conn()
+def _insert_plan_task(c: sqlite3.Connection, space_id: str, t: dict,
+                      source_plan: str = "", done: int = 0, done_at: float = 0) -> str:
     tid = new_id()
-    due = (t.get("due_date") or t.get("due") or "").strip()[:10]
+    due = _norm_due_date(t.get("due_date") or t.get("due") or "")
     c.execute("INSERT INTO plan_tasks(id,space_id,phase,content,accept,points,due_date,method,source_plan,done,done_at,created_at) "
               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
               (tid, space_id, (t.get("phase") or "").strip()[:80],
                (t.get("content") or "").strip(), (t.get("accept") or "").strip(),
                json.dumps(t.get("points") or [], ensure_ascii=False),
                due, (t.get("method") or "").strip()[:40], source_plan, done, done_at, now()))
+    return tid
+
+
+def add_plan_task(space_id: str, t: dict, source_plan: str = "",
+                  done: int = 0, done_at: float = 0) -> str:
+    c = get_conn()
+    tid = _insert_plan_task(c, space_id, t, source_plan, done, done_at)
     c.commit()
     return tid
 
@@ -1038,18 +1231,13 @@ def list_plan_tasks(space_id: str) -> list[dict[str, Any]]:
     rows = rows_to_dicts(get_conn().execute(
         "SELECT * FROM plan_tasks WHERE space_id=? ORDER BY created_at", (space_id,)).fetchall())
     for t in rows:
-        t["points"] = json.loads(t["points"])
+        t["points"] = _safe_json(t["points"], [])
     return rows
 
 
 def set_plan_task_date(space_id: str, task_id: str, due_date: str) -> dict[str, Any] | None:
     """设置/清除任务截止日期（YYYY-MM-DD，空串清除）。"""
-    due_date = (due_date or "").strip()[:10]
-    if due_date:
-        try:
-            time.strptime(due_date, "%Y-%m-%d")
-        except ValueError:
-            raise ValueError("日期格式应为 YYYY-MM-DD")
+    due_date = _norm_due_date(due_date)
     c = get_conn()
     r = c.execute("SELECT id FROM plan_tasks WHERE id=? AND space_id=?", (task_id, space_id)).fetchone()
     if not r:
@@ -1105,7 +1293,7 @@ def toggle_plan_task(space_id: str, task_id: str, done: bool) -> dict[str, Any] 
                 space_id, row.get("method") or "", kind="task_done",
                 meta={"task_id": task_id, "points": points[:6], "content": (row.get("content") or "")[:80]})
         except Exception:
-            pass
+            log.warning("任务打卡的方法效果埋点写入失败（task=%s）", task_id, exc_info=True)
     return {"id": task_id, "done": done}
 
 
@@ -1261,9 +1449,9 @@ def set_space_edges(space_id: str, edges: list[dict], source: str) -> int:
         f, t = (e.get("from") or "").strip()[:80], (e.get("to") or "").strip()[:80]
         if not f or not t or f == t:
             continue
-        c.execute("INSERT OR IGNORE INTO concept_edges(space_id,from_point,to_point,source,created_at) "
-                  "VALUES(?,?,?,?,?)", (space_id, f, t, source, now()))
-        n += 1
+        cur = c.execute("INSERT OR IGNORE INTO concept_edges(space_id,from_point,to_point,source,created_at) "
+                        "VALUES(?,?,?,?,?)", (space_id, f, t, source, now()))
+        n += max(0, cur.rowcount)  # 被 UNIQUE 忽略的重复边 rowcount=0，不计入「新增」
     c.commit()
     return n
 
@@ -1499,7 +1687,8 @@ def clear_taken_courses() -> int:
 # ---------- 全局题库（出过的题入库复用，省 token + 正确率可统计） ----------
 
 def add_to_question_bank(space_id: str, questions: list[dict], difficulty: int = 1) -> int:
-    """把出过的题写入题库（按 question 文本去重）。返回新增条数。"""
+    """把出过的题写入题库（按题干去重）。question 列存整题 JSON（含 answer/options/knowledge_point），
+    复用出题时才能还原完整题面与标准答案；老库的纯文本行由读取端降级兼容。"""
     c = get_conn()
     added = 0
     for q in questions:
@@ -1508,16 +1697,16 @@ def add_to_question_bank(space_id: str, questions: list[dict], difficulty: int =
         qtext = q["question"].strip()
         if len(qtext) < 5:
             continue
-        # 去重：同空间同题干不重复入库
+        # 去重：同空间同题干不重复入库（题干含 % _ 时须转义，否则会误判重复静默丢题）
         existing = c.execute(
-            "SELECT id FROM question_bank WHERE space_id=? AND question LIKE ?",
-            (space_id, f"%{qtext[:50]}%")).fetchone()
+            "SELECT id FROM question_bank WHERE space_id=? AND question LIKE ? ESCAPE '\\'",
+            (space_id, f"%{like_escape(qtext[:50])}%")).fetchone()
         if existing:
             continue
         c.execute(
             "INSERT INTO question_bank(id,space_id,knowledge_point,question,qtype,difficulty,times_used,created_at) "
             "VALUES(?,?,?,?,?,?,0,?)",
-            (new_id(), space_id, q.get("knowledge_point", ""), qtext,
+            (new_id(), space_id, q.get("knowledge_point", ""), json.dumps(q, ensure_ascii=False),
              q.get("type", ""), difficulty, now()))
         added += 1
     c.commit()

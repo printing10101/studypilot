@@ -1,7 +1,7 @@
 // 学涯中心：合并原「学涯规划」与「成长手册」两页。
 // 档案只在「个人中心」维护一次——这里展示只读摘要，不再重复整张表单。
 // 子页签：学籍与方案 / 课程表 / 成绩审核 / 学涯计划 / 成长手册
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, AuditResult, CareerPlan, CompetitionAnalysis, CompetitionItem, CompetitionPick, CourseEntry, Handbook, HandbookMeta, Program, ScheduleData, Space, StudentProfile, SyllabusFulltext, SyllabusMajors, SyllabusOfficial, SyllabusSchool, SyllabusStats, TakenCourse } from '../api'
 import { downloadMd, Icon, SubTabs } from '../ui'
 import { Md } from '../md'
@@ -35,6 +35,7 @@ export function CareerView({ spaces, currentSid, onGoto }: {
 
   // 学籍（个人档案只读来源 + 查找用输入）
   const [profile, setProfile] = useState<StudentProfile | null>(null)
+  const [profileErr, setProfileErr] = useState('')  // 加载失败 ≠ 「正在读取」：否则成长手册/竞赛页永远转圈
   const [school, setSchool] = useState('')
   const [major, setMajor] = useState('')
   const [year, setYear] = useState('')
@@ -48,6 +49,7 @@ export function CareerView({ spaces, currentSid, onGoto }: {
   // 课程表
   const [schedule, setSchedule] = useState<ScheduleData | null>(null)
   const [draft, setDraft] = useState<CourseEntry[]>([])
+  const [draftDirty, setDraftDirty] = useState(false)  // 草稿已改未保存：被覆盖前必须确认
   const [pasteText, setPasteText] = useState('')
   const [msg, setMsg] = useState('')
 
@@ -81,34 +83,53 @@ export function CareerView({ spaces, currentSid, onGoto }: {
       setYear(p.year || '')
       setGoalType(goalAlias(p.goal_type))
       setTarget([p.target_school, p.target_major].filter(Boolean).join(' '))
-    }).catch(() => {})
+      setProfileErr('')
+    }).catch((e: any) => setProfileErr(e?.message || '网络错误'))
     api.syllabusStats().then(setStats).catch(() => {})
     api.officialSources().then(setOfficial).catch(() => {})
     api.schools().then(setSchools).catch(() => {})
-    api.schedule().then((s) => { setSchedule(s); setDraft(s.courses) }).catch(() => {})
+    // 首次加载失败也走兜底骨架：schedule 为 null 时学期名输入框永远无法输入，整个页签死锁
+    api.schedule().then((s) => { setSchedule(s); setDraft(s.courses); setDraftDirty(false) }).catch(() => {
+      setSchedule({ term: '', terms: [], courses: [] })
+      setDraft([])
+    })
     api.auditCourses().then((r) => setTaken(r.courses)).catch(() => {})
     api.handbooks().then(setHandbooks).catch(() => {})
     loadPlans()
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // 请求序号守卫：防抖只是减少请求，慢的旧响应仍可能晚到覆盖新结果
+  const majorSeq = useRef(0)
+  const progSeq = useRef(0)
   useEffect(() => {
     // 300ms 防抖：学校/专业每击键一个请求会造成响应竞态
     if (!school) { setMajorsInfo(null); return }
-    const t = setTimeout(() => api.majorsForSchool(school).then(setMajorsInfo).catch(() => setMajorsInfo(null)), 300)
+    const t = setTimeout(() => {
+      const id = ++majorSeq.current
+      api.majorsForSchool(school).then((m) => {
+        if (id === majorSeq.current) setMajorsInfo(m)
+      }).catch(() => { if (id === majorSeq.current) setMajorsInfo(null) })
+    }, 300)
     return () => clearTimeout(t)
   }, [school])
 
   useEffect(() => {
     if (school && major) {
-      const t = setTimeout(() =>
-        api.program(school, major).then((p) => { setProgram(p); setFulltext(null) }).catch(() => setProgram(null)), 300)
+      const t = setTimeout(() => {
+        const id = ++progSeq.current
+        api.program(school, major).then((p) => {
+          if (id !== progSeq.current) return
+          setProgram(p); setFulltext(null)
+        }).catch(() => { if (id === progSeq.current) setProgram(null) })
+      }, 300)
       return () => clearTimeout(t)
     } else { setProgram(null); setFulltext(null) }
   }, [school, major])
 
   const flash = (text: string) => {
+    // 常驻提示：解析结果的关键引导（「检查无误后点保存」）不该 2.5 秒后消失；
+    // 下一次操作会覆盖，或点 ✕ 手动关闭
     setMsg(text)
-    setTimeout(() => setMsg(''), 2500)
   }
 
   const loadFulltext = async () => {
@@ -116,8 +137,14 @@ export function CareerView({ spaces, currentSid, onGoto }: {
     try { setFulltext(await api.syllabusFulltext(school, major)) } catch (e: any) { toast('error', e.message) }
   }
 
+  const methodLabel = (m: string) => (m === 'llm' ? '智能解析' : m === 'rule' ? '规则解析' : m)
+
   const saveMySchool = async () => {
-    if (!profile) return
+    if (!profile) {
+      // 档案未加载成功时静默 no-op 会让人以为已保存；必须给明确反馈
+      toast('error', '个人档案尚未加载成功，无法写入。请刷新页面重试。')
+      return
+    }
     try {
       const p = await api.saveProfile({ ...profile, current_school: school, major, year })
       setProfile(p)
@@ -126,27 +153,45 @@ export function CareerView({ spaces, currentSid, onGoto }: {
   }
 
   // ---------- 课程表操作 ----------
-  const reloadSchedule = (term?: string) =>
-    api.schedule(term).then((s) => { setSchedule(s); setDraft(s.courses) }).catch(() => {})
+  const reloadSchedule = async (term?: string) => {
+    if (draftDirty) {
+      const go = await uxConfirm({ title: '覆盖未保存的修改', message: '课程表有修改尚未保存，继续将丢失这些修改。', confirmText: '继续' })
+      if (!go) return
+    }
+    api.schedule(term).then((s) => { setSchedule(s); setDraft(s.courses); setDraftDirty(false) }).catch(() => {
+      // 读取失败也要给出可编辑的骨架：schedule 为 null 时学期名输入框永远无法输入
+      // （onChange 直接丢弃），而导入/保存又都要求先填学期名 → 整个页签死锁
+      setSchedule((s) => s || { term: '', terms: [], courses: [] })
+      setDraft([])
+    })
+  }
 
   const importText = async () => {
     if (!schedule?.term) { toast('warn', '请先填写学期名（如 2025-2026-1 或 大三上）'); return }
+    if (draftDirty) {
+      const go = await uxConfirm({ title: '覆盖未保存的修改', message: '课程表有修改尚未保存，重新解析将覆盖这些修改。', confirmText: '重新解析' })
+      if (!go) return
+    }
     setBusy('schedule')
     try {
       const r = await api.importScheduleText(pasteText)
-      setDraft(r.courses)
-      flash(`解析出 ${r.courses.length} 门课（${r.method}），检查无误后点「保存课程表」`)
+      setDraft(r.courses); setDraftDirty(false)
+      flash(`解析出 ${r.courses.length} 门课（${methodLabel(r.method)}），检查无误后点「保存课程表」`)
     } catch (e: any) { toast('error', e.message) }
     setBusy('')
   }
 
   const importFile = async (f: File) => {
     if (!schedule?.term) { toast('warn', '请先填写学期名（如 2025-2026-1 或 大三上）'); return }
+    if (draftDirty) {
+      const go = await uxConfirm({ title: '覆盖未保存的修改', message: '课程表有修改尚未保存，重新解析将覆盖这些修改。', confirmText: '重新解析' })
+      if (!go) return
+    }
     setBusy('schedule')
     try {
       const r = await api.importScheduleFile(f)
-      setDraft(r.courses)
-      flash(`解析出 ${r.courses.length} 门课（${r.method}），检查无误后点「保存课程表」`)
+      setDraft(r.courses); setDraftDirty(false)
+      flash(`解析出 ${r.courses.length} 门课（${methodLabel(r.method)}），检查无误后点「保存课程表」`)
     } catch (e: any) { toast('error', e.message) }
     setBusy('')
   }
@@ -156,15 +201,17 @@ export function CareerView({ spaces, currentSid, onGoto }: {
     setBusy('schedule')
     try {
       const r = await api.saveSchedule(schedule.term, draft)
-      setDraft(r.courses)
+      setDraft(r.courses); setDraftDirty(false)
       await reloadSchedule(schedule.term)
       flash(`✓ 已保存 ${r.saved} 门课`)
     } catch (e: any) { toast('error', e.message) }
     setBusy('')
   }
 
-  const setDraftAt = (i: number, patch: Partial<CourseEntry>) =>
+  const setDraftAt = (i: number, patch: Partial<CourseEntry>) => {
+    setDraftDirty(true)
     setDraft((d) => d.map((c, j) => (j === i ? { ...c, ...patch } : c)))
+  }
 
   // 周视图网格数据
   const weekGrid = useMemo(() => {
@@ -207,19 +254,29 @@ export function CareerView({ spaces, currentSid, onGoto }: {
   // ---------- 已修课程 · 完成度审核 ----------
   const loadTaken = () => api.auditCourses().then((r) => setTaken(r.courses)).catch(() => {})
 
-  const refreshAudit = async () => {
-    try { setAuditRes(await api.runAudit(school, major)) } catch { /* 审核失败不阻塞页面 */ }
+  const refreshAudit = async (silent = false) => {
+    try {
+      setAuditRes(await api.runAudit(school, major))
+    } catch (e: any) {
+      // 自动重算（加课/导入后）失败保持静默；用户点「审核」按钮必须有反馈，否则按钮像坏的
+      if (!silent) toast('error', '审核失败：' + (e.message || '未知错误'))
+    }
   }
 
   const addCourse = async () => {
     if (!newCourse.name.trim()) { toast('warn', '请填写课程名'); return }
+    // 学分误输非数字静默存 0 会让学分进度/GPA 失真：非法输入必须当场拦下
+    if (newCourse.credit.trim() && (isNaN(Number(newCourse.credit)) || Number(newCourse.credit) <= 0)) {
+      toast('warn', `学分应为正数，当前输入「${newCourse.credit}」无效`)
+      return
+    }
     setBusy('course')
     try {
       await api.addAuditCourse({ name: newCourse.name.trim(), credit: parseFloat(newCourse.credit) || 0,
         grade: newCourse.grade.trim(), semester: newCourse.semester.trim(), status: newCourse.status })
       setNewCourse({ name: '', credit: '', grade: '', semester: '', status: 'done' })
       await loadTaken()
-      await refreshAudit()
+      await refreshAudit(true)
     } catch (e: any) { toast('error', e.message) }
     setBusy('')
   }
@@ -230,14 +287,19 @@ export function CareerView({ spaces, currentSid, onGoto }: {
       const r = await api.importAuditCourses(transcriptText)
       setTranscriptText('')
       await loadTaken()
-      await refreshAudit()
+      await refreshAudit(true)
       toast('success', `已导入 ${r.added} 门课程（${r.method === 'llm' ? '智能解析' : '规则解析'}）`)
     } catch (e: any) { toast('error', e.message) }
     setBusy('')
   }
 
   const removeCourse = async (cid: string) => {
-    try { await api.deleteAuditCourse(cid); await loadTaken(); await refreshAudit() } catch (e: any) { toast('error', e.message) }
+    // 单门成绩记录单击即删且触发重算，与「清空」的保护强度倒挂了：补上确认
+    const c = taken.find((t) => t.id === cid)
+    if (!(await uxConfirm({ title: '删除已修课程',
+      message: `删除「${c?.name || '该课程'}」的成绩记录？审核结果会随之重算。`,
+      confirmText: '删除', danger: true }))) return
+    try { await api.deleteAuditCourse(cid); await loadTaken(); await refreshAudit(true) } catch (e: any) { toast('error', e.message) }
   }
 
   const clearCourses = async () => {
@@ -251,18 +313,33 @@ export function CareerView({ spaces, currentSid, onGoto }: {
 
   // ---------- 目标计划 ----------
   const loadPlans = () =>
-    api.careerPlans().then(async (metas) =>
-      setPlans(await Promise.all(metas.map((m) => api.careerPlan(m.id))))).catch(() => {})
+    api.careerPlans().then(async (metas) => {
+      // allSettled：单份计划损坏/404 不应把整个计划列表静默清空
+      const results = await Promise.allSettled(metas.map((m) => api.careerPlan(m.id)))
+      setPlans(results.filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled').map((r) => r.value))
+    }).catch(() => {})
 
+  const genAbort = useRef<AbortController | null>(null)
   const generate = async () => {
     setBusy('plan')
+    const ctrl = new AbortController()
+    genAbort.current = ctrl
     try {
-      const p = await api.generateCareerPlan({ school, major, year, goal_type: goalType, target, term: schedule?.term || '', horizon })
+      const p = await fetchWithSignal(ctrl.signal)
       await loadPlans()
       setOpenPlan(p.id)
-    } catch (e: any) { toast('error', e.message) }
+    } catch (e: any) {
+      if (e?.name === 'AbortError') {
+        // 服务端通常仍会生成完毕：提示稍后回来查看，而不是让用户以为计划丢了
+        toast('info', '已停止等待。计划可能仍在后台生成，稍后重新进入本页可见')
+        loadPlans()
+      } else toast('error', e.message)
+    }
+    genAbort.current = null
     setBusy('')
   }
+  const fetchWithSignal = (signal: AbortSignal) =>
+    api.generateCareerPlan({ school, major, year, goal_type: goalType, target, term: schedule?.term || '', horizon }, signal)
 
   const toggleTask = async (pid: string, taskId: string, done: boolean) => {
     try {
@@ -359,6 +436,19 @@ export function CareerView({ spaces, currentSid, onGoto }: {
                 </div>
               </details>
             )}
+            {profileErr ? (
+              <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                <span className="sub" style={{ color: 'var(--red)' }}>⚠ 个人档案加载失败：{profileErr}（成长手册与竞赛规划依赖档案）</span>
+                <button className="btn small" onClick={() => {
+                  setProfileErr('')
+                  api.profile().then((p) => {
+                    setProfile(p); setSchool(p.current_school || ''); setMajor(p.major || '')
+                    setYear(p.year || ''); setGoalType(goalAlias(p.goal_type))
+                    setTarget([p.target_school, p.target_major].filter(Boolean).join(' '))
+                  }).catch((e: any) => setProfileErr(e?.message || '网络错误'))
+                }}>重试</button>
+              </div>
+            ) : null}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 12 }}>
               <div>
                 <input type="text" list="sp-schools" placeholder="选择/输入学校（如 示例大学、华科）"
@@ -378,7 +468,8 @@ export function CareerView({ spaces, currentSid, onGoto }: {
               </div>
               <input type="text" placeholder="当前年级（如 大三上）" value={year}
                 onChange={(e) => setYear(e.target.value)} />
-              <button className="btn ghost" onClick={saveMySchool}>写入个人档案</button>
+              <button className="btn ghost" onClick={saveMySchool} disabled={!!profileErr}
+                title={profileErr ? '档案未加载成功，无法写入' : undefined}>写入个人档案</button>
             </div>
             {majorsInfo && (
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
@@ -576,7 +667,13 @@ export function CareerView({ spaces, currentSid, onGoto }: {
               {busy === 'schedule' ? '解析中…' : '解析粘贴文本'}
             </button>
             <button className="btn small" disabled={busy === 'schedule' || !draft.length} onClick={saveSchedule}>保存课程表</button>
-            {msg && <span className="sub">{msg}</span>}
+            {msg && (
+              <span className="sub" style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+                {msg}
+                <button className="btn ghost small" style={{ padding: '0 6px' }} aria-label="关闭提示"
+                  onClick={() => setMsg('')}>✕</button>
+              </span>
+            )}
           </div>
 
           {draft.length > 0 && (
@@ -626,7 +723,7 @@ export function CareerView({ spaces, currentSid, onGoto }: {
                         <td><input type="text" value={c.weeks} style={{ width: 90 }} onChange={(e) => setDraftAt(i, { weeks: e.target.value })} /></td>
                         <td><input type="text" value={c.room} style={{ width: 100 }} onChange={(e) => setDraftAt(i, { room: e.target.value })} /></td>
                         <td><input type="text" value={c.teacher} style={{ width: 90 }} onChange={(e) => setDraftAt(i, { teacher: e.target.value })} /></td>
-                        <td><button className="btn danger ghost small" onClick={() => setDraft((d) => d.filter((_, j) => j !== i))}>✕</button></td>
+                        <td><button className="btn danger ghost small" onClick={() => { setDraftDirty(true); setDraft((d) => d.filter((_, j) => j !== i)) }}>✕</button></td>
                       </tr>
                     ))}
                   </tbody>
@@ -657,7 +754,7 @@ export function CareerView({ spaces, currentSid, onGoto }: {
               <option value="taking">修读中</option>
             </select>
             <button className="btn small" disabled={busy === 'course'} onClick={addCourse}>添加</button>
-            <button className="btn small" disabled={busy === 'audit'} onClick={refreshAudit}>对照培养方案审核</button>
+            <button className="btn small" disabled={busy === 'audit'} onClick={() => { setBusy('audit'); refreshAudit(false).finally(() => setBusy('')) }}>对照培养方案审核</button>
             {taken.length > 0 && (
               <button className="btn danger ghost small" onClick={clearCourses}>清空</button>
             )}
@@ -775,14 +872,19 @@ export function CareerView({ spaces, currentSid, onGoto }: {
                 {GOALS.map((g) => <option key={g} value={g}>目标：{g}</option>)}
               </select>
               <input type="text" placeholder="目标去向（如 华中科技大学 计算机技术 / 大厂后端岗）"
-                value={target} onChange={(e) => setTarget(e.target.value)} />
-              <select value={horizon} onChange={(e) => setHorizon(e.target.value)}>
+                value={target} onChange={(e) => setTarget(e.target.value)} disabled={busy === 'plan'} />
+              <select value={horizon} onChange={(e) => setHorizon(e.target.value)} disabled={busy === 'plan'}>
                 {HORIZONS.map((h) => <option key={h} value={h}>跨度：{h}</option>)}
               </select>
               <button className="btn" disabled={busy === 'plan'} onClick={generate}>
-                {busy === 'plan' ? <><span className="spin" /> 生成中…</> : '生成学习计划'}
+                {busy === 'plan' ? <><span className="spin" /> 生成中（约 1 分钟）</> : '生成学习计划'}
               </button>
+              {busy === 'plan' && (
+                <button className="btn ghost" onClick={() => genAbort.current?.abort()}>停止等待</button>
+              )}
             </div>
+            {/* 生成期间目标输入被禁用：避免「正在生成的是旧目标」的困惑 */}
+            {busy === 'plan' && <p className="sub" style={{ marginTop: 8 }}>正在按「目标：{goalType}{target ? ` → ${target}` : ''}」生成，期间不能修改目标。</p>}
             {!school || !major ? (
               <p className="sub" style={{ marginTop: 8 }}>提示：先在「① 学籍与培养方案」选择学校与专业，计划会更贴合培养方案。</p>
             ) : schedule && !schedule.courses.length ? (
@@ -867,6 +969,12 @@ export function CareerView({ spaces, currentSid, onGoto }: {
                   以上来自「个人中心」的档案。要修改学校、专业、目标或补充经历，<a href="#" onClick={(e) => { e.preventDefault(); onGoto('profile') }} style={{ textDecoration: 'underline' }}>去个人中心修改</a>，生成手册时会自动带入。
                 </p>
               </>
+            ) : profileErr ? (
+              <p className="sub" style={{ marginTop: 8, color: 'var(--red)' }}>
+                ⚠ 个人档案加载失败：{profileErr}。
+                <button className="btn ghost small" onClick={() => window.location.reload()} style={{ marginLeft: 6 }}>刷新重试</button>
+                或到「个人中心」手动检查。
+              </p>
             ) : (
               <p className="sub" style={{ marginTop: 8 }}><span className="spin" /> 正在读取个人档案…</p>
             )}
@@ -908,7 +1016,7 @@ export function CareerView({ spaces, currentSid, onGoto }: {
                       <td style={{ width: 150, color: 'var(--muted)', fontSize: 12 }}>
                         {new Date(h.created_at * 1000).toLocaleDateString()}</td>
                       <td style={{ width: 60 }}>
-                        <button className="btn danger small" onClick={() => removeHandbook(h.id)}><Icon name="trash" size={12} /></button>
+                        <button className="btn danger small" onClick={() => removeHandbook(h.id)} aria-label={`删除手册《${h.title}》`}><Icon name="trash" size={12} /></button>
                       </td>
                     </tr>
                   ))}
@@ -919,7 +1027,7 @@ export function CareerView({ spaces, currentSid, onGoto }: {
         </>
       )}
       {/* ⑥ 竞赛规划：目标导向的竞赛推荐与分析 */}
-      {sub === 'compete' && <CompeteTab profile={profile} onGoto={onGoto} />}
+      {sub === 'compete' && <CompeteTab profile={profile} profileErr={profileErr} onGoto={onGoto} />}
     </div>
   )
 }
@@ -928,7 +1036,7 @@ export function CareerView({ spaces, currentSid, onGoto }: {
 
 const COMPETE_GOALS = ['考研', '推免/保研', '就业', '出国']
 
-function CompeteTab({ profile, onGoto }: { profile: StudentProfile | null; onGoto: (t: string) => void }) {
+function CompeteTab({ profile, profileErr, onGoto }: { profile: StudentProfile | null; profileErr: string; onGoto: (t: string) => void }) {
   const { toast } = useUX()
   const [goal, setGoal] = useState('考研')
   const [useLlm, setUseLlm] = useState(true)
@@ -1001,6 +1109,8 @@ function CompeteTab({ profile, onGoto }: { profile: StudentProfile | null; onGot
               档案在 <a href="#" onClick={(e) => { e.preventDefault(); onGoto('profile') }} style={{ textDecoration: 'underline' }}>个人中心</a> 维护，分析自动带入
             </span>
           </div>
+        ) : profileErr ? (
+          <p className="sub" style={{ marginTop: 8, color: 'var(--red)' }}>⚠ 个人档案加载失败：{profileErr}——分析依赖档案中的时间线与目标，请刷新页面重试。</p>
         ) : (
           <p className="sub" style={{ marginTop: 8 }}><span className="spin" /> 正在读取个人档案…</p>
         )}

@@ -367,7 +367,7 @@ def _safe_url(url: str) -> str:
         raise ValueError("仅允许 http/https 链接")
     host = p.hostname or ""
     if not host or host.lower() == "localhost" or host.endswith((".local", ".internal")):
-        raise ValueError("禁止访问本地地址")
+        raise ValueError("禁止剪藏本机/本地地址")
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError as e:
@@ -376,7 +376,10 @@ def _safe_url(url: str) -> str:
         ip = ipaddress.ip_address(info[4][0])
         if (ip.is_loopback or ip.is_private or ip.is_reserved or ip.is_link_local
                 or ip.is_multicast or ip.is_unspecified):
-            raise ValueError(f"禁止访问私有/保留地址: {ip}")
+            # 校园网用户常想剪藏校内通知/内网文献站，要说明原因与替代路径，而不是一行生硬拒绝
+            raise ValueError(
+                f"出于安全考虑，剪藏仅支持公网链接（该地址解析到内网 {ip}）。"
+                "校内页面可在浏览器另存为 PDF/TXT 后从「上传讲义」入库")
     return url
 
 

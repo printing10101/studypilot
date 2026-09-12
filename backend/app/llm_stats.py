@@ -15,6 +15,7 @@ _lock = threading.Lock()
 # 内存滑动窗口（最近 200 条），避免频繁查库
 _recent: list[dict] = []
 _MAX_RECENT = 200
+_write_count = 0  # 触发周期性保留期裁剪
 
 
 def _ensure_table() -> None:
@@ -48,9 +49,12 @@ def record(task: str, channel: str, model: str, latency_ms: int,
         "ok": ok, "error": error[:200],
     }
     with _lock:
+        global _write_count
         _recent.append(entry)
         if len(_recent) > _MAX_RECENT:
             _recent.pop(0)
+        _write_count += 1
+        prune = _write_count % 500 == 0  # 每 500 次写入顺带裁剪一次保留期
     try:
         c = db.get_conn()
         c.execute(
@@ -58,6 +62,9 @@ def record(task: str, channel: str, model: str, latency_ms: int,
             "VALUES(?,?,?,?,?,?,?,?,?)",
             (entry["ts"], task, channel, model, latency_ms, tokens_in, tokens_out,
              1 if ok else 0, entry["error"]))
+        # 例行保留期裁剪：该表每条消息都会插入多行，不裁剪会无限膨胀拖慢仪表盘
+        if prune:
+            c.execute("DELETE FROM llm_calls WHERE ts < ?", (time.time() - 90 * 86400,))
         c.commit()
     except Exception:
         pass  # 统计失败不影响主流程
@@ -155,7 +162,9 @@ def clear_history() -> None:
     with _lock:
         _recent.clear()
     try:
-        db.get_conn().execute("DELETE FROM llm_calls").commit()
+        c = db.get_conn()
+        c.execute("DELETE FROM llm_calls")
+        c.commit()  # execute 返回的是 Cursor，没有 .commit——此前静默 AttributeError 导致清空失效
     except Exception:
         pass
 

@@ -112,11 +112,17 @@ def _save_runtime_config() -> None:
 
 
 def update_runtime_config(cloud_base_url: str | None = None, cloud_api_key: str | None = None,
-                          cloud_model: str | None = None, routing: str | None = None) -> None:
+                          cloud_model: str | None = None, routing: str | None = None,
+                          local_base_url: str | None = None, local_api_key: str | None = None,
+                          local_model: str | None = None) -> None:
     _ensure_runtime()
     if routing is not None and routing not in ("local", "auto", "cloud"):
         # 先整体校验再动手，避免非法 routing 导致前序字段改了内存却没落盘
         raise ValueError("routing 必须是 local / auto / cloud")
+    if local_base_url is not None and local_base_url.strip():
+        parsed = urlparse(local_base_url.strip())
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("本地端点协议必须是 http/https")
     with _cfg_lock:
         if cloud_base_url is not None:
             _runtime["cloud_base_url"] = cloud_base_url.strip()
@@ -126,6 +132,14 @@ def update_runtime_config(cloud_base_url: str | None = None, cloud_api_key: str 
             _runtime["cloud_model"] = cloud_model.strip()
         if routing is not None:
             _runtime["routing"] = routing
+        # 本地端点也可界面内修改（存空串 = 恢复 .env 默认）：桌面版不随附 llama-server，
+        # 用户换了端口/模型名后原先只能手改 .env 重启，无法在应用内自救
+        if local_base_url is not None:
+            _runtime["local_base_url"] = local_base_url.strip()
+        if local_api_key is not None:
+            _runtime["local_api_key"] = local_api_key.strip()
+        if local_model is not None:
+            _runtime["local_model"] = local_model.strip()
         _save_runtime_config()
         for client in _clients.values():
             client.close()
@@ -137,9 +151,13 @@ def get_status() -> dict:
     rt = _ensure_runtime()
     cloud_ok = bool(rt.get("cloud_base_url") and rt.get("cloud_model"))
     key = rt.get("cloud_api_key", "")
+    lkey = rt.get("local_api_key", "")
+    lp = _local_profile()
     return {
         "routing": rt.get("routing", "local"),
-        "local": {"base_url": settings.llm_base_url, "model": settings.llm_model},
+        "local": {"base_url": lp["base_url"], "model": lp["model"],
+                  "api_key_masked": (lkey[:4] + "****" + lkey[-4:]) if len(lkey) > 8 else ("已配置" if lkey else ""),
+                  "custom": bool(rt.get("local_base_url") or rt.get("local_model"))},
         "cloud": {"base_url": rt.get("cloud_base_url", ""), "model": rt.get("cloud_model", ""),
                   "api_key_masked": (key[:4] + "****" + key[-4:]) if len(key) > 8 else ("已配置" if key else ""),
                   "configured": cloud_ok},
@@ -152,36 +170,67 @@ def get_status() -> dict:
 
 def probe_latency(profile: str = "local", timeout: float = 15.0) -> dict:
     """主动探测通道延迟：发一个极短请求测响应时间。供模型设置页「测速」按钮。"""
+    p = _local_profile() if profile == "local" else _cloud_profile()
+    if not p:
+        return {"ok": False, "error": "通道未配置", "latency_ms": 0}
+    return _probe(p["base_url"], p["api_key"], p["model"], profile, timeout)
+
+
+def probe_profile(base_url: str, api_key: str, model: str,
+                  profile: str, timeout: float = 15.0) -> dict:
+    """用调用方显式给的端点三元组探测（表单未保存先测场景）；空 model 视为未配置。"""
+    if not base_url or not model:
+        return {"ok": False, "error": "未配置", "latency_ms": 0}
+    return _probe(base_url.strip(), api_key or "none", model.strip(), profile, timeout)
+
+
+def _probe(base_url: str, api_key: str, model: str, profile: str, timeout: float = 15.0) -> dict:
     t0 = time.monotonic()
     try:
-        p = _local_profile() if profile == "local" else _cloud_profile()
-        if not p:
-            return {"ok": False, "error": "通道未配置", "latency_ms": 0}
         client = httpx.Client(
-            base_url=p["base_url"],
-            headers={"Authorization": f"Bearer {p['api_key']}"},
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {api_key}"},
             timeout=httpx.Timeout(timeout, connect=5.0),
         )
         r = client.post("/chat/completions", json={
-            "model": p["model"],
+            "model": model,
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 1,
             "temperature": 0,
         })
         r.raise_for_status()
         latency_ms = int((time.monotonic() - t0) * 1000)
-        llm_stats.record("probe", profile, p["model"], latency_ms, ok=True)
+        llm_stats.record("probe", profile, model, latency_ms, ok=True)
         client.close()
-        return {"ok": True, "latency_ms": latency_ms, "model": p["model"]}
+        return {"ok": True, "latency_ms": latency_ms, "model": model}
     except Exception as e:
         latency_ms = int((time.monotonic() - t0) * 1000)
         llm_stats.record("probe", profile, "", latency_ms, ok=False, error=str(e))
-        return {"ok": False, "error": str(e)[:200], "latency_ms": latency_ms}
+        return {"ok": False, "error": _friendly_conn_error(e)[:200], "latency_ms": latency_ms}
+
+
+def _friendly_conn_error(e: Exception) -> str:
+    """把裸系统错误翻译成可操作的提示：用户看到的不能是 [Errno 10061]。"""
+    s = str(e)
+    low = s.lower()
+    if isinstance(e, httpx.ConnectError) or "10061" in s or "connection refused" in low or "connectionreset" in low:
+        return ("无法连接模型服务——请确认 llama-server/Ollama 已启动、端口正确，"
+                "或到「模型设置」改用云端通道")
+    if "timeout" in low or "timed out" in low:
+        return "模型服务连接超时——服务可能正忙或假死，可重启模型服务后重试"
+    if "401" in s or "unauthorized" in low or "invalid api key" in low:
+        return "鉴权失败（401）——请检查 API Key 是否正确"
+    if "404" in s or "not found" in low:
+        return "端点或模型名不存在（404）——请检查 Base URL 与模型名拼写"
+    return s
 
 
 def _local_profile() -> dict:
-    return {"base_url": settings.llm_base_url, "api_key": settings.llm_api_key,
-            "model": settings.llm_model}
+    # 界面内修改的本地端点优先（存 data/llm_config.json），未设置时用 .env 默认
+    rt = _ensure_runtime()
+    return {"base_url": rt.get("local_base_url") or settings.llm_base_url,
+            "api_key": rt.get("local_api_key") or settings.llm_api_key,
+            "model": rt.get("local_model") or settings.llm_model}
 
 
 def _cloud_profile() -> dict | None:
@@ -258,7 +307,7 @@ def _get_client(profile: str) -> httpx.Client:
             client = httpx.Client(
                 base_url=p["base_url"],
                 headers={"Authorization": f"Bearer {p['api_key']}"},
-                timeout=httpx.Timeout(900.0, connect=10.0),
+                timeout=httpx.Timeout(settings.llm_timeout_s, connect=10.0),
                 limits=httpx.Limits(max_keepalive_connections=2, keepalive_expiry=600.0),
                 follow_redirects=False,
             )
@@ -316,7 +365,8 @@ def chat(messages: list[dict], temperature: float | None = None, max_tokens: int
             last_err = e
             if profile == order[-1]:
                 break
-    raise RuntimeError(f"LLM 调用失败（本地/云端均不可用）: {last_err}") from last_err
+    # 裸系统错误（[Errno 10061]…）对用户毫无意义，翻译成可操作的提示
+    raise RuntimeError(f"模型调用失败：{_friendly_conn_error(last_err) if last_err else '未知错误'}") from last_err
 
 
 class _ThinkFilter:
@@ -421,7 +471,7 @@ def chat_stream(messages: list[dict], temperature: float | None = None, max_toke
             last_err = e
             if profile == order[-1]:
                 break
-    raise RuntimeError(f"LLM 流式调用失败（本地/云端均不可用）: {last_err}") from last_err
+    raise RuntimeError(f"模型调用失败：{_friendly_conn_error(last_err) if last_err else '未知错误'}") from last_err
 
 
 _JSON_RETRY = "\n\n注意：刚才的输出不是合法 JSON。重新输出，只输出严格 JSON，不要任何解释、前后缀或代码块标记。"
@@ -471,6 +521,17 @@ def _configure_embed_offline() -> None:
     """嵌入模型已在本地（目录或 HF 缓存）时才强制离线，避免每次加载联网校验拖慢；
     未缓存的新环境保持在线以便首次下载。"""
     model = settings.embed_model
+    # 国内直连 huggingface.co 基本不可达，首次下载会长时间挂起：
+    # 用户未显式配置时默认走 hf-mirror.com 镜像（须在 huggingface_hub 首次加载前设置）
+    if not os.environ.get("HF_ENDPOINT"):
+        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+    try:  # 库已被提前加载时 ENDPOINT 已固化，改常量兜底
+        import huggingface_hub.constants as _hf_c
+        if os.environ.get("HF_ENDPOINT") and not getattr(_hf_c, "_sp_endpoint_patched", False):
+            _hf_c.ENDPOINT = os.environ["HF_ENDPOINT"]
+            _hf_c._sp_endpoint_patched = True
+    except Exception:
+        pass
     cached = os.path.isdir(model)
     if not cached:
         try:
@@ -508,6 +569,20 @@ _emb_lock = threading.Lock()
 _emb_model = None
 
 
+def _embed_device() -> str:
+    """配置要求 cuda 但机器没有可用 CUDA 时自动回退 cpu：
+    大多数笔记本无 N 卡，硬编码 cuda 会让首次上传直接崩在裸 torch 错误上。"""
+    dev = (settings.embed_device or "cpu").strip().lower()
+    if dev in ("cuda", "gpu"):
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return "cpu"
+        except Exception:
+            return "cpu"
+    return dev
+
+
 class Embedder:
     def __init__(self):
         _configure_embed_offline()
@@ -515,7 +590,7 @@ class Embedder:
         global _emb_model
         with _emb_lock:
             if _emb_model is None:
-                _emb_model = SentenceTransformer(settings.embed_model, device=settings.embed_device)
+                _emb_model = SentenceTransformer(settings.embed_model, device=_embed_device())
         self.model = _emb_model
 
     def encode(self, texts: list[str]) -> list[list[float]]:

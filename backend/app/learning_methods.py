@@ -230,7 +230,8 @@ def format_methods_block(methods: list[dict], title: str = "【学习方法建�
 def _dominant_error_types(space_id: str, top: int = 2) -> list[str]:
     from collections import Counter
     stats: Counter[str] = Counter()
-    for q in db.list_quizzes(space_id)[-8:]:
+    # 取最近 8 次测验的错因（recent_quizzes 新→旧，SQL LIMIT 免全量 JSON 解析）
+    for q in db.recent_quizzes(space_id, 8):
         for a in q.get("answers") or []:
             if a.get("verdict") != "对" and a.get("error_type"):
                 stats[a["error_type"]] += 1

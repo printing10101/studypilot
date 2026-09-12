@@ -1,6 +1,6 @@
 // 资料中心：合并原「知识库」与「教材书库」两页——
 // 上半是当前空间的讲义（RAG 检索源），下半是全局教材库（可挂载到多个空间），消除两处重复的上传体验
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, Book, Doc, Space } from '../api'
 import { EmptyState, Icon } from '../ui'
 import { useUX } from '../ux'
@@ -29,26 +29,58 @@ function SpaceDocsCard({ sid, spaceName }: { sid: string; spaceName: string }) {
   const { toast, confirm: uxConfirm } = useUX()
   const [docs, setDocs] = useState<Doc[]>([])
   const [busy, setBusy] = useState(false)
-  const refresh = () => api.listDocs(sid).then(setDocs).catch(() => setDocs([]))
-  useEffect(() => { refresh() }, [sid]) // eslint-disable-line react-hooks/exhaustive-deps
+  const [prog, setProg] = useState({ done: 0, total: 0 })
+  const [loadErr, setLoadErr] = useState(false)
+  const [lastErrors, setLastErrors] = useState<string[]>([])  // 批量导入失败清单：toast 3 秒读不完，改为常驻可关闭
+  const [reindexing, setReindexing] = useState('')
+  const seq = useRef(0)
+  const refresh = () => {
+    const id = ++seq.current
+    // 失败必须区分于空态：此前伪装成"还没有讲义"，服务故障时诱导用户反复重传
+    return api.listDocs(sid).then((d) => {
+      if (id !== seq.current) return
+      setDocs(d); setLoadErr(false)
+    }).catch(() => { if (id === seq.current) setLoadErr(true) })
+  }
+  useEffect(() => {
+    seq.current++
+    setDocs([]); setLoadErr(false)
+    refresh()
+  }, [sid]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const upload = async (files: FileList | null) => {
     if (!files?.length) return
+    const list = Array.from(files)
     setBusy(true)
+    setProg({ done: 0, total: list.length })
     const errors: string[] = []
     let ok = 0
-    for (const f of Array.from(files)) {
+    for (const f of list) {
       try {
         const r: any = await api.uploadDoc(sid, f)
         if (r.batch) {
-          const bad = r.batch.filter((b: any) => b.status === 'error')
-          ok += r.batch.length - bad.length
+          const bad = r.batch.filter((b: any) => b.status !== 'ready')
+          ok += r.batch.filter((b: any) => b.status === 'ready').length
           bad.forEach((b: any) => errors.push(`${b.filename}: ${b.error}`))
         } else ok++
       } catch (e: any) { errors.push(`${f.name}: ${e.message}`) }
+      setProg((p) => ({ ...p, done: p.done + 1 }))
+      await refresh() // 每个文件完成后即时刷新，列表里能看到逐个出现
     }
-    await refresh(); setBusy(false)
-    if (errors.length) toast('warn', `导入完成：成功 ${ok} 个\n失败：\n${errors.join('\n')}`)
+    setBusy(false)
+    setProg({ done: 0, total: 0 })
+    setLastErrors(errors)
+    if (!errors.length) toast('success', `已导入 ${ok} 个文件`)
+  }
+
+  const reindex = async (d: Doc) => {
+    setReindexing(d.id)
+    try {
+      const r = await api.reindexDoc(sid, d.id)
+      toast('success', `已重新索引《${d.filename}》（${r.chunks} 个分块）`)
+      refresh()
+    } catch (e: any) { toast('error', e.message) }
+    setReindexing('')
   }
 
   const removeDoc = async (d: Doc) => {
@@ -63,7 +95,7 @@ function SpaceDocsCard({ sid, spaceName }: { sid: string; spaceName: string }) {
     <div className="card" style={{ marginBottom: 18 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
         <h3 style={{ margin: 0 }}>本空间讲义{spaceName && ` · ${spaceName}`}</h3>
-        <span className="badge">RAG 检索源</span>
+        <span className="badge">答疑引用来源</span>
         <div style={{ flex: 1 }} />
         <label className="btn" style={{ cursor: 'pointer' }}>
           <Icon name="plus" size={14} /> 上传讲义
@@ -72,11 +104,30 @@ function SpaceDocsCard({ sid, spaceName }: { sid: string; spaceName: string }) {
         </label>
       </div>
       <p className="sub" style={{ marginTop: 6 }}>
-        解析 → 语义分块 → BGE 向量化 → 答疑/出题时检索引用并标注来源。支持 PDF / PPTX 课件（含讲者备注）/
+        上传后自动解析建立语义索引，答疑/出题时检索引用并标注来源。支持 PDF / PPTX 课件（含讲者备注）/
         TXT / Markdown / 图片（离线 OCR）/ zip 压缩包（自动展开导入）。
       </p>
-      {busy && <p className="sub" style={{ marginTop: 8 }}><span className="spin" /> 正在解析并向量化…（首次运行会下载嵌入模型）</p>}
-      {docs.length > 0 ? (
+      {busy && <p className="sub" style={{ marginTop: 8 }}>
+        <span className="spin" /> 正在解析并向量化…{prog.total > 0 && `（${prog.done}/${prog.total}）`}（首次运行会下载嵌入模型，耐心等待）
+      </p>}
+      {lastErrors.length > 0 && (
+        <div style={{ marginTop: 10, padding: '10px 14px', border: '1px solid var(--orange)', borderRadius: 10, fontSize: 13 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <b style={{ color: 'var(--orange)' }}>部分文件未导入（{lastErrors.length}）</b>
+            <div style={{ flex: 1 }} />
+            <button className="btn ghost small" onClick={() => setLastErrors([])}>知道了</button>
+          </div>
+          <div style={{ marginTop: 6, maxHeight: 160, overflowY: 'auto', whiteSpace: 'pre-line', color: 'var(--muted)' }}>
+            {lastErrors.join('\n')}
+          </div>
+        </div>
+      )}
+      {loadErr ? (
+        <p className="sub" style={{ marginTop: 12 }}>
+          讲义列表加载失败（服务可能正在重启）。{' '}
+          <button className="btn small" onClick={() => { setLoadErr(false); refresh() }}>重试</button>
+        </p>
+      ) : docs.length > 0 ? (
         <table className="quiz" style={{ marginTop: 12 }}>
           <thead><tr><th>文件</th><th>状态</th><th>分块</th><th>错误</th><th></th></tr></thead>
           <tbody>
@@ -87,6 +138,12 @@ function SpaceDocsCard({ sid, spaceName }: { sid: string; spaceName: string }) {
                 <td>{d.chunks}</td>
                 <td style={{ color: 'var(--red)' }}>{d.error}</td>
                 <td>
+                  {d.status === 'error' && (
+                    <button className="btn small" disabled={!!reindexing} onClick={() => reindex(d)}
+                      title="原文件还在时可直接重新索引，无需重传">
+                      {reindexing === d.id ? <><span className="spin" /> 索引中</> : '重新索引'}
+                    </button>
+                  )}
                   <button className="btn danger small" onClick={() => removeDoc(d)}>删除</button>
                 </td>
               </tr>
@@ -113,20 +170,26 @@ function BookLibraryCard({ spaces, currentSid }: { spaces: Space[]; currentSid: 
   const [done, setDone] = useState(0)
   const [pageUrl, setPageUrl] = useState('')
   const [mounted, setMounted] = useState<Record<string, string[]>>({})
+  const [bookErr, setBookErr] = useState('')  // 加载失败 ≠ 书库为空：别再诱导用户去「导入」
+  const seq = useRef(0)
   // 搜索 300ms 防抖：query 直接进依赖会每敲一键触发 1+N 个请求
   useEffect(() => {
     const t = setTimeout(() => setDebouncedQuery(query), 300)
     return () => clearTimeout(t)
   }, [query])
   const refresh = () => {
+    const id = ++seq.current
+    setBookErr('')
     api.library(debouncedQuery, subject).then(async (bs) => {
-      setBooks(bs)
-      // 每本书已挂载到哪些课程空间：挂载只存在于本地书，external/仅书目不查
+      // 每本书已挂载到哪些课程空间：挂载只存在于本地书，external/仅书目不查。
+      // books 与 mounted 必须一次性落（分两步会有"新 books + 旧 mounted"的错配窗口）
       const entries = await Promise.all(bs.filter((b) => b.status === 'local').map(async (b) => {
         try { return [b.id, (await api.bookSpaces(b.id)).map((s) => s.name)] as const } catch { return [b.id, []] as const }
       }))
+      if (id !== seq.current) return  // 防抖期间又改了搜索词：旧响应整体丢弃
+      setBooks(bs)
       setMounted(Object.fromEntries(entries))
-    }).catch(() => setBooks([]))
+    }).catch((e: any) => { if (id === seq.current) { setBooks([]); setBookErr(e?.message || '网络错误') } })
     api.librarySubjects().then(setSubjects).catch(() => {})
   }
   useEffect(() => { refresh() }, [debouncedQuery, subject]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -141,8 +204,12 @@ function BookLibraryCard({ spaces, currentSid }: { spaces: Space[]; currentSid: 
       if (!['.pdf', '.pptx', '.txt', '.md', '.markdown', '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.zip'].some((ext) => low.endsWith(ext))) { skipped++; continue }
       try {
         const r: any = await api.uploadBook(f)
-        if (r.batch) ok += r.batch.length
-        else ok++
+        if (r.batch) {
+          // 与 SpaceDocsCard 同口径：失败成员不算成功（后端现只产成功条目，但口径先对齐）
+          const bad = r.batch.filter((b: any) => b.status === 'error')
+          ok += r.batch.length - bad.length
+          bad.forEach((b: any) => toast('warn', `${b.filename}: ${b.error}`))
+        } else ok++
       } catch (e: any) { toast('error', `${f.name}: ${e.message}`) }
       setDone((d) => d + 1)
     }
@@ -244,7 +311,12 @@ function BookLibraryCard({ spaces, currentSid }: { spaces: Space[]; currentSid: 
         ))}
       </div>
 
-      {books.length > 0 ? (
+      {bookErr ? (
+        <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <span className="sub" style={{ color: 'var(--red)' }}>⚠ 书库加载失败：{bookErr}</span>
+          <button className="btn small" onClick={refresh}>重试</button>
+        </div>
+      ) : books.length > 0 ? (
         <table className="quiz" style={{ marginTop: 12 }}>
           <thead><tr><th style={{ width: '34%' }}>书名</th><th>学科</th><th>状态</th><th style={{ width: '30%' }}>说明 / 操作</th></tr></thead>
           <tbody>
@@ -279,7 +351,8 @@ function BookLibraryCard({ spaces, currentSid }: { spaces: Space[]; currentSid: 
                     {b.source_url && (
                       <a className="btn ghost small" href={b.source_url} target="_blank" rel="noreferrer">官网来源 ↗</a>
                     )}
-                    <button className="btn danger small" disabled={!!busy} onClick={() => remove(b)}>
+                    <button className="btn danger small" disabled={!!busy} onClick={() => remove(b)}
+                      aria-label={`移除教材《${b.title}》`}>
                       <Icon name="trash" size={12} />
                     </button>
                   </div>

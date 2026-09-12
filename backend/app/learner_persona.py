@@ -160,7 +160,8 @@ def list_catalog() -> list[dict]:
 def _error_mix(space_id: str) -> dict[str, int]:
     from collections import Counter
     stats: Counter[str] = Counter()
-    for q in db.list_quizzes(space_id)[-10:]:
+    # 取最近 10 次测验的错因（recent_quizzes 新→旧，SQL LIMIT 免全量 JSON 解析）
+    for q in db.recent_quizzes(space_id, 10):
         for a in q.get("answers") or []:
             if a.get("verdict") != "对" and a.get("error_type"):
                 stats[a["error_type"]] += 1
@@ -215,7 +216,7 @@ def infer_personas(space_id: str) -> tuple[list[str], list[str]]:
         graded_acc = None
         if quizzes:
             hits = tot = 0
-            for q in quizzes[-5:]:
+            for q in quizzes[:5]:
                 for a in q.get("answers") or []:
                     tot += 1
                     if a.get("verdict") == "对":

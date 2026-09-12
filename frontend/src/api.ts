@@ -4,7 +4,7 @@ export interface Doc { id: string; filename: string; status: string; chunks: num
 export interface Citation { index: number; source: string; score: number; snippet: string }
 export interface Msg {
   id?: string; mode: string; role: 'user' | 'assistant'; content: string
-  expert?: string; citations?: Citation[]
+  expert?: string; citations?: Citation[]; created_at?: number
 }
 export interface QuizQ {
   id: string; type: string; question: string; options: string[]
@@ -38,7 +38,7 @@ export interface MasteryData {
 }
 export interface LlmStatus {
   routing: string
-  local: { base_url: string; model: string }
+  local: { base_url: string; model: string; api_key_masked?: string; custom?: boolean }
   cloud: { base_url: string; model: string; api_key_masked: string; configured: boolean }
   max_context_chars: number
 }
@@ -289,6 +289,10 @@ export interface CampusStatus {
 
 const BASE = ''
 
+// 页面间跳转的附加定位：sub = 目标页子页签（如测验页的 wrong 错题本），
+// quizId = 要滚动定位并高亮的具体卷子（每日一题 / 复习题 / 出 N 题练它）
+export interface NavExtra { sub?: string; quizId?: string }
+
 // FastAPI 校验错误的 detail 是数组、业务错误是字符串，直接塞给 Error 会显示 [object Object]
 async function errMsg(r: Response): Promise<string> {
   const body: any = await r.json().catch(() => ({ detail: r.statusText }))
@@ -304,7 +308,8 @@ async function errMsg(r: Response): Promise<string> {
 async function j<T>(res: Promise<Response>): Promise<T> {
   const r = await res
   if (!r.ok) throw new Error(await errMsg(r))
-  return r.json()
+  // 200 但 body 非 JSON（如代理/错误页 HTML）时给出可读错误，而不是裸 SyntaxError
+  return r.json().catch(() => { throw new Error('响应不是有效 JSON（服务可能正在重启）') })
 }
 
 // 写操作统一走状态检查：裸 fetch 对 HTTP 400/404/500 会当成功 resolve，
@@ -329,17 +334,20 @@ export const api = {
   },
   deleteDoc: (sid: string, did: string) =>
     ok(fetch(`${BASE}/api/spaces/${sid}/documents/${did}`, { method: 'DELETE' })),
-  listMessages: (sid: string) => j<Msg[]>(fetch(`${BASE}/api/spaces/${sid}/messages`)),
-  chat: (sid: string, mode: string, message: string, guide = false) =>
-    j<{ reply: string; citations: Citation[]; expert: string }>(fetch(`${BASE}/api/spaces/${sid}/chat`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, message, guide }),
-    })),
+  // 重新索引失败/中断的文档（原文件还在时无需重传）
+  reindexDoc: (sid: string, did: string) =>
+    j<{ id: string; status: string; chunks: number }>(
+      fetch(`${BASE}/api/spaces/${sid}/documents/${did}/reindex`, { method: 'POST' })),
+  listMessages: (sid: string, opts: { limit?: number; before?: number } = {}) =>
+    j<{ messages: Msg[]; has_more: boolean }>(
+      fetch(`${BASE}/api/spaces/${sid}/messages?limit=${opts.limit ?? 200}${opts.before != null ? `&before=${opts.before}` : ''}`)),
   listSkills: () => j<{ id: string; name: string }[]>(fetch(`${BASE}/api/skills`)),
   listExperts: () => j<{ id: string; name: string; description: string }[]>(fetch(`${BASE}/api/experts`)),
   runSkill: (sid: string, skill: string, params: object) =>
     j<any>(fetch(`${BASE}/api/spaces/${sid}/skills`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ skill, params }),
     })),
+  // 注：SSE 流式版为独立导出函数 runSkillStream（见文件末尾，与 chatStream 并列）
   quizzes: (sid: string) => j<QuizRecord[]>(fetch(`${BASE}/api/spaces/${sid}/quizzes`)),
   memory: (sid: string) => j<MemoryData>(fetch(`${BASE}/api/spaces/${sid}/memory`)),
   clearMemory: (sid: string, level: number) => ok(fetch(`${BASE}/api/spaces/${sid}/memory/${level}`, { method: 'DELETE' })),
@@ -369,12 +377,19 @@ export const api = {
   reviewDue: (sid: string) => j<{ due: MasteryPoint[]; weakest: MasteryPoint[] }>(
     fetch(`${BASE}/api/spaces/${sid}/review/due`)),
   llmConfig: () => j<LlmStatus>(fetch(`${BASE}/api/llm/config`)),
-  updateLlmConfig: (patch: { routing?: string; cloud_base_url?: string; cloud_api_key?: string; cloud_model?: string }) =>
+  updateLlmConfig: (patch: { routing?: string; cloud_base_url?: string; cloud_api_key?: string
+    cloud_model?: string; local_base_url?: string; local_api_key?: string; local_model?: string }) =>
     j<LlmStatus>(fetch(`${BASE}/api/llm/config`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
     })),
-  testLlm: () => j<Record<string, { ok: boolean; latency_ms?: number; error?: string }>>(
-    fetch(`${BASE}/api/llm/test`, { method: 'POST' })),
+  // 「测试连通」可携带表单里正在编辑的值：未传字段回退到已保存配置
+  testLlm: (form?: { local_base_url?: string; local_api_key?: string; local_model?: string
+    cloud_base_url?: string; cloud_api_key?: string; cloud_model?: string }) =>
+    j<Record<string, { ok: boolean; latency_ms?: number; error?: string }>>(
+      fetch(`${BASE}/api/llm/test`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form || {}),
+      })),
 
   generateHandbook: (profile: object) =>
     j<Handbook>(fetch(`${BASE}/api/handbook/generate`, {
@@ -410,16 +425,10 @@ export const api = {
     })),
   today: (sid: string) => j<TodayData>(fetch(`${BASE}/api/spaces/${sid}/today`)),
   learnerPersonas: () => j<{ personas: LearnerPersonaMeta[] }>(fetch(`${BASE}/api/learner-personas`)),
-  spacePersona: (sid: string) => j<{
-    primary: string; primary_name: string; primary_blurb: string; primary_tip: string
-    session: string; labels: string[]; explicit: string[]; inferred: string[]; evidence: string[]
-  }>(fetch(`${BASE}/api/spaces/${sid}/persona`)),
-  spaceMetrics: (sid: string) => j<Record<string, unknown>>(fetch(`${BASE}/api/spaces/${sid}/metrics`)),
   predictQuiz: (sid: string, quizId: string, predicted: number) =>
     j<{ quiz_id: string; predicted: number }>(fetch(`${BASE}/api/spaces/${sid}/quiz/${quizId}/predict`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ predicted }),
     })),
-  studyLoad: () => j<{ spaces: Array<Record<string, unknown>> }>(fetch(`${BASE}/api/study-load`)),
   auditCourses: () => j<{ courses: TakenCourse[] }>(fetch(`${BASE}/api/audit/courses`)),
   addAuditCourse: (body: { name: string; credit: number; grade: string; semester: string; status: string }) =>
     j<TakenCourse>(fetch(`${BASE}/api/audit/courses`, {
@@ -502,9 +511,9 @@ export const api = {
     ok(fetch(`${BASE}/api/schedule?term=${encodeURIComponent(term)}`, { method: 'DELETE' })),
   careerPlans: () => j<CareerPlanMeta[]>(fetch(`${BASE}/api/planner`)),
   careerPlan: (pid: string) => j<CareerPlan>(fetch(`${BASE}/api/planner/${pid}`)),
-  generateCareerPlan: (p: { school: string; major: string; year: string; goal_type: string; target: string; term: string; horizon: string }) =>
+  generateCareerPlan: (p: { school: string; major: string; year: string; goal_type: string; target: string; term: string; horizon: string }, signal?: AbortSignal) =>
     j<CareerPlan & { course_spaces: Record<string, string> }>(fetch(`${BASE}/api/planner/generate`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p), signal,
     })),
   toggleCareerTask: (pid: string, taskId: string, done: boolean) =>
     ok(fetch(`${BASE}/api/planner/${pid}/toggle`, {
@@ -517,8 +526,6 @@ export const api = {
   deleteCareerPlan: (pid: string) => ok(fetch(`${BASE}/api/planner/${pid}`, { method: 'DELETE' })),
 
   // ---- 竞品借鉴新功能 ----
-  velocity: (sid: string) => j<{ velocity: TodayData['velocity']; forecast: TodayData['forecast'] }>(
-    fetch(`${BASE}/api/spaces/${sid}/velocity`)),
   dailyQuestion: (sid: string) => j<{
     source: string; point: string; quiz_id?: string
     questions?: QuizQ[]; p_correct: number | null; note?: string
@@ -546,25 +553,11 @@ export const api = {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ rating }),
     })),
-  previewDocReview: (sid: string, did: string) => j<{
-    id: string; filename: string
-    preview: Record<string, { seconds: number; human: string }>
-  }>(fetch(`${BASE}/api/spaces/${sid}/doc-reviews/${did}/preview`)),
   // BKT 参数个性化拟合
   bktFit: (sid: string) => j<{ fitted_count: number; params: Record<string, unknown> }>(
     fetch(`${BASE}/api/spaces/${sid}/bkt/fit`, { method: 'POST' })),
   bktParams: (sid: string) => j<Record<string, Omit<BktParam, 'point'>>>(
     fetch(`${BASE}/api/spaces/${sid}/bkt/params`)),
-  // LLM 调用统计
-  llmStats: (hours = 24) => j<{
-    summary: {
-      total: number; window_hours: number
-      by_channel: Record<string, { count: number; success_rate: number; avg_latency_ms: number; p50_latency_ms: number; p95_latency_ms: number; total_tokens_out?: number }>
-      by_task: Record<string, { count: number; success_rate: number; avg_latency_ms: number; p50_latency_ms: number; p95_latency_ms: number }>
-    }
-    health: Record<string, { available: boolean | null; avg_latency_ms: number; success_rate: number; recent_calls?: number }>
-    task_routing: Record<string, string>
-  }>(fetch(`${BASE}/api/llm/stats?hours=${hours}`)),
   llmUsage: (days = 30) => j<UsageDashboard>(fetch(`${BASE}/api/llm/usage?days=${days}`)),
   clearLlmStats: () => ok(fetch(`${BASE}/api/llm/stats/clear`, { method: 'POST' })),
   // 校园网感知 · 校园信息自动同步
@@ -580,48 +573,97 @@ export const api = {
     })),
 }
 
+// SSE 帧解析（chatStream / runSkillStream 共用）：按 \n\n 分帧可抗 chunk 分包截断，
+// 不完整帧留在 buf 等下一包；: ping 心跳注释帧没有 data: 行，自动跳过
+async function consumeSSE(
+  r: Response,
+  onEvent: (evt: any) => 'done' | void,
+): Promise<void> {
+  if (!r.body) throw new Error(`请求失败（${r.status}）`)
+  const reader = r.body.getReader()
+  const dec = new TextDecoder()
+  let buf = ''
+  for (; ;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += dec.decode(value, { stream: true })
+    const parts = buf.split('\n\n')
+    buf = parts.pop() || ''
+    for (const p of parts) {
+      const line = p.split('\n').find((l) => l.startsWith('data:'))
+      if (!line) continue
+      let evt: any
+      try {
+        evt = JSON.parse(line.slice(5))
+      } catch { continue }
+      if (onEvent(evt) === 'done') return
+    }
+  }
+}
+
+async function sseResponse(res: Promise<Response>): Promise<Response> {
+  const r = await res
+  if (!r.ok || !r.body) {
+    const detail = await r.json().catch(() => null)
+    // detail 可能是 FastAPI 422 的数组：直接塞 Error 会显示 [object Object]
+    const msg = typeof detail?.detail === 'string' ? detail.detail : `请求失败（${r.status}）`
+    throw new Error(msg)
+  }
+  return r
+}
+
 export function chatStream(
   sid: string, mode: string, message: string,
-  onDelta: (t: string) => void,
-  onDone: (meta: { expert: string; citations: Citation[]; assistant_message_id?: string }) => void,
-  guide = false,
-  onError?: (msg: string) => void,
+  handlers: {
+    onDelta: (t: string) => void
+    onDone: (meta: { expert: string; citations: Citation[]; assistant_message_id?: string; user_message_id?: string }) => void
+    onError?: (msg: string) => void
+    onAbort?: () => void
+  },
+  opts: { guide?: boolean; signal?: AbortSignal } = {},
 ) {
+  const { onDelta, onDone, onError, onAbort } = handlers
   // 失败必须回调 onError 并结束 busy：此前 fetch 无 catch、不查 r.ok、也不认 error 事件，
   // 模型不可用/断流时发送按钮永久禁用且无任何提示
-  fetch(`${BASE}/api/spaces/${sid}/chat/stream`, {
+  sseResponse(fetch(`${BASE}/api/spaces/${sid}/chat/stream`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mode, message, guide }),
-  }).then(async (r) => {
-    if (!r.ok || !r.body) {
-      const detail = await r.json().catch(() => null)
-      throw new Error(detail?.detail || `请求失败（${r.status}）`)
+    body: JSON.stringify({ mode, message, guide: opts.guide || false }),
+    signal: opts.signal,
+  })).then((r) => consumeSSE(r, (evt) => {
+    if (evt.type === 'delta') onDelta(evt.text)
+    if (evt.type === 'done') {
+      onDone({
+        expert: evt.expert, citations: evt.citations,
+        assistant_message_id: evt.assistant_message_id,
+        user_message_id: evt.user_message_id,
+      })
+      return 'done'
     }
-    const reader = r.body.getReader()
-    const dec = new TextDecoder()
-    let buf = ''
-    let finished = false
-    for (; ;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += dec.decode(value, { stream: true })
-      const parts = buf.split('\n\n')
-      buf = parts.pop() || ''
-      for (const p of parts) {
-        const line = p.split('\n').find((l) => l.startsWith('data:'))
-        if (!line) continue
-        let evt: any
-        try {
-          evt = JSON.parse(line.slice(5))
-        } catch { continue }
-        if (evt.type === 'delta') onDelta(evt.text)
-        if (evt.type === 'done') {
-          finished = true
-          onDone({ expert: evt.expert, citations: evt.citations, assistant_message_id: evt.assistant_message_id })
-        }
-        if (evt.type === 'error') throw new Error(evt.message || '生成回答失败')
-      }
-    }
-    if (!finished) throw new Error('连接中断，未收到完整回答')
-  }).catch((e: any) => onError?.(e?.message || '网络错误：无法连接服务'))
+    if (evt.type === 'error') throw new Error(evt.message || '生成回答失败')
+  })).catch((e: any) => {
+    // 用户主动停止不算错误：保留已生成的部分内容，由 onAbort 收尾
+    if (e?.name === 'AbortError') { onAbort?.(); return }
+    onError?.(e?.message || '网络错误：无法连接服务')
+  })
+}
+
+// SSE 版技能执行：onPhase 收到「正在检索讲义/生成/入库」等阶段进度；
+// onDone 收到与同步版 runSkill 相同的返回值。长任务期间服务端以 SSE 心跳保活。
+// 中止（AbortError）会回调 onAbort：调用方必须借此复位 busy，否则界面永久卡在生成中
+export function runSkillStream(
+  sid: string, skill: string, params: object,
+  handlers: { onPhase?: (label: string) => void; onDone: (result: any) => void; onError?: (msg: string) => void; onAbort?: () => void },
+  signal?: AbortSignal,
+) {
+  sseResponse(fetch(`${BASE}/api/spaces/${sid}/skills/stream`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ skill, params }), signal,
+  })).then((r) => consumeSSE(r, (evt) => {
+    if (evt.type === 'phase') handlers.onPhase?.(evt.label)
+    if (evt.type === 'done') { handlers.onDone(evt.result); return 'done' }
+    if (evt.type === 'error') throw new Error(evt.message || '技能执行失败')
+  })).catch((e: any) => {
+    if (e?.name === 'AbortError') { handlers.onAbort?.(); return }
+    handlers.onError?.(e?.message || '网络错误：无法连接服务')
+  })
 }

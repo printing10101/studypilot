@@ -1,11 +1,14 @@
 """专家团 + 三层记忆（L1 镜像 / L2 摘要 / L3 长期综合）+ 模式(Ask/Plan/Craft)编排。"""
 import json
+import logging
 import re
 import sys
 import threading
 
 from . import connectors, db, fatigue, llm, rag
 from .config import settings
+
+log = logging.getLogger("studypilot.experts")
 
 # ---------- 专家团（WorkBuddy: 专家 agents） ----------
 
@@ -197,7 +200,11 @@ def record_feedback(space_id: str, message_id: str, rating: str,
     except Exception:
         points = []
     if not points:
-        points = [(confusion or question or "当前话题").strip()[:40]]
+        # 提炼失败且拿不到任何具体表述时直接放弃：把「当前话题」这类占位词
+        # 写进掌握度会污染薄弱点排行/知识图谱，且 UI 上几乎无法清除
+        if not (confusion or question).strip():
+            return {"ok": True, "points": []}
+        points = [(confusion or question).strip()[:40]]
     reason = "没听懂" if understood == 0 else "回答没帮助"
     for p in points:
         db.adjust_mastery(space_id, p, "confused")
@@ -358,27 +365,30 @@ def maybe_update_memory(space_id: str, every_n_msgs: int = 8) -> None:
         {"role": "user", "content": l1},
     ], temperature=0.2, task="analyze")
 
-    # 分析位点在摘要成功后才推进：中途失败下次还能覆盖这批消息
-    db.set_meta(marker, str(n))
-    db.clear_memory(space_id, level=2)
-    db.add_memory(space_id, 2, summary, kind="summary")
-
-    # 2) L3 提取
-    l3_raw = llm.chat([
-        {"role": "system", "content": (
-            "根据摘要和历史档案，提取学生当前的知识点掌握状态变化。"
-            "输出严格 JSON 数组，每项 {\"kind\":\"mastery|weakness|error\",\"content\":\"...\"}，最多5条，不要多余文字。")},
-        {"role": "user", "content": f"近期摘要：{summary}\n现有档案：{json.dumps(db.list_memory(space_id, 3), ensure_ascii=False)}"},
-    ], temperature=0.2, task="extract")
+    marker_advanced = False
     try:
-        text = l3_raw[l3_raw.find("["): l3_raw.rfind("]") + 1]
-        for item in json.loads(text):
-            db.add_memory(space_id, 3, item.get("content", ""), kind=item.get("kind", ""))
-    except (ValueError, json.JSONDecodeError):
-        pass
+        # 分析位点在摘要成功后才推进：中途失败下次还能覆盖这批消息
+        db.set_meta(marker, str(n))
+        db.clear_memory(space_id, level=2)
+        db.add_memory(space_id, 2, summary, kind="summary")
+        marker_advanced = True
 
-    # 3) 掌握度模型更新（对话信号：解释不通/反复追问 → 削弱；顺利理解 → 加固）
-    try:
+        # 2) L3 提取（失败不推进位点之外的事：位点已推进，这批消息的 L3 就此错过，
+        #    但绝不能让它一路抛上去把整个分析线程打挂）
+        l3_raw = llm.chat([
+            {"role": "system", "content": (
+                "根据摘要和历史档案，提取学生当前的知识点掌握状态变化。"
+                "输出严格 JSON 数组，每项 {\"kind\":\"mastery|weakness|error\",\"content\":\"...\"}，最多5条，不要多余文字。")},
+            {"role": "user", "content": f"近期摘要：{summary}\n现有档案：{json.dumps(db.list_memory(space_id, 3), ensure_ascii=False)}"},
+        ], temperature=0.2, task="extract")
+        try:
+            text = l3_raw[l3_raw.find("["): l3_raw.rfind("]") + 1]
+            for item in json.loads(text):
+                db.add_memory(space_id, 3, item.get("content", ""), kind=item.get("kind", ""))
+        except (ValueError, json.JSONDecodeError):
+            log.warning("L3 记忆提取输出非法 JSON（space=%s），本批跳过", space_id)
+
+        # 3) 掌握度模型更新（对话信号：解释不通/反复追问 → 削弱；顺利理解 → 加固）
         data = llm.chat_json([
             {"role": "system", "content": (
                 "根据学习对话判断学生对知识点的掌握变化。输出 JSON："
@@ -395,5 +405,9 @@ def maybe_update_memory(space_id: str, every_n_msgs: int = 8) -> None:
             p = (s.get("point") or "").strip()
             if p:
                 db.adjust_mastery(space_id, p, "progress")
-    except (ValueError, AttributeError):
-        pass
+    except Exception:
+        # L2 摘要是 clear+add 覆盖式写入、可安全重算：位点回退让下批消息触发时重跑整轮，
+        # 而不是让 L3/掌握度阶段静默漏采
+        if marker_advanced:
+            db.set_meta(marker, str(last))
+        log.warning("学习分析第 2/3 阶段失败（space=%s），位点已回退待重试", space_id, exc_info=True)

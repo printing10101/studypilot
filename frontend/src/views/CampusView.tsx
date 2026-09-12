@@ -1,5 +1,5 @@
 // 校园网：网络状态感知 + 校园信息自动同步（教务处/学校/新闻网/图书馆/学院）
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, CampusItem, CampusStatus } from '../api'
 import { EmptyState, Icon } from '../ui'
 import { useUX } from '../ux'
@@ -7,7 +7,9 @@ import { useUX } from '../ux'
 export function CampusView() {
   const { toast } = useUX()
   const [status, setStatus] = useState<CampusStatus | null>(null)
+  const [statusErr, setStatusErr] = useState('')
   const [items, setItems] = useState<CampusItem[]>([])
+  const [itemsErr, setItemsErr] = useState('')
   const [source, setSource] = useState('')
   const [query, setQuery] = useState('')
   const [busy, setBusy] = useState('')
@@ -15,11 +17,24 @@ export function CampusView() {
   const [intervalMin, setIntervalMin] = useState(30)
 
   const applyStatus = (s: CampusStatus) => {
-    setStatus(s); setAutoSync(s.config.auto_sync); setIntervalMin(s.config.interval_min)
+    setStatus(s); setStatusErr(''); setAutoSync(s.config.auto_sync); setIntervalMin(s.config.interval_min)
   }
-  const refresh = (force = false) => api.campusStatus(force).then(applyStatus).catch(() => {})
-  const loadItems = (src: string, q: string) =>
-    api.campusItems(src, 100, q).then((r) => setItems(r.items)).catch(() => setItems([]))
+  const refresh = (force = false) => {
+    setStatusErr('')
+    return api.campusStatus(force).then(applyStatus).catch((e: any) => setStatusErr(e?.message || '网络错误'))
+  }
+  // 请求序号守卫：防抖只是减少请求，慢的旧响应仍可能晚于新响应返回、把旧结果覆盖上去
+  const loadSeq = useRef(0)
+  const loadItems = (src: string, q: string) => {
+    const id = ++loadSeq.current
+    setItemsErr('')
+    api.campusItems(src, 100, q).then((r) => {
+      if (id === loadSeq.current) setItems(r.items)
+    }).catch((e: any) => {
+      // 失败不能伪装成「该筛选条件下没有内容」：那会把排查方向带到换关键词上
+      if (id === loadSeq.current) { setItems([]); setItemsErr(e?.message || '网络错误') }
+    })
+  }
   useEffect(() => { refresh() }, [])
   useEffect(() => {
     const t = setTimeout(() => loadItems(source, query), query ? 300 : 0)
@@ -87,18 +102,25 @@ export function CampusView() {
           <button className="btn" disabled={!!busy} onClick={syncNow}>
             {busy === 'sync' ? <><span className="spin" /> 同步中</> : '立即同步'}
           </button>
-          <span style={{ display: 'inline-flex', gap: 8, alignItems: 'center', marginLeft: 8 }}>
-            <label style={{ display: 'inline-flex', gap: 6, alignItems: 'center', cursor: 'pointer', fontSize: 13 }}>
-              <input type="checkbox" checked={autoSync} onChange={(e) => setAutoSync(e.target.checked)} /> 自动同步
-            </label>
-            <input type="number" min={5} max={1440} value={intervalMin} style={{ width: 76 }}
-              onChange={(e) => setIntervalMin(Number(e.target.value) || 30)} />
-            <span className="sub">分钟/次</span>
-            <button className="btn ghost small" disabled={!!busy} onClick={saveCfg}>
-              {busy === 'save' ? <><span className="spin" /> 保存中</> : '保存设置'}
-            </button>
-          </span>
-        </div>
+            <span style={{ display: 'inline-flex', gap: 8, alignItems: 'center', marginLeft: 8 }}>
+              <label style={{ display: 'inline-flex', gap: 6, alignItems: 'center', cursor: 'pointer', fontSize: 13 }}>
+                <input type="checkbox" checked={autoSync} onChange={(e) => setAutoSync(e.target.checked)} /> 自动同步
+              </label>
+              <input type="number" min={5} max={1440} value={intervalMin} style={{ width: 76 }}
+                onChange={(e) => setIntervalMin(Number(e.target.value) || 30)}
+                onBlur={() => setIntervalMin((v) => Math.min(1440, Math.max(5, Math.round(v) || 30)))} />
+              <span className="sub">分钟/次（5-1440）</span>
+              <button className="btn ghost small" disabled={!!busy} onClick={saveCfg}>
+                {busy === 'save' ? <><span className="spin" /> 保存中</> : '保存设置'}
+              </button>
+            </span>
+          </div>
+        {statusErr && (
+          <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <span className="sub" style={{ color: 'var(--red)' }}>⚠ 状态检测失败：{statusErr}</span>
+            <button className="btn small" onClick={() => refresh()}>重试</button>
+          </div>
+        )}
         <p className="sub" style={{ marginTop: 14 }}>
           常用入口：<a href="https://findexample.libsp.cn" target="_blank" rel="noopener noreferrer" style={{ textDecoration: 'underline' }}>示例大学馆藏统一检索</a>
           {' · '}<a href="http://mech.example.edu.cn" target="_blank" rel="noopener noreferrer" style={{ textDecoration: 'underline' }}>机械学院官网</a>
@@ -142,7 +164,12 @@ export function CampusView() {
                 {source === '' && <span className="badge" style={{ flex: 'none', fontSize: 11 }}>{sourceName[it.source] || it.source}</span>}
               </a>
             ))}
-            {status && status.total > 0 && !items.length && (
+            {itemsErr ? (
+              <div style={{ padding: '16px 4px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                <span className="sub" style={{ color: 'var(--red)' }}>⚠ 列表加载失败：{itemsErr}</span>
+                <button className="btn small" onClick={() => loadItems(source, query)}>重试</button>
+              </div>
+            ) : (
               <div className="sub" style={{ padding: '16px 4px' }}>该筛选条件下没有内容——换个关键词，或点「立即同步」更新</div>
             )}
           </div>

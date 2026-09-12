@@ -44,7 +44,11 @@ def report_md(space_id: str) -> str:
         lines += ["## 测验记录", ""]
         for q in graded[:10]:
             good = sum(1 for a in q["answers"] if a.get("verdict") == "对")
-            lines.append(f"- {_ts(q['created_at'])}　{q['topic'] or '综合'}　{good}/{len(q['questions'])}")
+            partial = sum(1 for a in q["answers"] if a.get("verdict") == "部分对")
+            # 分母用实际作答题数：部分交卷时按全题数算会虚低正确率
+            answered = max(len(q["answers"]), 1)
+            extra = f"（含部分对 {partial}）" if partial else ""
+            lines.append(f"- {_ts(q['created_at'])}　{q['topic'] or '综合'}　{good}/{answered}{extra}")
         lines.append("")
 
     mem = db.list_memory(space_id)

@@ -1,11 +1,14 @@
 // 个人中心：全应用唯一的档案表单（原成长手册/学涯规划里的重复表单已移除）+ 跨空间学习总览 + 迁移机会
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, LearnerPersonaMeta, Space, SpaceOverview, StudentProfile, SyllabusSchool, TransferOpportunity } from '../api'
 import { Icon } from '../ui'
 import { useUX } from '../ux'
 
 const FLAGS = ['重修', '挂科', '跨考', '无科研经历', '无竞赛奖项', '英语未过级']
 const RANKS = ['', '前10%', '前20%', '前30%', '前50%', '50%以后']
+// 与学涯中心/竞赛页共用同一份目标词表：此前档案只有 3 个考研向选项，
+// 「就业/出国」永远无法从档案流入竞赛分析，两侧展示也会不一致
+const GOALS = ['保研', '考研', '就业', '竞赛', '出国', '期末', '毕业']
 
 export function ProfileView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSpace: (id: string) => void }) {
   const { toast } = useUX()
@@ -15,29 +18,40 @@ export function ProfileView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
   })
   const [savedAt, setSavedAt] = useState(0)
   const [overview, setOverview] = useState<SpaceOverview[] | null>(null)
+  const [overviewErr, setOverviewErr] = useState('')
   const [transfers, setTransfers] = useState<TransferOpportunity[]>([])
+  const [transfersErr, setTransfersErr] = useState('')
   const [busy, setBusy] = useState(false)
   const [schoolList, setSchoolList] = useState<SyllabusSchool[]>([])
   const [majorList, setMajorList] = useState<string[]>([])
   const [personaList, setPersonaList] = useState<LearnerPersonaMeta[]>([])
+  const [loadErr, setLoadErr] = useState(false)
 
   useEffect(() => {
     api.profile().then((p) => {
       setForm({ ...p, learner_personas: p.learner_personas || [] })
       setSavedAt(p.updated_at || 0)
-    }).catch(() => {})
-    api.profileOverview().then((o) => setOverview(o.spaces)).catch(() => {})
-    api.transferOpportunities().then(setTransfers).catch(() => setTransfers([]))
+      setLoadErr(false)
+    }).catch(() => setLoadErr(true))  // 读取失败必须拦住保存：空表单提交会整行覆盖真实档案
+    api.profileOverview().then((o) => { setOverview(o.spaces); setOverviewErr('') })
+      .catch((e: any) => { setOverview(null); setOverviewErr(e?.message || '网络错误') })
+    api.transferOpportunities().then((t) => { setTransfers(t); setTransfersErr('') })
+      .catch((e: any) => { setTransfers([]); setTransfersErr(e?.message || '网络错误') })
     api.schools().then(setSchoolList).catch(() => {})
     api.learnerPersonas().then((r) => setPersonaList(r.personas)).catch(() => {})
   }, [])
 
-  // 选中 985/211 学校后，专业输入给到培养方案候选（300ms 防抖，避免每击键一个请求竞态）
+  // 选中 985/211 学校后，专业输入给到培养方案候选（300ms 防抖 + 序号守卫，
+  // 避免每击键一个请求竞态：慢的旧响应晚到会覆盖新学校的专业列表）
+  const majorSeq = useRef(0)
   useEffect(() => {
     if (!form.current_school) { setMajorList([]); return }
     const t = setTimeout(() => {
-      api.majorsForSchool(form.current_school).then((m) =>
-        setMajorList([...m.custom_majors, ...m.template_majors, ...m.strong])).catch(() => setMajorList([]))
+      const id = ++majorSeq.current
+      api.majorsForSchool(form.current_school).then((m) => {
+        if (id !== majorSeq.current) return
+        setMajorList([...m.custom_majors, ...m.template_majors, ...m.strong])
+      }).catch(() => { if (id === majorSeq.current) setMajorList([]) })
     }, 300)
     return () => clearTimeout(t)
   }, [form.current_school])
@@ -45,6 +59,11 @@ export function ProfileView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
   const set = (k: string, v: unknown) => setForm((f) => ({ ...f, [k]: v }))
 
   const save = async () => {
+    if (loadErr) {
+      // 后端整行覆盖保存：档案没读出来就保存 = 用空表单清掉真实档案
+      toast('error', '档案尚未加载成功，已阻止保存以防空档案覆盖原有数据。请刷新重试。')
+      return
+    }
     setBusy(true)
     try {
       const p = await api.saveProfile(form)
@@ -86,7 +105,7 @@ export function ProfileView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
           <input type="text" placeholder="关键时间线（如：2028.12 初试）"
             value={form.timeline} onChange={(e) => set('timeline', e.target.value)} />
           <select value={form.goal_type} onChange={(e) => set('goal_type', e.target.value)}>
-            {['考研', '推免/保研', '考研为主+推免兜底'].map((g) => <option key={g} value={g}>{g}</option>)}
+            {GOALS.map((g) => <option key={g} value={g}>{g}</option>)}
           </select>
         </div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
@@ -131,7 +150,12 @@ export function ProfileView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
       <div className="card" style={{ marginBottom: 18 }}>
         <h3>学习总览</h3>
         <p className="sub">跨课程空间汇总你的知识点掌握情况。</p>
-        {overview && overview.length > 0 ? (
+        {overviewErr ? (
+          <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <span className="sub" style={{ color: 'var(--red)' }}>⚠ 学习总览加载失败：{overviewErr}</span>
+            <button className="btn small" onClick={() => api.profileOverview().then((o) => { setOverview(o.spaces); setOverviewErr('') }).catch((e: any) => setOverviewErr(e?.message || '网络错误'))}>重试</button>
+          </div>
+        ) : overview && overview.length > 0 ? (
           <>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '10px 0 14px' }}>
               <span className="badge">课程空间 {spaces.length}</span>
@@ -174,7 +198,12 @@ export function ProfileView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
       <div className="card">
         <h3>跨空间迁移机会</h3>
         <p className="sub">课程 A 里已掌握的概念，和课程 B 里未掌握的近名概念相关——先学 B 的这个概念，可以借 A 的底子加速。</p>
-        {transfers.length > 0 ? (
+        {transfersErr ? (
+          <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <span className="sub" style={{ color: 'var(--red)' }}>⚠ 迁移分析加载失败：{transfersErr}</span>
+            <button className="btn small" onClick={() => api.transferOpportunities().then((t) => { setTransfers(t); setTransfersErr('') }).catch((e: any) => setTransfersErr(e?.message || '网络错误'))}>重试</button>
+          </div>
+        ) : transfers.length > 0 ? (
           <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
             {transfers.slice(0, 8).map((t, i) => (
               <div key={i} style={{ border: '1px solid var(--hairline)', borderRadius: 12, padding: '10px 14px', fontSize: 13, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>

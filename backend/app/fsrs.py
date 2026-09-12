@@ -73,7 +73,10 @@ def card_from_row(row: dict[str, Any]) -> Card:
     stability = float(row.get("stability") or 0)
     if stability > 0:
         last = float(row.get("last_review") or 0)
-        return Card(card_id=cid, state=State(int(row.get("state") or State.Review.value)),
+        # state=0（New）是合法值，不能用 `or` 兜底——会把 New 吞成 Review
+        raw_state = row.get("state")
+        state_val = int(raw_state) if raw_state is not None else State.Review.value
+        return Card(card_id=cid, state=State(state_val),
                     step=int(row["step"]) if row.get("step") is not None else None,
                     stability=stability,
                     difficulty=float(row.get("difficulty") or 5.0),

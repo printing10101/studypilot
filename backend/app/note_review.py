@@ -39,11 +39,13 @@ def schedule_doc_review(did: str, rating: int) -> dict | None:
     if not doc:
         return None
     row = {
+        "id": did,
         "state": doc.get("review_state", 0) or 0,
         "step": doc.get("review_step"),
         "stability": doc.get("review_stability", 0) or 0,
         "difficulty": doc.get("review_difficulty", 0) or 0,
         "last_review": doc.get("review_last", 0) or 0,
+        "due_at": doc.get("review_due_at", 0) or 0,
         "reps": doc.get("review_reps", 0) or 0,
         "lapses": doc.get("review_lapses", 0) or 0,
     }
@@ -71,7 +73,8 @@ def schedule_doc_review(did: str, rating: int) -> dict | None:
 
 def list_due_doc_reviews(space_id: str) -> list[dict]:
     """列出空间内到期需要复习的讲义文档。"""
-    docs = db.list_documents(space_id)
+    # 必须用带 review_* 列的查询：普通列表查询不含这些列，会让所有文档恒判「从未复习」
+    docs = db.list_documents_with_review(space_id)
     now = db.now()
     due = []
     for d in docs:
@@ -102,11 +105,13 @@ def doc_review_preview(did: str) -> dict | None:
     if not doc:
         return None
     row = {
+        "id": did,
         "state": doc.get("review_state", 0) or 0,
         "step": doc.get("review_step"),
         "stability": doc.get("review_stability", 0) or 0,
         "difficulty": doc.get("review_difficulty", 0) or 0,
         "last_review": doc.get("review_last", 0) or 0,
+        "due_at": doc.get("review_due_at", 0) or 0,
         "reps": doc.get("review_reps", 0) or 0,
         "lapses": doc.get("review_lapses", 0) or 0,
     }

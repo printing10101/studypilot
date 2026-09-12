@@ -7,6 +7,7 @@
 import io
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -22,11 +23,6 @@ from . import db, fsrs
 # revlog: 复习日志
 
 
-def _detect_field_separator(fields_str: str) -> str:
-    """Anki note.fields 用 \x1f 分隔。"""
-    return "\x1f"
-
-
 def import_apkg(file_bytes: bytes, space_id: str) -> dict:
     """导入 .apkg 文件，将闪卡写入指定空间。
 
@@ -40,25 +36,41 @@ def import_apkg(file_bytes: bytes, space_id: str) -> dict:
     except zipfile.BadZipFile:
         return {"imported": 0, "skipped": 0, "errors": ["不是有效的 .apkg 文件（zip 损坏）"]}
 
-    # .apkg 也是 zip，按声明解压大小防炸弹（同 ingest 的立场，按上限拒绝）
+    # .apkg 也是 zip：先按声明大小做廉价预检，再在读取成员时按实际字节计量——
+    # 恶意包会谎报 file_size，信任 zip 头等于没有防护（同 ingest.expand_zip 的立场）
     _MAX_UNCOMPRESSED = 500 * 1024 * 1024
+    _COL_MEMBER_LIMIT = 200 * 1024 * 1024
     if sum(i.file_size for i in zf.infolist()) > _MAX_UNCOMPRESSED:
         return {"imported": 0, "skipped": 0,
                 "errors": [f".apkg 解压后超过 {_MAX_UNCOMPRESSED // (1024 * 1024)}MB 上限，已拒绝"]}
 
-    # 找 collection.anki2 或 collection.anki21
+    # 找 collection.anki2 或 collection.anki21（fullmatch，避免误匹配 "collection.anki2evil"）
     col_name = None
     for name in zf.namelist():
-        if name.startswith("collection.anki2"):
+        if re.fullmatch(r"collection\.anki2(1)?", name):
             col_name = name
             break
     if not col_name:
         return {"imported": 0, "skipped": 0, "errors": [".apkg 中未找到 collection.anki2"]}
 
-    # 解压到临时 SQLite
+    # 流式解压到临时 SQLite：按实际拷贝字节计量，超限即中止
+    chunks = []
+    total = 0
+    with zf.open(col_name) as src:
+        while True:
+            chunk = src.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _COL_MEMBER_LIMIT:
+                return {"imported": 0, "skipped": 0,
+                        "errors": [f"collection.anki2 解压后超过 {_COL_MEMBER_LIMIT // (1024 * 1024)}MB 上限，已拒绝"]}
+            chunks.append(chunk)
     with tempfile.NamedTemporaryFile(suffix=".anki2", delete=False) as tmp:
-        tmp.write(zf.read(col_name))
+        for chunk in chunks:
+            tmp.write(chunk)
         tmp_path = tmp.name
+    del chunks
 
     try:
         conn = sqlite3.connect(tmp_path)
@@ -88,6 +100,7 @@ def import_apkg(file_bytes: bytes, space_id: str) -> dict:
         # ivl: 间隔天数（复习卡为正，学习卡为负=分钟）
         # factor: 简易度 ×1000（2500=250%）
         # reps, lapses
+        pending: list[dict] = []  # (闪卡字段, 调度列) 成对收集，最后一次性入库
         for row in c.execute(
             "SELECT nid, type, queue, ivl, factor, reps, lapses, due FROM cards"
         ):
@@ -127,31 +140,26 @@ def import_apkg(file_bytes: bytes, space_id: str) -> dict:
             else:
                 due_at = now_ts  # 新卡/学习卡立即到期
 
-            sched = {
-                "state": fsrs_state,
-                "step": 0,
-                "stability": stability,
-                "difficulty": diff,
-                "last_review": now_ts - (ivl * 86400 if ivl > 0 else 0),
-            }
+            pending.append({
+                "card": {"front": note["front"], "back": note["back"],
+                         "point": note["tags"] or ""},
+                "sched": (min(5, max(1, int(stability / 7) + 1)), due_at,
+                          fsrs_state, stability, diff,
+                          now_ts - (ivl * 86400 if ivl > 0 else 0), reps, lapses),
+            })
 
-            saved = db.add_flashcards(space_id, [{
-                "front": note["front"], "back": note["back"],
-                "point": note["tags"] or "",
-            }])
-            if saved:
-                fid = saved[0]["id"]
-                c2 = db.get_conn()
-                c2.execute(
-                    "UPDATE flashcards SET box=?, due_at=?, state=?, step=?, "
-                    "stability=?, difficulty=?, last_review=?, reps=?, lapses=? WHERE id=?",
-                    (min(5, max(1, int(stability / 7) + 1)), due_at,
-                     fsrs_state, 0, stability, diff,
-                     sched["last_review"], reps, lapses, fid))
-                c2.commit()
-                imported += 1
-            else:
-                skipped += 1
+        # 万卡牌组逐卡 commit 会慢到不可用：一次批量插入 + 一次批量 UPDATE
+        saved = db.add_flashcards(space_id, [p["card"] for p in pending])
+        if len(saved) == len(pending):
+            c2 = db.get_conn()
+            c2.executemany(
+                "UPDATE flashcards SET box=?, due_at=?, state=?, step=?, "
+                "stability=?, difficulty=?, last_review=?, reps=?, lapses=? WHERE id=?",
+                [(*p["sched"], fid) for p, fid in zip(pending, (s["id"] for s in saved))])
+            c2.commit()
+            imported = len(saved)
+        else:
+            skipped += len(pending)
 
         conn.close()
     except sqlite3.Error as e:

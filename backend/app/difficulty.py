@@ -104,13 +104,13 @@ def recommend_for_space(space_id: str, topic_points: list[str] | None = None) ->
     if not rows:
         return recommend_difficulty(0.3)
     avg_score = sum(r["score"] for r in rows) / len(rows)
-    # 取最常见的错因
+    # 取最常见的错因（最近 5 份卷，SQL LIMIT 免全量 JSON 解析）
     gap = None
     from collections import Counter
+    recent = db.recent_quizzes(space_id, 5)
     error_types = []
     for r in rows:
-        # 从最近判卷中找错因
-        for q in db.list_quizzes(space_id)[-5:]:
+        for q in recent:
             for a in q.get("answers", []):
                 if a.get("verdict") != "对" and a.get("error_type"):
                     import difflib

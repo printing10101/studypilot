@@ -1,9 +1,13 @@
 """技能系统（WorkBuddy: Skills）：出题 / 判卷 / 总结 / 学习计划 / 薄弱点复习
 / 错题重做 / 错题变式 / 闪卡 / 费曼检验 / 模拟考试 / 今日一题。"""
 import json
+import logging
+import re
 import time
 
 from . import bkt_fit, db, difficulty, experts, learning_methods, llm, rag, velocity
+
+log = logging.getLogger("studypilot.skills")
 
 
 def _as_list(data) -> list:
@@ -17,14 +21,41 @@ def _as_list(data) -> list:
     return []
 
 
+def _rag_context(space_id: str, topic: str, top_k: int = 8, budget: int | None = None,
+                 empty_note: str = "（无讲义片段）") -> str:
+    """检索讲义并拼装 prompt 上下文：4 个技能共用同一段「检索 + 预算 + 兜底」样板。"""
+    if budget is None:
+        budget = max(2000, experts.settings.max_context_chars - 1500)
+    hits = rag.retrieve(space_id, topic, top_k=top_k)
+    return rag.build_context(hits, budget=budget) if hits else empty_note
+
+
 def _public_questions(questions: list[dict]) -> list[dict]:
-    """下发题目给前端时隐藏标准答案（判卷在服务端做，作答前不应泄露）。"""
-    return [{k: v for k, v in q.items() if k != "answer"} for q in questions]
+    """下发题目给前端时隐藏标准答案（判卷在服务端做，作答前不应泄露）。
+    同时补齐缺省字段：题库旧行/模型漏字段可能没有 options，前端 q.options.length 会崩。"""
+    out = []
+    for q in questions:
+        clean = {k: v for k, v in q.items() if k != "answer"}
+        clean["type"] = clean.get("type") or "简答"
+        clean["knowledge_point"] = clean.get("knowledge_point") or ""
+        opts = clean.get("options")
+        clean["options"] = [str(o) for o in opts] if isinstance(opts, list) else []
+        out.append(clean)
+    return out
 
 
 # ---------- quiz.generate ----------
 
-def quiz_generate(space_id: str, topic: str, count: int = 5) -> list[dict]:
+def _emit(progress, label: str):
+    """SSE 进度埋点：progress 由流式端点注入；同步调用（progress=None）时是空操作。"""
+    if progress:
+        try:
+            progress(label)
+        except Exception:
+            pass
+
+
+def quiz_generate(space_id: str, topic: str, count: int = 5, progress=None) -> list[dict]:
     # 1. 先查题库：命中已有题则复用（省 token + 风格稳定）
     topic_points = [p.strip() for p in (topic or "").replace("；", ";").replace("、", ";").split(";") if p.strip()]
     bank_hits = db.query_question_bank(space_id, topic_points or ["核心"], limit=count) if topic_points else []
@@ -38,12 +69,13 @@ def quiz_generate(space_id: str, topic: str, count: int = 5) -> list[dict]:
     # 2. 不足部分调 LLM 生成，注入 ZPD 难度指导
     generated = []
     if remaining > 0:
-        hits = rag.retrieve(space_id, topic or "课程核心概念", top_k=8)
-        budget = max(2000, experts.settings.max_context_chars - 1500)
-        context = rag.build_context(hits, budget=budget) if hits else "（无讲义片段，按通识出题）"
+        _emit(progress, "正在检索讲义…")
+        context = _rag_context(space_id, topic or "课程核心概念", top_k=8,
+                               empty_note="（无讲义片段，按通识出题）")
         # ZPD 难度分层：根据掌握度推荐难度分布
         diff_rec = difficulty.recommend_for_space(space_id, topic_points or None)
         diff_guide = difficulty.format_for_prompt(diff_rec)
+        _emit(progress, f"正在生成 {remaining} 道题…（本地模型约 1 分钟）")
         questions = _as_list(llm.chat_json([
             {"role": "system", "content": experts.EXPERTS["examiner"]["system"] + diff_guide},
             {"role": "user", "content": (
@@ -59,6 +91,7 @@ def quiz_generate(space_id: str, topic: str, count: int = 5) -> list[dict]:
     all_questions = reused + generated
     if not all_questions:
         raise ValueError("出题结果格式异常")
+    _emit(progress, "正在入库…")
     qid = db.save_quiz(space_id, topic, all_questions)
     return [{"quiz_id": qid, "questions": _public_questions(all_questions),
              "reused_count": len(reused), "generated_count": len(generated)}]
@@ -68,6 +101,55 @@ def quiz_generate(space_id: str, topic: str, count: int = 5) -> list[dict]:
 
 _VERDICT_TO_MASTERY = {"对": "correct", "部分对": "partial", "错": "wrong"}
 
+_JUDGE_TRUE = {"对", "正确", "t", "true", "√", "是", "yes", "y", "a", "right"}
+_JUDGE_FALSE = {"错", "错误", "f", "false", "×", "x", "否", "no", "n", "b", "wrong"}
+
+
+def _norm_answer_text(s: str) -> str:
+    """答案规范化：全角→半角、去空白与常见分隔符、小写。用于客观题确定性比对
+    （「Ａ」vs「A」、「AB」vs「A、B」应视为一致）。"""
+    import unicodedata
+    t = unicodedata.normalize("NFKC", str(s or "")).strip().lower()
+    return re.sub(r"[\s,，、;；.。()（）\"']+", "", t)
+
+
+def _norm_verdict(v: str) -> str:
+    """判卷 verdict 归一化：模型输出「正确/True/√」等都收拢到 对/部分对/错 三值，
+    否则任何非「对」字面量都会被当错题计分并写入错题记忆。"""
+    t = str(v or "").strip().lower()
+    if "部分" in t:  # 部分(正确/对/得分) → 部分对；必须先于「对」判断
+        return "部分对"
+    if "对" in t or "正确" in t or t in ("true", "t", "yes", "√", "right"):
+        return "对"
+    return "错"
+
+
+def _deterministic_grade(q: dict, user: str) -> str | None:
+    """客观题（选择/判断）规范化比对：确定答对时直接判「对」，不再依赖 LLM——
+    温度 0.2 的判卷模型也会把「正确」误判成错题，脏样本会写进掌握度/错题本。
+    只做肯定判断；不一致时仍交 LLM（保留部分对与归因分析的空间）。返回 None 表示需 LLM。"""
+    qtype = str(q.get("type") or "")
+    ans = str(q.get("answer") or "")
+    if not user.strip() or not ans.strip():
+        return None
+    u, a = _norm_answer_text(user), _norm_answer_text(ans)
+    if not u or not a:
+        return None
+    if "判断" in qtype:
+        def _tf(x: str) -> str | None:
+            if x in _JUDGE_TRUE:
+                return "对"
+            if x in _JUDGE_FALSE:
+                return "错"
+            return None
+        uu, aa = _tf(u), _tf(a)
+        if uu and aa:
+            return "对" if uu == aa else None
+        return None
+    if "选择" in qtype:
+        return "对" if u == a else None
+    return None
+
 
 def quiz_grade(space_id: str, quiz_id: str, answers: list[dict]) -> dict:
     quizzes = {q["id"]: q for q in db.list_quizzes(space_id)}
@@ -75,38 +157,57 @@ def quiz_grade(space_id: str, quiz_id: str, answers: list[dict]) -> dict:
     if not quiz:
         raise ValueError("测验不存在")
     questions = {q["id"]: q for q in quiz["questions"]}
-    results = _as_list(llm.chat_json([
-        {"role": "system", "content": experts.EXPERTS["grader"]["system"] + (
-            "\n\n【三层归因要求】对每道错题，从三个层面分析："
-            "1) 知识层（knowledge_layer）：概念本身不会/前置知识缺失/公式记错；"
-            "2) 策略层（strategy_layer）：方法选错/步骤跳步/时间分配不当；"
-            "3) 认知层（cognitive_layer）：审题偏差/思维定式/粗心大意。"
-            "在 error_type 中填最核心的那一层标签，在 analysis 中简述三层归因。"
-            "学生答案过短或过于模糊时，evidence_quality 标为 low，不要强行归因。")},
-        {"role": "user", "content": (
-            "题目与标准答案：" + json.dumps(quiz["questions"], ensure_ascii=False) +
-            "\n学生答案：" + json.dumps(answers, ensure_ascii=False) +
-            "\n输出 JSON 数组：[{\"qid\":\"...\",\"verdict\":\"对|错|部分对\","
-            "\"error_type\":\"概念误解|计算失误|记忆模糊|审题错误|\","
-            "\"error_layer\":\"知识层|策略层|认知层|\","
-            "\"evidence_quality\":\"high|low|\","
-            "\"analysis\":\"错误根因与正确思路（50字内）\",\"knowledge_point\":\"...\"}]，"
-            "答对的题 error_type 和 error_layer 为空字符串；"
-            "学生答案过短（<5字）或明显未认真作答时 evidence_quality 填 low。"
-            "不要多余文字。")},
-    ], temperature=0.2, max_tokens=1600, task="grade"))
-    if not results:
+    # 客观题先程序化判对；其余（简答/不一致/存疑）才交给模型
+    pre_results, pending = [], []
+    for a in answers or []:
+        q = questions.get(a.get("qid"))
+        if not q:
+            continue
+        user = a.get("answer") or a.get("user_answer") or ""
+        if _deterministic_grade(q, user) == "对":
+            pre_results.append({"qid": a["qid"], "verdict": "对", "error_type": "",
+                                "error_layer": "", "evidence_quality": "",
+                                "analysis": "", "knowledge_point": q.get("knowledge_point", ""),
+                                "user_answer": user, "correct_answer": q.get("answer", "")})
+        else:
+            pending.append(a)
+    results: list[dict] = []
+    if pending:
+        pending_qids = {a.get("qid") for a in pending}
+        judge_questions = [q for q in quiz["questions"] if q["id"] in pending_qids]
+        results = _as_list(llm.chat_json([
+            {"role": "system", "content": experts.EXPERTS["grader"]["system"] + (
+                "\n\n【三层归因要求】对每道错题，从三个层面分析："
+                "1) 知识层（knowledge_layer）：概念本身不会/前置知识缺失/公式记错；"
+                "2) 策略层（strategy_layer）：方法选错/步骤跳步/时间分配不当；"
+                "3) 认知层（cognitive_layer）：审题偏差/思维定式/粗心大意。"
+                "在 error_type 中填最核心的那一层标签，在 analysis 中简述三层归因。"
+                "学生答案过短或过于模糊时，evidence_quality 标为 low，不要强行归因。")},
+            {"role": "user", "content": (
+                "题目与标准答案：" + json.dumps(judge_questions, ensure_ascii=False) +
+                "\n学生答案：" + json.dumps(pending, ensure_ascii=False) +
+                "\n输出 JSON 数组：[{\"qid\":\"...\",\"verdict\":\"对|错|部分对\","
+                "\"error_type\":\"概念误解|计算失误|记忆模糊|审题错误|\","
+                "\"error_layer\":\"知识层|策略层|认知层|\","
+                "\"evidence_quality\":\"high|low|\","
+                "\"analysis\":\"错误根因与正确思路（50字内）\",\"knowledge_point\":\"...\"}]，"
+                "答对的题 error_type 和 error_layer 为空字符串；"
+                "学生答案过短（<5字）或明显未认真作答时 evidence_quality 填 low。"
+                "不要多余文字。")},
+        ], temperature=0.2, max_tokens=1600, task="grade"))
+    if not results and not pre_results:
         raise ValueError("判卷结果格式异常")
     # 只保留与本卷题目对应且不重复的判卷结果：模型漏判/幻觉 qid 时
     # 分数分母仍按总题数算，错题统计也不会被垃圾行虚增
-    user_by_qid = {a.get("qid"): (a.get("answer") or a.get("user_answer") or "") for a in answers}
+    user_by_qid = {a.get("qid"): (a.get("answer") or a.get("user_answer") or "") for a in answers or []}
     clean, seen = [], set()
-    for r in results:
+    for r in list(results) + pre_results:
         if not isinstance(r, dict) or r.get("qid") not in questions or r["qid"] in seen:
             continue
         seen.add(r["qid"])
-        r["user_answer"] = user_by_qid.get(r.get("qid"), "")
-        r["correct_answer"] = questions[r["qid"]].get("answer", "")
+        r["verdict"] = _norm_verdict(r.get("verdict"))
+        r["user_answer"] = r.get("user_answer") or user_by_qid.get(r.get("qid"), "")
+        r["correct_answer"] = r.get("correct_answer") or questions[r["qid"]].get("answer", "")
         clean.append(r)
     results = clean
     db.update_quiz(quiz_id, results)
@@ -155,6 +256,8 @@ def quiz_grade(space_id: str, quiz_id: str, answers: list[dict]) -> dict:
         db.add_message(space_id, "craft", "assistant",
                        f"【方法跟进】\n{followup}", expert="学习方法教练")
     except Exception:
+        # 判卷主流程已完成；校准/跟进属增强信息，失败只降级不中断，但要留痕
+        log.warning("判卷后的校准/方法跟进写入失败（quiz=%s）", quiz_id, exc_info=True)
         followup = learning_methods.grade_followup(results, space_id=space_id)
     return {"quiz_id": quiz_id, "results": results,
             "score": f"{correct}/{len(questions)}",
@@ -173,8 +276,13 @@ def wrong_redo(space_id: str, qids: list[str] | None = None) -> list[dict]:
         pool = [q for q in pool if q["id"] in wanted]
     if not pool:
         raise ValueError("没有可重做的错题")
-    questions = [{k: q[k] for k in ("id", "type", "question", "options", "answer", "knowledge_point")}
+    # 错题本旧行可能缺 options/answer 等字段（判卷时已尽力补齐），不能裸 q[k]
+    questions = [{k: q.get(k, [] if k == "options" else "")
+                  for k in ("id", "type", "question", "options", "answer", "knowledge_point")}
                  for q in pool]
+    questions = [q for q in questions if q["question"]]
+    if not questions:
+        raise ValueError("没有可重做的错题")
     qid = db.save_quiz(space_id, f"错题重做（{len(questions)}题）", questions)
     return [{"quiz_id": qid, "questions": _public_questions(questions), "redo_count": len(questions)}]
 
@@ -230,7 +338,7 @@ def _sample_interleaved_points(space_id: str, count: int = 5) -> list[str]:
     return seen[:count] if seen else []
 
 
-def review_generate(space_id: str, count: int = 5) -> list[dict]:
+def review_generate(space_id: str, count: int = 5, progress=None) -> list[dict]:
     """从到期/最薄弱的知识点出复习题；知识点交错混合，贴近考试检索。"""
     due = db.due_points(space_id)
     pool = due or db.weak_points(space_id, 5)
@@ -238,7 +346,7 @@ def review_generate(space_id: str, count: int = 5) -> list[dict]:
     if not points:
         points = [p["point"] for p in pool[:5]]
     topic = "；".join(points) if points else ""
-    made = quiz_generate(space_id, topic or "课程核心概念", count)
+    made = quiz_generate(space_id, topic or "课程核心概念", count, progress=progress)
     made[0]["review_points"] = points
     made[0]["interleaved"] = True
     made[0]["topic"] = f"交错复习：{topic[:60]}" if points else "综合复习"
@@ -248,13 +356,13 @@ def review_generate(space_id: str, count: int = 5) -> list[dict]:
 
 # ---------- 模拟考试 ----------
 
-def exam_mock(space_id: str, count: int = 10, minutes: int = 30) -> list[dict]:
+def exam_mock(space_id: str, count: int = 10, minutes: int = 30, progress=None) -> list[dict]:
     """按掌握度交错采样组卷（到期+薄弱+中等），前端限时作答。"""
     points = _sample_interleaved_points(space_id, count=max(5, min(count, 12)))
     if not points:
         points = [p["point"] for p in db.weak_points(space_id, 8)]
     topic = "、".join(points) if points else "课程核心概念"
-    made = quiz_generate(space_id, topic, count)
+    made = quiz_generate(space_id, topic, count, progress=progress)
     db.set_quiz_topic(made[0]["quiz_id"], "模拟考试（交错）")
     made[0]["topic"] = "模拟考试（交错）"
     made[0]["exam_minutes"] = minutes
@@ -266,14 +374,15 @@ def exam_mock(space_id: str, count: int = 10, minutes: int = 30) -> list[dict]:
 
 # ---------- 闪卡 ----------
 
-def flashcard_generate(space_id: str, topic: str = "", count: int = 10) -> dict:
+def flashcard_generate(space_id: str, topic: str = "", count: int = 10, progress=None) -> dict:
     """从讲义片段生成问答闪卡；混入精细追问「指令卡」促进生成式加工。"""
     if not topic:
         weak = db.weak_points(space_id, 5)
         topic = "、".join(p["point"] for p in weak) if weak else "课程核心概念"
-    hits = rag.retrieve(space_id, topic, top_k=8)
-    budget = max(2000, experts.settings.max_context_chars - 1500)
-    context = rag.build_context(hits, budget=budget) if hits else "（无讲义片段，按通识生成）"
+    _emit(progress, "正在检索讲义…")
+    context = _rag_context(space_id, topic, top_k=8,
+                           empty_note="（无讲义片段，按通识生成）")
+    _emit(progress, "正在生成闪卡…（本地模型约 1 分钟）")
     cards = _as_list(llm.chat_json([
         {"role": "system", "content": (
             "你是记忆卡片设计师。依据讲义片段生成闪卡，输出严格 JSON 数组，每项："
@@ -287,6 +396,7 @@ def flashcard_generate(space_id: str, topic: str = "", count: int = 10) -> dict:
     if not cards:
         raise ValueError("闪卡生成格式异常")
     cards = [c for c in cards if isinstance(c, dict) and c.get("front") and c.get("back")]
+    _emit(progress, "正在入库…")
     added = db.add_flashcards(space_id, cards[:count])
     n_inst = sum(1 for c in added if (c.get("kind") or "") == "instruction")
     return {"cards": added, "count": len(added), "instruction_cards": n_inst,
@@ -297,8 +407,7 @@ def flashcard_generate(space_id: str, topic: str = "", count: int = 10) -> dict:
 
 def teach_check(space_id: str, topic: str, explanation: str) -> dict:
     """学生用自己的话讲解概念，判卷专家评估理解质量并更新掌握度。"""
-    hits = rag.retrieve(space_id, topic, top_k=4)
-    context = rag.build_context(hits, budget=2500) if hits else "（无讲义片段）"
+    context = _rag_context(space_id, topic, top_k=4, budget=2500)
     data = llm.chat_json([
         {"role": "system", "content": (
             "你是严谨的学科助教，评估学生用自己的话对概念的讲解（费曼技巧）。"
@@ -327,9 +436,8 @@ def note_summarize(space_id: str, document_id: str) -> str:
     doc = db.get_document(document_id)
     if not doc:
         raise ValueError("文档不存在")
-    from . import rag as rag_mod
-    text = rag_mod.parse_file(doc["path"], doc["filename"])
-    chunks = rag_mod.chunk_text(text)
+    text = rag.parse_file(doc["path"], doc["filename"])
+    chunks = rag.chunk_text(text)
     if not chunks:
         raise ValueError("文档没有可解析的文本内容，无法总结")
     # 分段摘要后合并（长文档 map-reduce）
@@ -355,11 +463,12 @@ def note_summarize(space_id: str, document_id: str) -> str:
 
 # ---------- plan.study（结构化任务版） ----------
 
-def plan_study(space_id: str, goal: str) -> dict:
+def plan_study(space_id: str, goal: str, progress=None) -> dict:
     """生成结构化学习计划：拆为阶段任务（含截止日期）存库可打卡，同时渲染 Markdown 存入对话。"""
     memory_ctx = experts.build_memory_context(space_id) or "（暂无学习记录）"
     today = time.strftime("%Y-%m-%d")
     method_block = learning_methods.planner_prompt_block(space_id)
+    _emit(progress, "正在按薄弱点拆解阶段任务…（本地模型约 1 分钟）")
     data = llm.chat_json([
         {"role": "system", "content": experts.EXPERTS["planner"]["system"] + method_block +
             "\n输出严格 JSON：{\"summary\":\"总方针(40字内)\",\"phases\":[{\"name\":\"阶段名（含时间范围，如：第1-2周）\","
@@ -393,6 +502,7 @@ def plan_study(space_id: str, goal: str) -> dict:
                           "points": t.get("points") or []})
     if not tasks:
         raise ValueError("计划生成格式异常")
+    _emit(progress, "正在入库…")
     db.replace_plan_tasks(space_id, tasks)
 
     # 从归一化后的任务渲染（此前直接遍历模型原始输出，due 键错位导致计划永不显示截止日期）
@@ -416,7 +526,7 @@ def plan_study(space_id: str, goal: str) -> dict:
 
 # ---------- graph.build（知识图谱构建：讲义抽取 + 内置课程图谱合并） ----------
 
-def graph_build(space_id: str) -> dict:
+def graph_build(space_id: str, progress=None) -> dict:
     """构建空间的知识点依赖图：LLM 从已有知识点与讲义片段中抽取前置关系，
     再用内置课程图谱模糊匹配补边。BKT 掌握度 + 该图共同驱动缺陷诊断。"""
     from . import defects
@@ -424,8 +534,9 @@ def graph_build(space_id: str) -> dict:
     if len(points) < 2:
         raise ValueError("空间知识点太少（至少 2 个），先做几次测验或对话反馈")
     valid = set(points)
-    hits = rag.retrieve(space_id, "、".join(points[:6]) + " 核心概念 基础 前置", top_k=10)
-    context = rag.build_context(hits, budget=3000) if hits else "（无讲义片段）"
+    _emit(progress, "正在检索讲义…")
+    context = _rag_context(space_id, "、".join(points[:6]) + " 核心概念 基础 前置", top_k=10, budget=3000)
+    _emit(progress, "正在抽取前置关系…（本地模型约 1 分钟）")
     data = llm.chat_json([
         {"role": "system", "content": (
             "你是学科教研专家，梳理知识点的前置依赖关系：如果掌握 A 是学会 B 的前提，"

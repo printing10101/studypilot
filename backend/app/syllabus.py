@@ -316,12 +316,22 @@ def program(school: str, major: str) -> dict:
     merged["coverage"] = "+".join(flags)
     merged["custom_source"] = (custom or {}).get("source", "") if custom_data else ""
     merged["official_source"] = bool(override)
-    merged["has_fulltext"] = bool(override and override.get("source_file")
-                                  and os.path.isfile(os.path.join(HANDBOOK_DIR, override["source_file"])))
+    merged["has_fulltext"] = bool(override and _fulltext_path(override))
     if school_info:
         merged.setdefault("paths", {})
         merged["school_strong"] = school_info.get("strong", [])
     return merged
+
+
+def _fulltext_path(override: dict) -> str | None:
+    """解析官方方案全文路径：必须在 handbooks/ 目录内（source_file 含 .. 时拒绝）。"""
+    src = override.get("source_file") or ""
+    if not src:
+        return None
+    path = os.path.join(HANDBOOK_DIR, src)
+    if not os.path.realpath(path).startswith(HANDBOOK_DIR + os.sep) or not os.path.isfile(path):
+        return None
+    return path
 
 
 def full_text(school: str, major: str) -> dict:
@@ -331,9 +341,8 @@ def full_text(school: str, major: str) -> dict:
     override = _match_override(school_name, major) if school_name else None
     if not override:
         return {}
-    path = os.path.join(HANDBOOK_DIR, override.get("source_file") or "")
-    if not override.get("source_file") or not os.path.realpath(path).startswith(HANDBOOK_DIR + os.sep) \
-            or not os.path.isfile(path):
+    path = _fulltext_path(override)
+    if not path:
         return {}
     with open(path, encoding="utf-8") as f:
         text = f.read()

@@ -10,9 +10,12 @@
 """
 import difflib
 import json
+import logging
 import os
 
 from . import db
+
+log = logging.getLogger("studypilot.defects")
 
 CURRICULUM_DIR = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "curriculum"))
 
@@ -115,18 +118,26 @@ def _downstream_map(edges: list[dict]) -> dict[str, list[str]]:
     return out
 
 
-def _error_type_stats(space_id: str, point: str) -> dict[str, int]:
-    """从历史判卷结果里聚合该知识点的错因类型（错题记录中 knowledge_point 模糊匹配）。"""
-    stats: dict[str, int] = {}
+def _error_stats_bulk(space_id: str, points: list[str]) -> dict[str, dict[str, int]]:
+    """一次全量扫描聚合所有知识点的错因类型（错题记录中 knowledge_point 模糊匹配）。
+
+    匹配用「相等或互相包含，否则 ratio≥0.65」：纯 0.5 阈值会把「导数应用/导数定义」
+    这类相近名错因互相串扰。诊断循环里每个点都要用它（方法推荐 + evidence），
+    逐点各自全量扫描会把测验 JSON 重复解析 点数× 遍。
+    """
+    stats: dict[str, dict[str, int]] = {p: {} for p in points}
     for q in db.list_quizzes(space_id):
         for a in q["answers"]:
             kp = a.get("knowledge_point", "")
             if a.get("verdict") == "对" or not kp:
                 continue
-            if difflib.SequenceMatcher(None, kp, point).ratio() >= 0.5:
-                et = (a.get("error_type") or "").strip()
-                if et:
-                    stats[et] = stats.get(et, 0) + 1
+            et = (a.get("error_type") or "").strip()
+            if not et:
+                continue
+            for point in points:
+                if kp == point or kp in point or point in kp \
+                        or difflib.SequenceMatcher(None, kp, point).ratio() >= 0.65:
+                    stats[point][et] = stats[point].get(et, 0) + 1
     return stats
 
 
@@ -150,6 +161,7 @@ def diagnose(space_id: str) -> dict:
         eff = {k: max(0.0, min(1.0, v)) for k, v in new_eff.items()}
 
     diagnosed = []
+    et_by_point = _error_stats_bulk(space_id, [p["point"] for p in points])
     for p in points:
         if p["status"] == "mastered":
             continue
@@ -173,9 +185,9 @@ def diagnose(space_id: str) -> dict:
         if p["wrong"] >= 2 and p["wrong"] >= p["correct"]:
             note_parts.append(f"已错 {p['wrong']} 次，进入重点盯防")
         # 证据导向方法：错因 → 方法；无错因时按掌握档位
+        et_stats = et_by_point.get(name) or {}
         try:
             from . import learning_methods
-            et_stats = _error_type_stats(space_id, name)
             if et_stats:
                 primary_et = max(et_stats, key=et_stats.get)
                 recs = learning_methods.methods_for_error(primary_et, limit=2)
@@ -189,7 +201,7 @@ def diagnose(space_id: str) -> dict:
             elif p_known >= 0.75:
                 note_parts.append("方法：交错变式 + 合意困难（换情境/混题型）")
         except Exception:
-            pass
+            log.warning("缺陷诊断的方法推荐计算失败（space=%s point=%s）", space_id, name, exc_info=True)
         diagnosed.append({
             "point": name,
             "p_known": round(p_known, 3),
@@ -202,7 +214,7 @@ def diagnose(space_id: str) -> dict:
             "evidence": {
                 "attempts": p["attempts"], "wrong": p["wrong"], "correct": p["correct"],
                 "box": p["box"], "due_in_hours": round((p["due_at"] - t) / 3600.0, 1),
-                "error_types": _error_type_stats(space_id, name),
+                "error_types": et_stats,
             },
             "note": "；".join(note_parts),
         })

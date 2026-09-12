@@ -296,12 +296,18 @@ def _deadline_from(timeline: str, goal: str) -> tuple[datetime.date | None, str]
     默认取下一年初试，避免把大二大三当成临考生；就业/出国同理取下一个毕业季。
     """
     t = timeline or ""
-    m = re.search(r"(20\d{2})[年./-](\d{1,2})[月./-](\d{1,2})", t)
-    if m:
-        return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3))), t.strip()
-    m = re.search(r"(20\d{2})[年./-](\d{1,2})月?", t)
-    if m:
-        return datetime.date(int(m.group(1)), int(m.group(2)), 15), t.strip()
+    # 数字后加 (?!\d) 防止区间日期（"2025年12月-2026年1月"）把下个年份的前两位当成日；
+    # 解析出月/日越界的候选直接跳过（"2025-2026学年" 会匹配出 month=20）
+    for m in re.finditer(r"(20\d{2})[年./-](\d{1,2})(?!\d)[月./-](\d{1,2})(?!\d)", t):
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3))), t.strip()
+        except ValueError:
+            continue
+    for m in re.finditer(r"(20\d{2})[年./-](\d{1,2})月?(?!\d)", t):
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), 15), t.strip()
+        except ValueError:
+            continue
     today = datetime.date.today()
     if goal in ("考研", "推免"):
         year = today.year + (1 if today.month >= 9 else 0)
@@ -417,12 +423,14 @@ def analyze(profile: dict, goal: str = "", use_llm: bool = True) -> dict:
     # 保底：即便没有完全达标的，也把时间可行的最高分项提进 tier1，保证给出"至少参加谁"的答案
     if not tier1:
         for p in picks:
-            if p["feasible"] and p not in tier2 or (p in tier2 and p["value"] >= 3):
-                if p["feasible"]:
-                    tier1.append(p)
-                    if p in tier2:
-                        tier2.remove(p)
-                    break
+            if not p["feasible"]:
+                continue
+            if p in tier2 and p["value"] < 3:
+                continue
+            tier1.append(p)
+            if p in tier2:
+                tier2.remove(p)
+            break
 
     result = {
         "goal": goal_path,

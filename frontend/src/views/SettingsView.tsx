@@ -11,6 +11,9 @@ export function SettingsView() {
   const [baseUrl, setBaseUrl] = useState('')
   const [model, setModel] = useState('')
   const [apiKey, setApiKey] = useState('')
+  const [localBaseUrl, setLocalBaseUrl] = useState('')
+  const [localModel, setLocalModel] = useState('')
+  const [localApiKey, setLocalApiKey] = useState('')
   const [busy, setBusy] = useState('')
   const [testResult, setTestResult] = useState<Record<string, { ok: boolean; latency_ms?: number; error?: string }> | null>(null)
   const [mcps, setMcps] = useState<{ name: string; command: string[] }[]>([])
@@ -20,13 +23,16 @@ export function SettingsView() {
   const [skills, setSkills] = useState<{ id: string; name: string }[]>([])
   const [curricula, setCurricula] = useState<CurriculumMeta[]>([])
   const [usage, setUsage] = useState<UsageDashboard | null>(null)
+  const [cfgLoaded, setCfgLoaded] = useState(false)  // 配置未加载完成前禁止保存，防空值覆盖云端配置
 
   const refreshMcp = () => api.connectors().then((c) => setMcps(c.mcp)).catch(() => {})
   const refreshUsage = () => api.llmUsage(30).then(setUsage).catch(() => setUsage(null))
   useEffect(() => {
     api.llmConfig().then((s) => {
       setStatus(s); setRouting(s.routing); setBaseUrl(s.cloud.base_url); setModel(s.cloud.model)
-    }).catch(() => {})
+      setLocalBaseUrl(s.local.base_url); setLocalModel(s.local.model)
+      setCfgLoaded(true)
+    }).catch(() => setCfgLoaded(true))  // 失败也放行保存，但 baseUrl/model 保持原样不动
     refreshMcp()
     refreshUsage()
     api.listExperts().then(setExperts).catch(() => {})
@@ -53,6 +59,12 @@ export function SettingsView() {
   }
 
   const save = async () => {
+    if (!cfgLoaded) {
+      // 配置读取完成前，baseUrl/model 还是空字符串：无条件提交会把已配置的
+      // 云端端点/模型名清空（apiKey 已有条件展开保护，这两项此前没有）
+      toast('warn', '配置尚未加载完成，请稍后再保存')
+      return
+    }
     setBusy('save')
     try {
       const s = await api.updateLlmConfig({
@@ -60,15 +72,28 @@ export function SettingsView() {
         cloud_base_url: baseUrl,
         cloud_model: model,
         ...(apiKey ? { cloud_api_key: apiKey } : {}),
+        // 本地端点：与默认值一致时不提交，避免把 .env 配置固化进运行时配置
+        ...(localBaseUrl !== (status?.local.base_url || '') ? { local_base_url: localBaseUrl } : {}),
+        ...(localModel !== (status?.local.model || '') ? { local_model: localModel } : {}),
+        ...(localApiKey ? { local_api_key: localApiKey } : {}),
       })
-      setStatus(s); setApiKey(''); toast('success', '模型配置已保存')
+      setStatus(s); setApiKey(''); setLocalApiKey('')
+      toast('success', '模型配置已保存')
     } catch (e: any) { toast('error', e.message) }
     setBusy('')
   }
 
   const test = async () => {
     setBusy('test')
-    try { setTestResult(await api.testLlm()) } catch (e: any) { toast('error', e.message) }
+    try {
+      // 携带表单当前值测试：此前只测已保存配置，新填端点直接点测试会误报「不通」
+      setTestResult(await api.testLlm({
+        local_base_url: localBaseUrl, local_model: localModel,
+        ...(localApiKey ? { local_api_key: localApiKey } : {}),
+        cloud_base_url: baseUrl, cloud_model: model,
+        ...(apiKey ? { cloud_api_key: apiKey } : {}),
+      }))
+    } catch (e: any) { toast('error', e.message) }
     setBusy('')
   }
 
@@ -89,18 +114,29 @@ export function SettingsView() {
       <div className="card" style={{ marginBottom: 18 }}>
         <h3>模型设置 · 本地 / 云端双通道</h3>
         <p className="sub">
-          本地通道始终可用（{status?.local.model || '…'}）；配置云端 OpenAI 兼容 API 后，
-          可按任务把重推理交给云端，日常答疑保持本地低延迟。云端密钥仅保存在本机 data 目录。
+          本地通道连接本机或局域网的 OpenAI 兼容服务（llama-server / Ollama / LM Studio），
+          端口或模型名不同就在下方改成对应值；配置云端 API 后，可按任务把重推理交给云端。
+          密钥仅保存在本机 data 目录。模型没连上时，先在下方「测试连通」定位问题。
         </p>
         <div style={{ display: 'grid', gap: 10, margin: '16px 0', maxWidth: 640 }}>
           {ROUTES.map(([v, t, d]) => (
-            <label key={v} className="route-opt" style={{ display: 'flex', gap: 10, alignItems: 'flex-start', cursor: 'pointer' }}>
-              <input type="radio" name="routing" checked={routing === v} onChange={() => setRouting(v)} style={{ marginTop: 3 }} />
+            <label key={v} style={{ display: 'flex', gap: 10, alignItems: 'flex-start', cursor: cfgLoaded ? 'pointer' : 'wait' }}>
+              <input type="radio" name="routing" checked={routing === v} onChange={() => setRouting(v)} style={{ marginTop: 3 }} disabled={!cfgLoaded} />
               <span><b>{t}</b><span style={{ color: 'var(--muted)' }}>　{d}</span></span>
             </label>
           ))}
         </div>
-        <div style={{ display: 'grid', gap: 10, maxWidth: 640 }}>
+        <b style={{ fontSize: 13 }}>本地通道</b>
+        <div style={{ display: 'grid', gap: 10, maxWidth: 640, margin: '8px 0 16px' }}>
+          <input type="text" placeholder="本地服务地址（如 http://127.0.0.1:8080/v1 或 http://127.0.0.1:11434/v1）"
+            value={localBaseUrl} onChange={(e) => setLocalBaseUrl(e.target.value)} />
+          <input type="text" placeholder="本地模型名（如 qwen2.5:7b，Ollama 用 ollama list 查看）"
+            value={localModel} onChange={(e) => setLocalModel(e.target.value)} />
+          <input type="password" placeholder={status?.local.api_key_masked || '本地 API Key（通常留空即可）'}
+            value={localApiKey} onChange={(e) => setLocalApiKey(e.target.value)} />
+        </div>
+        <b style={{ fontSize: 13 }}>云端通道（可选）</b>
+        <div style={{ display: 'grid', gap: 10, maxWidth: 640, margin: '8px 0' }}>
           <input type="text" placeholder="云端 API 地址（如 https://api.openai.com/v1 或国内兼容端点）"
             value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
           <input type="text" placeholder="云端模型名（如 gpt-4o-mini / deepseek-chat）"
@@ -209,7 +245,7 @@ export function SettingsView() {
                 <tr key={m.name}>
                   <td><b>{m.name}</b></td>
                   <td style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>{m.command.join(' ')}</td>
-                  <td><button className="btn danger small" onClick={() => delMcp(m.name)}><Icon name="trash" size={12} /></button></td>
+                  <td><button className="btn danger small" onClick={() => delMcp(m.name)} aria-label={`移除 MCP server ${m.name}`}><Icon name="trash" size={12} /></button></td>
                 </tr>
               ))}
             </tbody>

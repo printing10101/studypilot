@@ -3,6 +3,7 @@
 - local_folder：本地文件夹导入（内置）
 - mcp：MCP 标准协议客户端骨架，可挂载外部 MCP server
 """
+import atexit
 import json
 import os
 import queue
@@ -70,6 +71,27 @@ class McpClient:
             # server 挂起时整个聊天请求都会被卡死
             threading.Thread(target=self._pump, daemon=True, name=f"mcp-{self.name}").start()
 
+    def stop(self) -> None:
+        """终止子进程并回收资源：terminate 不够时升级 kill，防止 npx 等
+        wrapper 场景留下孤儿进程。注册重名覆盖/移除/应用退出时都必须调用。"""
+        proc, self._proc = self._proc, None
+        self._inited = False
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
     def _pump(self) -> None:
         try:
             assert self._proc and self._proc.stdout
@@ -97,7 +119,10 @@ class McpClient:
                 except queue.Empty:
                     raise RuntimeError(f"MCP server {self.name} 响应超时（>{int(timeout)}s）")
                 if not line:
-                    raise RuntimeError(f"MCP server {self.name} 无响应（进程已退出）")
+                    # server 进程已退出：复位状态，下次调用自动重启，而不是永久报错到重启应用
+                    self._proc = None
+                    self._inited = False
+                    raise RuntimeError(f"MCP server {self.name} 无响应（进程已退出，将自动重启）")
                 try:
                     msg = json.loads(line)
                 except ValueError:
@@ -159,6 +184,13 @@ def register_mcp(name: str, command: list[str]) -> None:
         raise ValueError("启动命令不能为空")
     if len(command) > 32:
         raise ValueError("启动命令参数过多（上限 32 个）")
+    # 先停掉同名旧实例再覆盖：直接覆盖会泄漏旧 MCP 子进程
+    old = _mcp_servers.get(name)
+    if old is not None:
+        try:
+            old.stop()
+        except Exception:
+            pass
     _mcp_servers[name] = McpClient(name, command)
     _invalidate_tools_cache()
     db.set_meta(_MCP_META_KEY, json.dumps(
@@ -170,14 +202,23 @@ def remove_mcp(name: str) -> bool:
         return False
     client = _mcp_servers.pop(name)
     try:
-        if client._proc:
-            client._proc.terminate()
+        client.stop()  # terminate+wait+kill 兜底，防孤儿进程
     except Exception:
         pass
     _invalidate_tools_cache()
     db.set_meta(_MCP_META_KEY, json.dumps(
         {n: c.command for n, c in _mcp_servers.items()}, ensure_ascii=False))
     return True
+
+
+@atexit.register
+def _shutdown_mcp_servers() -> None:
+    """应用退出时回收所有 MCP 子进程，不留孤儿。"""
+    for client in list(_mcp_servers.values()):
+        try:
+            client.stop()
+        except Exception:
+            pass
 
 
 _TOOLS_TTL = 300.0  # 工具清单缓存 5 分钟，避免每条聊天消息都同步拉一遍 list_tools
@@ -195,22 +236,26 @@ def _invalidate_tools_cache() -> None:
 def all_tools() -> list[dict]:
     """汇总所有已注册 server 的工具清单：[{server, name, description}]。
 
-    带缓存（TTL 5 分钟），单个 server 失败/超时只影响它自己的工具。"""
+    带缓存（TTL 5 分钟），单个 server 失败/超时只影响它自己的工具。
+    锁只护缓存读写：list_tools 是最长 15s 的阻塞 RPC，放在锁内会让
+    并发聊天请求全部排队。"""
     global _tools_cache, _tools_cached_at
     with _tools_lock:
         if _tools_cache is not None and time.time() - _tools_cached_at < _TOOLS_TTL:
             return _tools_cache
-        tools = []
-        for client in _mcp_servers.values():
-            try:
-                for t in client.list_tools():
-                    tools.append({"server": client.name, "name": t.get("name", ""),
-                                  "description": (t.get("description") or "")[:200]})
-            except Exception:
-                continue
+    # 快照后再遍历：register/remove 并发改字典时不会 RuntimeError
+    tools = []
+    for client in list(_mcp_servers.values()):
+        try:
+            for t in client.list_tools():
+                tools.append({"server": client.name, "name": t.get("name", ""),
+                              "description": (t.get("description") or "")[:200]})
+        except Exception:
+            continue
+    with _tools_lock:
         _tools_cache = tools
         _tools_cached_at = time.time()
-        return tools
+    return tools
 
 
 def call_mcp_tool(server: str, tool: str, arguments: dict) -> str:

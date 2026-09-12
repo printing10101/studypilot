@@ -28,6 +28,7 @@ export function Icon({ name, size = 16 }: { name: string; size?: number }) {
     case 'warn': return <svg {...p}><path d="M12 3 2 21h20L12 3z" /><path d="M12 10v4m0 3v.01" /></svg>
     case 'wifi': return <svg {...p}><path d="M2.5 9a15 15 0 0 1 19 0" /><path d="M5.5 12.5a10 10 0 0 1 13 0" /><path d="M8.6 16a5.5 5.5 0 0 1 6.8 0" /><circle cx="12" cy="19.3" r="1" /></svg>
     case 'arrow': return <svg {...p}><path d="M5 12h14m-6-6 6 6-6 6" /></svg>
+    case 'search': return <svg {...p}><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
   }
   return null
 }
@@ -38,11 +39,13 @@ export function Typing() {
 
 export function downloadMd(kind: string, text: string) {
   const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
-  a.href = URL.createObjectURL(blob)
+  a.href = url
   a.download = `studypilot-${kind}.md`
   a.click()
-  URL.revokeObjectURL(a.href)
+  // 等浏览器开始下载再回收 URL：同步 revoke 在部分浏览器/大文件下会中断下载
+  setTimeout(() => URL.revokeObjectURL(url), 3000)
 }
 
 // ============ Toast 通知系统 ============
@@ -62,10 +65,13 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   const push = useCallback((type: ToastType, text: string) => {
     const id = ++_toastId
     setToasts((t) => [...t.slice(-4), { id, type, text }])
+    // 时长随内容伸缩：多行清单（批量导入失败列表等）3 秒根本读不完
+    const lines = text.split('\n').length
+    const ms = type === 'error' ? 6000 : lines > 1 ? Math.min(15000, 2500 + lines * 1500) : 3000
     const timer = setTimeout(() => {
       setToasts((t) => t.filter((x) => x.id !== id))
       timers.current.delete(id)
-    }, type === 'error' ? 5000 : 3000)
+    }, ms)
     timers.current.set(id, timer)
   }, [])
 
@@ -74,7 +80,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   return (
     <ToastCtx.Provider value={push}>
       {children}
-      <div className="toast-wrap">
+      <div className="toast-wrap" role="status" aria-live="polite">
         {toasts.map((t) => (
           <div key={t.id} className={`toast toast-${t.type}`}
             onClick={() => { setToasts((s) => s.filter((x) => x.id !== t.id)); const tm = timers.current.get(t.id); if (tm) clearTimeout(tm) }}>
@@ -97,19 +103,50 @@ interface ModalProps {
   width?: number
 }
 export function Modal({ open, title, onClose, children, width = 440 }: ModalProps) {
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const prevFocusRef = useRef<HTMLElement | null>(null)
+  // onClose 用 ref 转发：调用方传内联箭头函数时避免 effect 因依赖变化反复装卸
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
+
   useEffect(() => {
     if (!open) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    prevFocusRef.current = document.activeElement as HTMLElement | null
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { onCloseRef.current(); return }
+      if (e.key !== 'Tab') return
+      // 焦点圈定：Tab / Shift+Tab 循环停留在弹层内可聚焦元素上
+      const root = dialogRef.current
+      if (!root) return
+      const focusables = [...root.querySelectorAll<HTMLElement>(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+      )].filter((el) => !el.hasAttribute('disabled'))
+      if (!focusables.length) return
+      const first = focusables[0]
+      const last = focusables[focusables.length - 1]
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus() }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
+      else if (!root.contains(document.activeElement)) { e.preventDefault(); first.focus() }
+    }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open, onClose])
+    const t = setTimeout(() => dialogRef.current?.focus(), 30)
+    // cleanup 同时覆盖 open 翻转与卸载两种关闭路径：把焦点还给触发元素
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      clearTimeout(t)
+      if (prevFocusRef.current) { prevFocusRef.current.focus?.(); prevFocusRef.current = null }
+    }
+  }, [open])
+
   if (!open) return null
   return (
-    <div className="modal-mask" onClick={onClose}>
-      <div className="modal" style={{ maxWidth: width }} onClick={(e) => e.stopPropagation()}>
+    <div className="modal-mask" onClick={() => onCloseRef.current()}>
+      {/* role/aria：读屏用户需要感知弹层边界；全局快捷键也以此判断「弹窗打开中」 */}
+      <div className="modal" style={{ maxWidth: width }} ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label={title}
+        onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <b>{title}</b>
-          <button className="modal-x" onClick={onClose}><Icon name="close" size={14} /></button>
+          <button className="modal-x" onClick={onClose} aria-label="关闭"><Icon name="close" size={14} /></button>
         </div>
         <div className="modal-body">{children}</div>
       </div>
@@ -276,6 +313,88 @@ export function SubTabs({ tabs, value, onChange }: {
       {tabs.map(([v, label]) => (
         <button key={v} className={`mode-tab ${value === v ? 'active' : ''}`} onClick={() => onChange(v)}>{label}</button>
       ))}
+    </div>
+  )
+}
+
+// ============ 命令面板（Ctrl+K）：页面/空间/操作全局跳转 ============
+
+export interface PaletteItem { id: string; label: string; hint?: string; icon?: string; run: () => void }
+
+export function CommandPalette({ open, onClose, items }: {
+  open: boolean
+  onClose: () => void
+  items: PaletteItem[]
+}) {
+  const [q, setQ] = useState('')
+  const [idx, setIdx] = useState(0)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
+
+  useEffect(() => {
+    if (open) { setQ(''); setIdx(0); setTimeout(() => inputRef.current?.focus(), 30) }
+  }, [open])
+
+  // Esc / Tab 挂在 window 上：此前只挂在输入框 onKeyDown，点击面板其他区域让输入框
+  // 失焦后，Esc 关不掉、Tab 会逃逸到背景页面
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { e.preventDefault(); onCloseRef.current(); return }
+      if (e.key !== 'Tab') return
+      // 焦点圈定：Tab / Shift+Tab 循环停留在面板内的输入框与结果项上
+      const root = panelRef.current
+      if (!root) return
+      const focusables = [...root.querySelectorAll<HTMLElement>('button, input')]
+        .filter((el) => !el.hasAttribute('disabled'))
+      if (!focusables.length) return
+      const first = focusables[0]
+      const last = focusables[focusables.length - 1]
+      e.preventDefault()
+      if (e.shiftKey && document.activeElement === first) last.focus()
+      else if (!e.shiftKey && document.activeElement === last) first.focus()
+      else if (!root.contains(document.activeElement)) first.focus()
+      else if (e.shiftKey) {
+        const i = focusables.indexOf(document.activeElement as HTMLElement)
+        focusables[Math.max(0, i - 1)].focus()
+      } else {
+        const i = focusables.indexOf(document.activeElement as HTMLElement)
+        focusables[Math.min(focusables.length - 1, i + 1)].focus()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open])
+
+  if (!open) return null
+  const kw = q.trim().toLowerCase()
+  const filtered = items.filter((it) => it.label.toLowerCase().includes(kw) || (it.hint || '').toLowerCase().includes(kw))
+  const pick = (it?: PaletteItem) => { if (it) { onClose(); it.run() } }
+
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <div className="modal palette" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="全局搜索" ref={panelRef}>
+        <input ref={inputRef} value={q} placeholder="搜索页面、课程空间或操作…（↑↓ 选择，Enter 打开，Esc 关闭）"
+          onChange={(e) => { setQ(e.target.value); setIdx(0) }}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowDown') { e.preventDefault(); setIdx((i) => Math.min(i + 1, filtered.length - 1)) }
+            else if (e.key === 'ArrowUp') { e.preventDefault(); setIdx((i) => Math.max(i - 1, 0)) }
+            else if (e.key === 'Enter') { e.preventDefault(); pick(filtered[idx]) }
+          }} />
+        <div className="palette-list">
+          {filtered.map((it, i) => (
+            <button key={it.id} type="button" className={`palette-item ${i === idx ? 'active' : ''}`}
+              onMouseEnter={() => setIdx(i)} onClick={() => pick(it)}>
+              {it.icon && <Icon name={it.icon} size={14} />}
+              <span>{it.label}</span>
+              {it.hint && <span className="sub">{it.hint}</span>}
+            </button>
+          ))}
+          {!filtered.length && <p className="sub" style={{ padding: 14, margin: 0 }}>没有匹配项</p>}
+        </div>
+      </div>
     </div>
   )
 }

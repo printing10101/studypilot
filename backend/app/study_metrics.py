@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any
@@ -51,39 +52,44 @@ def normalize_method_id(raw: str) -> str:
 # ---------- 表结构（懒迁移） ----------
 
 _ENSURED = False
+_ENSURE_LOCK = threading.Lock()
 
 
 def _ensure_tables() -> None:
     global _ENSURED
     if _ENSURED:
         return
-    c = db.get_conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS method_events(
-          id TEXT PRIMARY KEY,
-          space_id TEXT NOT NULL,
-          method_id TEXT NOT NULL,
-          kind TEXT DEFAULT 'task_done',  -- task_done | quiz | recommend
-          meta TEXT DEFAULT '{}',
-          score_delta REAL DEFAULT 0,     -- 关联掌握度变化（事后回填）
-          created_at REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_me_space ON method_events(space_id, created_at);
-        CREATE TABLE IF NOT EXISTS quiz_predictions(
-          quiz_id TEXT PRIMARY KEY,
-          space_id TEXT NOT NULL,
-          predicted REAL NOT NULL,        -- 0~1 预测正确率
-          actual REAL,                    -- 判卷后回填
-          created_at REAL
-        );
-        """
-    )
-    qcols = {r[1] for r in c.execute("PRAGMA table_info(quiz_records)")}
-    if "predicted" not in qcols:
-        c.execute("ALTER TABLE quiz_records ADD COLUMN predicted REAL DEFAULT -1")
-    c.commit()
-    _ENSURED = True
+    # 加锁 + 双检：并发首用时两个线程同时走到 ALTER 会 duplicate column 500
+    with _ENSURE_LOCK:
+        if _ENSURED:
+            return
+        c = db.get_conn()
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS method_events(
+              id TEXT PRIMARY KEY,
+              space_id TEXT NOT NULL,
+              method_id TEXT NOT NULL,
+              kind TEXT DEFAULT 'task_done',  -- task_done | quiz | recommend
+              meta TEXT DEFAULT '{}',
+              score_delta REAL DEFAULT 0,     -- 关联掌握度变化（事后回填）
+              created_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_me_space ON method_events(space_id, created_at);
+            CREATE TABLE IF NOT EXISTS quiz_predictions(
+              quiz_id TEXT PRIMARY KEY,
+              space_id TEXT NOT NULL,
+              predicted REAL NOT NULL,        -- 0~1 预测正确率
+              actual REAL,                    -- 判卷后回填
+              created_at REAL
+            );
+            """
+        )
+        qcols = {r[1] for r in c.execute("PRAGMA table_info(quiz_records)")}
+        if "predicted" not in qcols:
+            c.execute("ALTER TABLE quiz_records ADD COLUMN predicted REAL DEFAULT -1")
+        c.commit()
+        _ENSURED = True
 
 
 # ---------- 方法使用与效果 ----------
@@ -202,7 +208,8 @@ def _active_days(space_id: str, window_days: int = 30) -> set[str]:
 
 def consistency(space_id: str) -> dict:
     """连续学习天数 + 近 7/30 天活跃天。"""
-    days = _active_days(space_id, 40)
+    # 窗口给足一年：streak 从今天往回数，40 天窗口会把长期连续学习封顶在 40
+    days = _active_days(space_id, 366)
     if not days:
         return {"streak": 0, "active_7d": 0, "active_30d": 0, "last_active": ""}
     # streak：从今天或昨天往回数
@@ -336,12 +343,15 @@ def _parse_deadline(timeline: str) -> str | None:
     """从档案时间线里抠出最近的 YYYY-MM / YYYY.MM.DD / YYYY年M月。"""
     import re
     t = timeline or ""
-    m = re.search(r"(20\d{2})[年./-](\d{1,2})[月./-](\d{1,2})", t)
-    if m:
-        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    m = re.search(r"(20\d{2})[年./-](\d{1,2})月?", t)
-    if m:
-        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-01"
+    # (?!\d) 防止区间日期把下个年份前两位当月/日；越界组合（month=20）跳过
+    for m in re.finditer(r"(20\d{2})[年./-](\d{1,2})(?!\d)[月./-](\d{1,2})(?!\d)", t):
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    for m in re.finditer(r"(20\d{2})[年./-](\d{1,2})月?(?!\d)", t):
+        y, mo = int(m.group(1)), int(m.group(2))
+        if 1 <= mo <= 12:
+            return f"{y:04d}-{mo:02d}-01"
     return None
 
 

@@ -3,8 +3,8 @@
 //   空间级：今日学习 / 学习对话 / 测验 / 闪卡 / 学习计划 / 学习分析
 //   全局级：个人中心 / 资料中心（知识库+教材书库合并）/ 学涯中心（学涯规划+成长手册合并）/ 校园网 / 模型设置
 import { useEffect, useState } from 'react'
-import { api, Space } from './api'
-import { Icon } from './ui'
+import { api, NavExtra, Space } from './api'
+import { CommandPalette, Icon } from './ui'
 import { useUX } from './ux'
 import { TodayView } from './views/TodayView'
 import { ChatView } from './views/ChatView'
@@ -42,12 +42,30 @@ function App() {
   const [spaces, setSpaces] = useState<Space[]>([])
   const [sid, setSid] = useState<string>('')
   const [tab, setTab] = useState<Tab>('today')
+  // health=null 表示后端本身不可达（区别于「后端在但模型没连」），顶栏下挂全局重连横幅
   const [health, setHealth] = useState<{ llm: boolean; model: string } | null>(null)
+  const [serverDown, setServerDown] = useState(false)
   const [dueCount, setDueCount] = useState(0)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [navExtra, setNavExtra] = useState<NavExtra | undefined>(undefined)
+  const [paletteOpen, setPaletteOpen] = useState(false)
+
+  // Ctrl+K / Cmd+K 呼出命令面板：页面多、功能区多之后靠记忆找侧边栏太费劲
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault()
+        setPaletteOpen((v) => !v)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   const refreshSpaces = () => api.listSpaces().then(setSpaces).catch(() => {})
-  const refreshHealth = () => api.health().then(setHealth).catch(() => setHealth({ llm: false, model: '未连接' }))
+  const refreshHealth = () => api.health()
+    .then((h) => { setHealth(h); setServerDown(false) })
+    .catch(() => { setHealth(null); setServerDown(true) })
   useEffect(() => {
     refreshSpaces()
     refreshHealth()
@@ -88,15 +106,40 @@ function App() {
   const newSpace = async () => {
     const name = await uxPrompt({ title: '新建课程空间', label: '课程名称', placeholder: '如：清华普通物理' })
     if (!name) return
-    const s = await api.createSpace(name, '')
-    await refreshSpaces()
-    setSid(s.id)
-    setTab('today')
-    toast('success', `已创建「${name}」，去资料中心上传讲义开始吧`)
+    try {
+      const s = await api.createSpace(name, '')
+      await refreshSpaces()
+      setSid(s.id)
+      // 新空间第一步永远是传讲义：直接带去资料中心，而不是落在全 0 的今日页
+      setTab('library')
+      toast('success', `已创建「${name}」，先上传讲义构建这门课的知识库`)
+    } catch (e: any) {
+      // 此前无 catch：创建失败 unhandled rejection，用户毫无感知
+      toast('error', '创建空间失败：' + (e.message || '未知错误'))
+    }
   }
 
-  const nav = (t: string) => { setTab(t as Tab); setSidebarOpen(false) }
+  const nav = (t: string, extra?: NavExtra) => { setTab(t as Tab); setNavExtra(extra); setSidebarOpen(false) }
   const openSpace = (id: string) => { setSid(id); setTab('today'); setSidebarOpen(false) }
+
+  // 深链定位（navExtra）消费后清掉：否则切走再切回会重复触发滚动高亮
+  useEffect(() => {
+    if (!navExtra) return
+    const t = setTimeout(() => setNavExtra(undefined), 5000)
+    return () => clearTimeout(t)
+  }, [navExtra])
+
+  const paletteItems = [
+    ...GLOBAL_TABS.map(([t, label, ic]) => ({ id: `tab-${t}`, label, hint: '页面', icon: ic, run: () => nav(t) })),
+    ...(sid
+      ? SPACE_TABS.map(([t, label, ic]) => ({ id: `tab-${t}`, label, hint: '空间功能', icon: ic, run: () => nav(t) }))
+      : []),
+    ...spaces.map((s) => ({
+      id: `space-${s.id}`, label: `切换到「${s.name}」`, hint: '课程空间', icon: 'layers',
+      run: () => openSpace(s.id),
+    })),
+    { id: 'new-space', label: '新建课程空间', hint: '操作', icon: 'plus', run: newSpace },
+  ]
 
   const renderView = () => {
     if (tab === 'profile') return <ProfileView spaces={spaces} onOpenSpace={openSpace} />
@@ -135,8 +178,8 @@ function App() {
       )
     }
     switch (tab) {
-      case 'chat': return <ChatView sid={sid} />
-      case 'quiz': return <QuizView sid={sid} />
+      case 'chat': return <ChatView sid={sid} llmOk={health ? health.llm : true} onOpenSettings={() => nav('settings')} />
+      case 'quiz': return <QuizView sid={sid} navExtra={navExtra} />
       case 'cards': return <CardsView sid={sid} />
       case 'plan': return <PlanView sid={sid} />
       case 'analytics': return <AnalyticsView sid={sid} onGoto={nav} />
@@ -160,6 +203,11 @@ function App() {
           </div>
         </div>
         <div style={{ flex: 1 }} />
+        <button className="chip" style={{ cursor: 'pointer', fontFamily: 'inherit' }}
+          title="全局搜索页面、空间与操作（Ctrl+K）"
+          onClick={() => setPaletteOpen(true)}>
+          <Icon name="search" size={12} /> 搜索 <span style={{ opacity: 0.6 }}>Ctrl K</span>
+        </button>
         {health && (
           <span className={`chip ${health.llm ? '' : 'off'}`}>
             <span className="pulse" />{health.llm ? health.model : '模型未连接'}
@@ -167,15 +215,18 @@ function App() {
         )}
       </div>
 
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} items={paletteItems} />
+
       {sidebarOpen && <div className="sidebar-overlay" onClick={() => setSidebarOpen(false)} />}
       <div className="layout">
         <div className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
           <div className="nav-section">课程空间</div>
           {spaces.map((s) => (
-            <div key={s.id} className={`nav-item ${sid === s.id ? 'active' : ''}`}
+            <button key={s.id} type="button" className={`nav-item ${sid === s.id ? 'active' : ''}`}
+              aria-current={sid === s.id ? 'true' : undefined}
               onClick={() => openSpace(s.id)}>
               <Icon name="layers" />{s.name}
-            </div>
+            </button>
           ))}
           <button className="side-btn" onClick={newSpace}><Icon name="plus" size={14} /> 新建课程空间</button>
 
@@ -183,19 +234,23 @@ function App() {
             <>
               <div className="nav-section">空间功能</div>
               {SPACE_TABS.map(([t, label, ic]) => (
-                <div key={t} className={`nav-item ${tab === t ? 'active' : ''}`} onClick={() => nav(t)}>
+                <button key={t} type="button" className={`nav-item ${tab === t ? 'active' : ''}`}
+                  aria-current={tab === t ? 'page' : undefined}
+                  onClick={() => nav(t)}>
                   <Icon name={ic} />{label}
                   {t === 'today' && dueCount > 0 && <span className="badge expert" style={{ marginLeft: 'auto' }}>{dueCount} 到期</span>}
-                </div>
+                </button>
               ))}
             </>
           )}
 
           <div className="nav-section">通用</div>
           {GLOBAL_TABS.map(([t, label, ic]) => (
-            <div key={t} className={`nav-item ${tab === t ? 'active' : ''}`} onClick={() => nav(t)}>
+            <button key={t} type="button" className={`nav-item ${tab === t ? 'active' : ''}`}
+              aria-current={tab === t ? 'page' : undefined}
+              onClick={() => nav(t)}>
               <Icon name={ic} />{label}
-            </div>
+            </button>
           ))}
 
           {sid && (
@@ -204,7 +259,13 @@ function App() {
               <button className="btn danger small" style={{ width: '100%', justifyContent: 'center' }}
                 onClick={async () => {
                   if (await uxConfirm({ title: '删除课程空间', message: '删除后所有数据不可恢复。', confirmText: '删除', danger: true })) {
-                    await api.deleteSpace(sid); setSid(''); refreshSpaces()
+                    try {
+                      await api.deleteSpace(sid)
+                    } catch (e: any) {
+                      toast('error', '删除失败：' + (e.message || '未知错误'))
+                      return
+                    }
+                    setSid(''); refreshSpaces()
                     toast('success', '空间已删除')
                   }
                 }}><Icon name="trash" size={13} /> 删除当前空间</button>
@@ -213,6 +274,14 @@ function App() {
         </div>
 
         <div className="main">
+          {serverDown && (
+            <div className="card" style={{ margin: '14px 18px 0', padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12, borderColor: 'var(--red)', flexWrap: 'wrap' }}>
+              <span className="badge expert" style={{ color: 'var(--red)', borderColor: 'rgba(238,154,169,.4)' }}>⚠ 服务未连接</span>
+              <span className="sub">后端服务暂时不可达（可能正在重启）。数据都在本机，恢复后自动重连。</span>
+              <div style={{ flex: 1 }} />
+              <button className="btn small" onClick={refreshHealth}>重试连接</button>
+            </div>
+          )}
           {sid && dueCount > 0 && (
             <div className="card" style={{ margin: '14px 18px 0', padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12, borderColor: 'var(--orange)' }}>
               <span className="badge expert">⏰ 间隔复习</span>

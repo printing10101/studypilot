@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+import zipfile
 from collections import Counter
 
 from . import db, ingest, llm
@@ -59,14 +60,16 @@ def _read_pptx(path: str) -> str:
                      if re.fullmatch(r"ppt/notesSlides/notesSlide\d+\.xml", n)}
             pages = []
             for i, name in enumerate(slides, 1):
-                raw = z.read(name)
-                if len(raw) > MAX_XML_BYTES:
-                    continue  # 异常超大条目跳过
+                # 声明 3KB 实际可膨胀数 GB 的 zip 炸弹：流式读取并在上限处截断，
+                # 不能 z.read 整体进内存后再检查
+                raw = _read_capped(z, name, MAX_XML_BYTES)
+                if raw is None:
+                    continue
                 texts = _texts(raw)
                 page = f"[第{i}页]\n" + "\n".join(texts)
                 if notes.get(i):
-                    nraw = z.read(notes[i])
-                    if len(nraw) <= MAX_XML_BYTES:
+                    nraw = _read_capped(z, notes[i], MAX_XML_BYTES)
+                    if nraw is not None:
                         ntexts = [t for t in _texts(nraw) if not t.isdigit()]  # 去掉页码噪声
                         if ntexts:
                             page += "\n[讲者备注]\n" + "\n".join(ntexts)
@@ -79,8 +82,35 @@ def _read_pptx(path: str) -> str:
     return "\n".join(pages)
 
 
+def _read_capped(z: zipfile.ZipFile, name: str, cap: int) -> bytes | None:
+    """流式读取 zip 成员，超过 cap 字节返回 None（防声明大小造假的炸弹）。"""
+    total = 0
+    parts = []
+    with z.open(name) as src:
+        while True:
+            chunk = src.read(256 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > cap:
+                return None
+            parts.append(chunk)
+    return b"".join(parts)
+
+
 def _read_text(path: str) -> str:
-    for enc in ("utf-8", "gb18030", "utf-16"):
+    import codecs
+    with open(path, "rb") as f:
+        head = f.read(4)
+    # 先嗅探 BOM：带 BOM 的 UTF-16 大多能被 gb18030「成功」解码成乱码，
+    # 纯 try-encoding 顺序会永远走不到 utf-16 分支
+    if head.startswith(codecs.BOM_UTF16_LE) or head.startswith(codecs.BOM_UTF16_BE):
+        try:
+            with open(path, encoding="utf-16") as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeError):
+            pass
+    for enc in ("utf-8-sig", "gb18030", "utf-16"):
         try:
             with open(path, encoding=enc) as f:
                 return f.read()
@@ -191,6 +221,12 @@ _BM25_B = 0.75
 
 _bm25_lock = threading.Lock()  # 仅保护 _bm25_cache 的并发写（索引重建幂等，竞争无害但避免重复劳动）
 _bm25_cache: dict[str, tuple[tuple, dict]] = {}   # space_id -> (行签名, 索引)
+
+
+def drop_space_cache(space_id: str) -> None:
+    """删除空间后回收其 BM25 索引缓存（含全量 token Counter，不清理会一直滞留内存）。"""
+    with _bm25_lock:
+        _bm25_cache.pop(space_id, None)
 _reranker = None
 _reranker_lock = threading.Lock()
 _reranker_failed_at = 0.0
@@ -313,12 +349,19 @@ def retrieve(space_id: str, query: str, top_k: int = 6) -> list[dict]:
     if not rows:
         return []
     fetch_k = max(top_k * _FETCH_MULT, 12)
-    vec_ranked = _vector_scores(rows, llm.embed([query])[0])[:fetch_k]
+    try:
+        qvec = llm.embed([query])[0]
+    except Exception as e:
+        # embed 失败（嵌入模型缺失/下载失败）原本以 OSError 等类型裸抛，
+        # 端点只捕 RuntimeError → 用户看到 500 而不是「模型不可用」的 502
+        raise RuntimeError(f"向量检索不可用：{e}") from e
+    vec_ranked = _vector_scores(rows, qvec)[:fetch_k]
     if not settings.hybrid_search:
-        ranked = vec_ranked[:top_k]
-        hits = [{"id": rows[i]["id"], "document_id": rows[i]["document_id"],
-                 "chunk_index": rows[i]["chunk_index"], "text": rows[i]["text"],
-                 "score": round(s, 4)} for i, s in ranked]
+        ranked = _rerank(query, [
+            {"id": rows[i]["id"], "document_id": rows[i]["document_id"],
+             "chunk_index": rows[i]["chunk_index"], "text": rows[i]["text"],
+             "score": round(s, 4)} for i, s in vec_ranked[:top_k]])
+        hits = ranked
     else:
         fused: dict[int, float] = {}
         for rank, (i, _s) in enumerate(vec_ranked):

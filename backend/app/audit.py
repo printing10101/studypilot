@@ -168,9 +168,10 @@ def run_audit(school: str = "", major: str = "") -> dict[str, Any]:
         t = matched.get(r["base"])
         if t and t["status"] == "done":
             total_earned += float(t["credit"] or r["credit"] or 0)
-    # 未匹配到要求课程的已修学分也计入总进度（通识/选修大量存在，不能丢）
+    # 未匹配到要求课程的已修学分也计入总进度（通识/选修大量存在，不能丢）；
+    # 但不及格（绩点 0）的课没有拿到学分，不能计入
     for u in unmatched:
-        if u.get("status") != "taking":
+        if u.get("status") != "taking" and grade_to_gpa(u.get("grade") or "") != 0:
             total_earned += float(u.get("credit") or 0)
 
     by_category: list[dict[str, Any]] = []
@@ -223,9 +224,10 @@ def run_audit(school: str = "", major: str = "") -> dict[str, Any]:
     ready_next = ready_next[:12]
 
     # ---- GPA ----
-    gpa_pairs = [(float(t["gpa"]), float(t["credit"] or r["credit"] or 0))
-                 for b, t in matched.items()
-                 if t["status"] == "done" and float(t.get("gpa") or -1) >= 0]
+    # 注意绩点 0.0（挂科）必须计入：`x or -1` 会把 0.0 吞成 -1 而漏掉挂科课
+    gpa_pairs = [(float(t["gpa"]), float(t["credit"] or 0))
+                 for t in matched.values()
+                 if t["status"] == "done" and t.get("gpa") is not None and float(t["gpa"]) >= 0]
     for u in unmatched:
         if u.get("status") == "taking":  # 在修课无最终成绩，不计入 GPA
             continue
@@ -260,10 +262,8 @@ def run_audit(school: str = "", major: str = "") -> dict[str, Any]:
 
 # ---------- 成绩文本批量导入 ----------
 
-_GRADE_TOKENS = {"优秀": 4.0, "优": 4.0, "良好": 3.0, "良": 3.0, "中等": 2.0, "中": 2.0,
-                 "及格": 1.0, "合格": 1.0, "通过": 1.0, "不及格": 0.0, "不合格": 0.0,
-                 "免修": 4.0, "A+": 4.0, "A": 4.0, "A-": 3.7, "B+": 3.3, "B": 3.0,
-                 "B-": 2.7, "C+": 2.3, "C": 2.0, "C-": 1.7, "D": 1.0, "F": 0.0}
+# 与 _GRADE_WORDS/_LETTER_GPA 同源生成，避免两份手抄表漂移（此前漏过 "D+"）
+_GRADE_TOKENS = {**_GRADE_WORDS, **_LETTER_GPA}
 _STATUS_TOKENS = ("必修", "选修", "任选", "限选", "已修", "重修", "在修", "修读中", "通过", "主修")
 
 
