@@ -9,9 +9,12 @@ Mayer 双重编码，以及 Learning Scientists 的课堂实践指南。
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from . import db
+
+log = logging.getLogger("studypilot.learning_methods")
 
 # ---------- 方法目录 ----------
 
@@ -275,7 +278,7 @@ def space_signals(space_id: str) -> dict:
                 if r < 0.5:
                     forgetting += 1
             except Exception:
-                pass
+                log.debug("留存抽样计算失败（point=%s）", p.get("point"), exc_info=True)
     if forgetting >= 2:
         if "forgetting" not in signals:
             signals.append("forgetting")
@@ -301,7 +304,7 @@ def space_signals(space_id: str) -> dict:
             signals.append("prereq_gap")
             notes.append("存在前置薄弱拖累后继，先补根因")
     except Exception:
-        pass
+        log.warning("学习方法信号 prereq_gap 计算失败（本次建议缺该信号）", exc_info=True)
 
     # 趋势
     try:
@@ -311,7 +314,7 @@ def space_signals(space_id: str) -> dict:
             signals.append("decelerating")
             notes.append("掌握速度在放缓，缩短单次会话并交错复习")
     except Exception:
-        pass
+        log.warning("学习方法信号 decelerating 计算失败（本次建议缺该信号）", exc_info=True)
 
     # 综合度量：负载 / 校准
     try:
@@ -327,7 +330,7 @@ def space_signals(space_id: str) -> dict:
         elif cal.get("label") == "underconfident":
             notes.append("预测常低于实际，可适度上难度建立成功体验")
     except Exception:
-        pass
+        log.warning("学习方法信号 load/calibration 计算失败（本次建议缺该信号）", exc_info=True)
 
     errors = _dominant_error_types(space_id)
     for et in errors[:1]:
@@ -377,7 +380,7 @@ def advise_for_space(space_id: str, limit: int = 4) -> MethodAdvice:
         for mid, b in study_metrics.efficacy_boost(space_id).items():
             boost[mid] = boost.get(mid, 0.0) + b
     except Exception:
-        pass
+        log.warning("方法效果闭环加权失败（本次仅按画像加权）", exc_info=True)
     methods = learner_persona.apply_boost(methods, boost)[:limit]
     for m in methods:
         if not m.get("why"):
@@ -400,7 +403,7 @@ def advise_for_space(space_id: str, limit: int = 4) -> MethodAdvice:
         if cd and 0 < cd.get("days_left", 999) <= 90:
             tip_bits.append(f"距考试约 {cd['days_left']} 天（{cd['phase']}）：{cd['strategy']}")
     except Exception:
-        pass
+        log.warning("建议中的考试倒计时计算失败（tip 缺倒计时）", exc_info=True)
 
     primary_p = learner_persona.PERSONAS.get(profile.primary)
     if primary_p and primary_p.tip:
@@ -480,7 +483,7 @@ def planner_prompt_block(space_id: str) -> str:
             parts.append(f"\n【今日负载】偏高，阶段任务粒度控制在 {load['suggested_minutes']} 分钟内，"
                          "优先到期检索，避免再堆新内容。")
     except Exception:
-        pass
+        log.warning("规划协议块中的倒计时/负载注入失败", exc_info=True)
     tip = f"\n当前画像提示：{advice.tip}。" if advice.tip else ""
     parts.append(tip)
     if block:

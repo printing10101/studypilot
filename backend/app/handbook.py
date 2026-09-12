@@ -64,7 +64,7 @@ def _get_index() -> list[dict]:
             entries.append({"text": chunk, "source": title, "vec": None})
     if entries:
         vecs = llm.embed([e["text"] for e in entries])
-        for e, v in zip(entries, vecs):
+        for e, v in zip(entries, vecs, strict=True):
             e["vec"] = np.array(v, dtype=np.float32)
     _index = entries
     return _index

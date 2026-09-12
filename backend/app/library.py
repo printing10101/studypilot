@@ -371,7 +371,7 @@ def _safe_url(url: str) -> str:
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError as e:
-        raise ValueError(f"域名解析失败: {e}")
+        raise ValueError(f"域名解析失败: {e}") from e
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
         if (ip.is_loopback or ip.is_private or ip.is_reserved or ip.is_link_local
@@ -543,7 +543,7 @@ def import_url(url: str, title: str = "") -> dict:
         raise ValueError(f"该网页已在书库（URL 相同）：《{name}》")
     f, dst = _new_book_file(".txt")
     with f:
-        f.write(f"来源: {url}\n\n{text}".encode("utf-8"))
+        f.write(f"来源: {url}\n\n{text}".encode())
     bid = db.add_book(title=f"网页：{name}", subject="我的教材", status="local", path=dst,
                       source_url=url, note="网页剪藏")
     return {"id": bid, "title": f"网页：{name}", "chars": len(text)}

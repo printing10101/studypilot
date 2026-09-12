@@ -8,8 +8,8 @@ import time
 import uuid
 from typing import Any
 
-from .config import settings
 from . import fsrs as _fsrs
+from .config import settings
 
 log = logging.getLogger("studypilot.db")
 
@@ -404,7 +404,7 @@ def delete_space(sid: str) -> None:
                 if os.path.realpath(p).startswith(upload_root + os.sep):
                     paths.append(p)
             except OSError:
-                pass
+                log.debug("空间 %s 文件路径解析失败，跳过该文件（%s）", sid, p, exc_info=True)
     for t in ("documents", "messages", "quiz_records", "memory", "vectors",
               "feedback", "mastery", "mastery_history", "flashcards",
               "plan_tasks", "concept_edges", "book_documents", "question_bank"):
@@ -494,10 +494,12 @@ def backup_database(keep: int = 7) -> str | None:
             try:
                 os.remove(os.path.join(backup_root, p))
             except OSError:
-                pass
+                log.debug("旧备份清理失败（%s）", p, exc_info=True)
         return dest_path
     except Exception:
-        return None  # 备份失败不阻塞启动
+        # 备份失败不阻塞启动，但必须留痕：备份是数据安全的最后防线
+        log.warning("启动滚动备份失败（不阻塞启动）", exc_info=True)
+        return None
 
 
 _DOC_UPDATABLE_COLS = {"status", "error", "chunks", "filename", "path"}  # 防御性白名单：SET 列名不拼接任意输入
@@ -711,7 +713,7 @@ def search_vectors(space_id: str, query_emb: list[float], top_k: int = 6) -> lis
     q = q / (np.linalg.norm(q) + 1e-9)
     vecs = [np.frombuffer(r["embedding"], dtype=np.float32) for r in rows]
     # 过滤维度不一致的旧向量（更换嵌入模型后可能出现），避免整体检索崩溃
-    rows = [r for r, v in zip(rows, vecs) if v.shape[0] == q.shape[0]]
+    rows = [r for r, v in zip(rows, vecs, strict=True) if v.shape[0] == q.shape[0]]
     vecs = [v for v in vecs if v.shape[0] == q.shape[0]]
     if not rows:
         return []
@@ -1177,7 +1179,7 @@ def _norm_due_date(due: str) -> str:
     try:
         return time.strftime("%Y-%m-%d", time.strptime(due, "%Y-%m-%d"))
     except ValueError:
-        raise ValueError("日期格式应为 YYYY-MM-DD")
+        raise ValueError("日期格式应为 YYYY-MM-DD") from None
 
 
 def replace_plan_tasks(space_id: str, tasks: list[dict]) -> None:

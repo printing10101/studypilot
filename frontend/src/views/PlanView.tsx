@@ -84,7 +84,6 @@ export function PlanView({ sid }: { sid: string }) {
   }
   if (!plan) return <div className="empty"><span className="spin" /> 加载中…</div>
   const pct = plan.total ? Math.round((plan.done / plan.total) * 100) : 0
-  let phase = ''
   return (
     <div className="content">
       <div className="card" style={{ marginBottom: 18 }}>
@@ -119,9 +118,9 @@ export function PlanView({ sid }: { sid: string }) {
             </div>
           </div>
           <div style={{ marginTop: 8 }}>
-            {plan.tasks.map((t) => {
-              const showPhase = t.phase !== phase
-              phase = t.phase
+            {plan.tasks.map((t, i) => {
+              // 阶段分组头：与前一任务的 phase 比较（等价于旧写法且不在渲染期改写外层变量）
+              const showPhase = i === 0 || t.phase !== plan.tasks[i - 1].phase
               return (
                 <div key={t.id}>
                   {showPhase && <p className="sub" style={{ margin: '16px 0 6px', fontWeight: 700, color: 'var(--text)' }}>◈ {t.phase || '任务'}</p>}

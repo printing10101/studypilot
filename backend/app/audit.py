@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import difflib
+import logging
 import re
 from typing import Any
 
@@ -375,7 +376,7 @@ def import_courses_text(text: str) -> dict[str, Any]:
                     for r in (courses or []) if isinstance(r, dict) and (r.get("name") or "").strip()]
             method = "llm"
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("成绩单 LLM 兜底解析失败（回退报错提示）", exc_info=True)
     if not rows:
         raise ValueError("没有解析出课程：每行写「课程名 学分 成绩 学期」，如「高等数学 5 92 大一上」")
     added = 0

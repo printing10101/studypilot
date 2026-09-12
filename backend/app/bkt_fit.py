@@ -5,7 +5,9 @@
 Guess/Slip 做 clipping 防止退化。数据不足时回退全局默认。
 """
 import json
+import logging
 import math
+
 from . import db
 
 # 全局默认参数（与 defects.py / quiz_grade 保持一致）
@@ -70,7 +72,6 @@ def fit_em(
         # 状态 0=未掌握, 1=已掌握；吸收态：一旦掌握保持掌握（含学习转移）
         alpha = [[0.0, 0.0] for _ in range(n)]
         # t=0
-        p_correct_if_L = [(1 - p_g), (1 - p_s)]  # state 0: guess only; state 1: no-slip
         p_obs0 = [p_g if observations[0] else (1 - p_g),
                   (1 - p_s) if observations[0] else p_s]
         alpha[0][0] = (1 - p_l0) * p_obs0[0]
@@ -212,7 +213,8 @@ def get_params(space_id: str, point: str, qtype: str = "") -> dict:
                     "source": "fitted",
                 }
         except (json.JSONDecodeError, KeyError):
-            pass
+            logging.getLogger(__name__).debug(
+                "空间 %s 的个性化 BKT 参数损坏（point=%s），回退默认参数", space_id, point, exc_info=True)
     # 默认：按题型区分 guess
     guess = DEFAULT_P_G_CHOICE if qtype in ("选择", "判断") else DEFAULT_P_G_OPEN
     return {

@@ -42,6 +42,7 @@ def _fatal_box(msg: str) -> None:
 
 def run_server() -> None:
     import uvicorn
+
     from app.main import app
     # pythonw 下无 stdout，把日志写入文件避免报错
     log_cfg = uvicorn.config.LOGGING_CONFIG

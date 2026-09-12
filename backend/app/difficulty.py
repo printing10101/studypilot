@@ -3,7 +3,7 @@
 基于 Vygotsky 最近发展区理论：根据学生当前掌握度与错因类型，
 映射到最优难度层并给出混合出题分布，注入出题官 system prompt。
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # ZPD 掌握度阈值
 _MASTERY_LOW = 0.4    # 低于此 → Layer 1 基础回忆

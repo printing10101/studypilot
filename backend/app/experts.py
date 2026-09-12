@@ -146,7 +146,7 @@ def build_memory_context(space_id: str) -> str:
             hints = [t["recommendation"] for t in transfers[:3]]
             parts.append("【跨课程关联】\n" + "\n".join(f"- {h}" for h in hints))
     except Exception:
-        pass
+        log.warning("跨空间迁移提示生成失败（prompt 缺少关联段）", exc_info=True)
     return "\n".join(parts)
 
 

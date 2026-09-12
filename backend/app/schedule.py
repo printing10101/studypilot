@@ -9,7 +9,6 @@
 全部结果在前端以可编辑周课表呈现，用户可以修正任何字段后保存。
 """
 import csv
-import io
 import re
 
 from . import db, llm
@@ -219,7 +218,7 @@ def parse_wakeup_rows(rows: list[list[str]]) -> list[dict] | None:
         if not cells or not cells[0]:
             continue
 
-        def _at(key: str, default_idx: int) -> str:
+        def _at(key: str, default_idx: int, cells: list[str] = cells) -> str:
             j = colmap.get(key, -1) if colmap else default_idx
             return cells[j] if 0 <= j < len(cells) else ""
 

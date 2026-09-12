@@ -12,7 +12,7 @@
 import datetime
 import re
 
-from . import db, llm
+from . import llm
 
 # ---------- 内置竞赛目录 ----------
 # goals 数值 1-5：该路径下此竞赛的回报价值（5 = 该路径硬通货）

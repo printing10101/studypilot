@@ -14,10 +14,10 @@
 扩展方式：仿照现有文件在 programs/ 增加专业 JSON、overrides/ 增加校级方案，
 或直接在应用里导入本校手册，无需改代码。
 """
+import difflib
 import json
 import os
 import re
-import difflib
 
 from . import db, llm
 

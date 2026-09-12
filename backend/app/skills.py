@@ -52,7 +52,7 @@ def _emit(progress, label: str):
         try:
             progress(label)
         except Exception:
-            pass
+            log.debug("progress 回调失败（不影响技能执行）", exc_info=True)
 
 
 def quiz_generate(space_id: str, topic: str, count: int = 5, progress=None) -> list[dict]:

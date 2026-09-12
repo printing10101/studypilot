@@ -1,7 +1,10 @@
 """一键导出：把学习报告 / 错题本 / 学习计划渲染为 Markdown 文本（纯模板，不调 LLM）。"""
+import logging
 import time
 
 from . import db
+
+log = logging.getLogger("studypilot.export")
 
 _STATUS_CN = {"weak": "薄弱", "learning": "学习中", "mastered": "已掌握"}
 
@@ -75,7 +78,7 @@ def report_md(space_id: str) -> str:
                     lines.append(f"  - 避免：{m['avoid']}")
             lines.append("")
     except Exception:
-        pass
+        log.warning("学习报告的方法建议段生成失败（报告缺该段）", exc_info=True)
     return "\n".join(lines)
 
 
@@ -132,7 +135,7 @@ def plan_md(space_id: str) -> str:
             for m in advice.methods:
                 lines.append(f"- **{m['name']}**：{m['how']}")
     except Exception:
-        pass
+        log.warning("计划导出的方法摘要段生成失败（导出缺该段）", exc_info=True)
     return "\n".join(lines)
 
 

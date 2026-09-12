@@ -35,11 +35,11 @@ export function CampusView() {
       if (id === loadSeq.current) { setItems([]); setItemsErr(e?.message || '网络错误') }
     })
   }
-  useEffect(() => { refresh() }, [])
+  useEffect(() => { refresh() }, []) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const t = setTimeout(() => loadItems(source, query), query ? 300 : 0)
     return () => clearTimeout(t)
-  }, [source, query]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [source, query])  
 
   const syncNow = async () => {
     setBusy('sync')

@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fsrs import Card, Rating, Scheduler, State
@@ -37,7 +37,7 @@ _DECAY = -0.5
 
 
 def _ts2dt(ts: float) -> datetime:
-    return datetime.fromtimestamp(ts, tz=timezone.utc)
+    return datetime.fromtimestamp(ts, tz=UTC)
 
 
 def _dt2ts(dt: datetime) -> float:

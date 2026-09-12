@@ -19,9 +19,38 @@ dependencies = [
     "fsrs>=6.3.2",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+]
+
 [tool.uv]
 package = false
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# 数据库/上传目录由 tests/conftest.py 在导入 app 前重定向到一次性临时目录，
+# 测试绝不读写真实 data/ 与 uploads/
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = ["uploads-smoke*", "data-smoke*"]
+
+[tool.ruff.lint]
+# E/W pycodestyle · F pyflakes · I isort · B bugbear（常见 bug 模式）· UP pyupgrade（现代语法）
+# E501 关闭：中文注释与长 URL 无法可靠自动折行
+select = ["E", "W", "F", "I", "B", "UP"]
+ignore = [
+    "E501",
+    "B008",  # FastAPI 依赖注入在参数默认值里调用函数是该框架的惯用法
+    "UP007", # 项目还没有全面迁移 X | Y 联合类型注解的诉求
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]

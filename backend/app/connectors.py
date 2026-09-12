@@ -5,15 +5,15 @@
 """
 import atexit
 import json
+import logging
 import os
 import queue
 import threading
 import time
 
-import httpx
-
 from . import db, ingest, rag
-from .config import settings
+
+log = logging.getLogger("studypilot.connectors")
 
 # ---------- local_folder 连接器 ----------
 
@@ -82,7 +82,7 @@ class McpClient:
             if proc.stdin:
                 proc.stdin.close()
         except Exception:
-            pass
+            log.debug("MCP %s stdin 关闭失败（可能已退出）", self.name, exc_info=True)
         try:
             proc.terminate()
             proc.wait(timeout=3)
@@ -90,7 +90,7 @@ class McpClient:
             try:
                 proc.kill()
             except Exception:
-                pass
+                log.debug("MCP %s 子进程 kill 兜底也失败", self.name, exc_info=True)
 
     def _pump(self) -> None:
         try:
@@ -98,7 +98,7 @@ class McpClient:
             for line in self._proc.stdout:
                 self._lines.put(line)
         except Exception:
-            pass
+            log.debug("MCP %s 输出泵退出（进程结束或流异常）", self.name, exc_info=True)
         self._lines.put("")  # EOF 哨兵
 
     def _send(self, payload: dict) -> None:
@@ -117,7 +117,7 @@ class McpClient:
                 try:
                     line = self._lines.get(timeout=timeout)
                 except queue.Empty:
-                    raise RuntimeError(f"MCP server {self.name} 响应超时（>{int(timeout)}s）")
+                    raise RuntimeError(f"MCP server {self.name} 响应超时（>{int(timeout)}s）") from None
                 if not line:
                     # server 进程已退出：复位状态，下次调用自动重启，而不是永久报错到重启应用
                     self._proc = None
@@ -190,7 +190,7 @@ def register_mcp(name: str, command: list[str]) -> None:
         try:
             old.stop()
         except Exception:
-            pass
+            log.debug("覆盖注册时旧 MCP 实例 %s 停止失败", name, exc_info=True)
     _mcp_servers[name] = McpClient(name, command)
     _invalidate_tools_cache()
     db.set_meta(_MCP_META_KEY, json.dumps(
@@ -204,7 +204,7 @@ def remove_mcp(name: str) -> bool:
     try:
         client.stop()  # terminate+wait+kill 兜底，防孤儿进程
     except Exception:
-        pass
+        log.debug("移除 MCP %s 时停止失败", name, exc_info=True)
     _invalidate_tools_cache()
     db.set_meta(_MCP_META_KEY, json.dumps(
         {n: c.command for n, c in _mcp_servers.items()}, ensure_ascii=False))
@@ -218,7 +218,7 @@ def _shutdown_mcp_servers() -> None:
         try:
             client.stop()
         except Exception:
-            pass
+            log.debug("退出时 MCP %s 停止失败", client.name, exc_info=True)
 
 
 _TOOLS_TTL = 300.0  # 工具清单缓存 5 分钟，避免每条聊天消息都同步拉一遍 list_tools

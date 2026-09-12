@@ -9,9 +9,12 @@
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from . import db, fatigue
+
+log = logging.getLogger("studypilot.learner_persona")
 
 
 @dataclass(frozen=True)
@@ -251,7 +254,7 @@ def infer_personas(space_id: str) -> tuple[list[str], list[str]]:
                 ids.append("structure_seeker")
                 evidence.append("计划打卡参与度较高，适合清单驱动")
     except Exception:
-        pass
+        log.warning("画像信号 structure_seeker 推断失败（本次缺该画像）", exc_info=True)
 
     # 保序去重
     seen: list[str] = []

@@ -195,7 +195,7 @@ def save_cfg(patch: dict) -> dict:
         try:
             cfg["interval_min"] = max(5, min(int(patch["interval_min"]), 1440))
         except (TypeError, ValueError):
-            raise ValueError("interval_min 必须是分钟数")
+            raise ValueError("interval_min 必须是分钟数") from None
     for key in ("campus_hosts", "internal_hosts", "public_cidrs"):
         if key in patch and patch[key] is not None:
             if not isinstance(patch[key], list):
@@ -206,7 +206,7 @@ def save_cfg(patch: dict) -> dict:
                     try:
                         ipaddress.ip_network(v, strict=False)
                     except ValueError:
-                        raise ValueError(f"非法 CIDR: {v}")
+                        raise ValueError(f"非法 CIDR: {v}") from None
             else:
                 for v in vals:
                     if not urllib.parse.urlparse(v if "//" in v else "//" + v).hostname:

@@ -4,12 +4,14 @@
 记录 {ts, task, channel, model, latency_ms, tokens_in, tokens_out, ok, error}，
 存 SQLite 供模型设置页展示延迟分布、成功率，以及 auto 路由的通道选择依据。
 """
-import json
+import logging
 import threading
 import time
 from collections import defaultdict
 
 from . import db
+
+log = logging.getLogger("studypilot.llm_stats")
 
 _lock = threading.Lock()
 # 内存滑动窗口（最近 200 条），避免频繁查库
@@ -166,7 +168,7 @@ def clear_history() -> None:
         c.execute("DELETE FROM llm_calls")
         c.commit()  # execute 返回的是 Cursor，没有 .commit——此前静默 AttributeError 导致清空失效
     except Exception:
-        pass
+        log.warning("清空 LLM 调用历史失败", exc_info=True)
 
 
 def usage_dashboard(days: int = 30) -> dict:

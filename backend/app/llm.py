@@ -12,16 +12,19 @@
 - 每次调用记录延迟/Token/通道到 llm_stats，供模型设置页展示与 auto 路由决策。
 """
 import json
+import logging
 import os
 import threading
 import time
-from typing import Iterator
+from collections.abc import Iterator
 from urllib.parse import urlparse
 
 import httpx
 
 from . import llm_stats
 from .config import settings
+
+log = logging.getLogger("studypilot.llm")
 
 # 嵌入模型的离线开关延后到首次加载时决定（见 _configure_embed_offline）：
 # 新环境模型还没缓存时不能强制离线，否则下载被禁、聊天/出题/索引全瘫痪
@@ -85,8 +88,10 @@ def _load_runtime_config() -> dict:
            "cloud_model": settings.cloud_model, "routing": settings.routing}
     try:
         cfg.update(json.loads(_read_config_file(_CONFIG_PATH)))
+    except FileNotFoundError:
+        pass  # 首次运行尚无运行时配置文件，属正常
     except (OSError, ValueError):
-        pass
+        log.warning("LLM 运行时配置文件损坏，已回退默认值（%s）", _CONFIG_PATH, exc_info=True)
     return cfg
 
 
@@ -531,7 +536,7 @@ def _configure_embed_offline() -> None:
             _hf_c.ENDPOINT = os.environ["HF_ENDPOINT"]
             _hf_c._sp_endpoint_patched = True
     except Exception:
-        pass
+        log.debug("HF endpoint 常量兜底跳过（huggingface_hub 尚未加载，无需兜底）", exc_info=True)
     cached = os.path.isdir(model)
     if not cached:
         try:
@@ -553,7 +558,7 @@ def _configure_embed_offline() -> None:
             import huggingface_hub.constants as _hf_constants
             _hf_constants.HF_HUB_OFFLINE = True
         except Exception:
-            pass
+            log.debug("HF offline 常量兜底失败（嵌入模型离线开关可能不生效）", exc_info=True)
 
 
 # 在本模块被 import 时（早于任何 sentence_transformers/transformers 导入）先判定缓存，

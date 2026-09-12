@@ -70,7 +70,7 @@ export function QuizView({ sid, navExtra }: { sid: string; navExtra?: NavExtra }
     for (const [quizId, answers] of Object.entries(userAnswers)) {
       lsSet(draftKey(quizId), JSON.stringify(answers))
     }
-  }, [userAnswers]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [userAnswers])  
 
   // 深链：外部带 sub / quizId 跳入（今日页磁贴、每日一题、图谱「出 N 题练它」…）
   useEffect(() => {
@@ -381,7 +381,6 @@ function WrongBook({ sid, onRedone }: { sid: string; onRedone: (quizId?: string)
 
   const exportWrong = async () => downloadMd('wrong', await api.exportMd(sid, 'wrong'))
 
-  let group = ''
   return (
     <>
       <div className="card" style={{ marginBottom: 18 }}>
@@ -407,9 +406,9 @@ function WrongBook({ sid, onRedone }: { sid: string; onRedone: (quizId?: string)
           </button>
         </div>
       </div>
-      {items.map((q) => {
-        const showTopic = q.quiz_topic !== group
-        group = q.quiz_topic
+      {items.map((q, i) => {
+        // 测验分组头：与前一题的 quiz_topic 比较（不在渲染期改写外层变量）
+        const showTopic = i === 0 || q.quiz_topic !== items[i - 1].quiz_topic
         return (
           <div key={q.id}>
             {showTopic && <p className="sub" style={{ margin: '14px 0 6px' }}>来自：{q.quiz_topic || '综合练习'}</p>}
@@ -458,7 +457,7 @@ function TeachView({ sid }: { sid: string }) {
   useEffect(() => {
     setTopic(sessionStorage.getItem(`sp-teach-topic-${sid}`) || '')
     setExplanation(sessionStorage.getItem(`sp-teach-text-${sid}`) || '')
-  }, [sid]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sid])  
   useEffect(() => {
     if (topic) sessionStorage.setItem(`sp-teach-topic-${sid}`, topic)
     if (explanation) sessionStorage.setItem(`sp-teach-text-${sid}`, explanation)

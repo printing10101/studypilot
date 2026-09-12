@@ -8,12 +8,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Any
 
 from . import db
+
+log = logging.getLogger("studypilot.study_metrics")
 
 # 方法名（中文/近义）→ 方法 id，用于把 plan_tasks.method 映射到目录
 _METHOD_ALIASES = {
@@ -385,7 +387,7 @@ def exam_countdown(space_id: str = "") -> dict | None:
             ld = daily_load(space_id)
             load_hint = ld["advice"]
         except Exception:
-            pass
+            log.warning("考试倒计时的负载提示计算失败（load_hint 留空）", exc_info=True)
     return {
         "deadline": deadline,
         "days_left": days_left,

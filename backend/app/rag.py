@@ -36,8 +36,8 @@ def _read_pptx(path: str) -> str:
     老的二进制 .ppt 格式不是 zip，不支持（调用方提示转存为 .pptx 或导出 PDF）。
     """
     import re
-    import zipfile
     import xml.etree.ElementTree as ET
+    import zipfile
 
     A_T = "{http://schemas.openxmlformats.org/drawingml/2006/main}t"
     MAX_XML_BYTES = 2 * 1024 * 1024  # 单个 slide/notes XML 条目上限
@@ -204,7 +204,8 @@ def index_document(space_id: str, document_id: str) -> int:
         if not chunks:
             raise ValueError("未解析到文本内容")
         vecs = llm.embed(chunks)
-        db.insert_vectors([(space_id, document_id, i, c, v) for i, (c, v) in enumerate(zip(chunks, vecs))])
+        db.insert_vectors([(space_id, document_id, i, c, v)
+                          for i, (c, v) in enumerate(zip(chunks, vecs, strict=True))])
         db.update_document(document_id, status="ready", chunks=len(chunks))
         return len(chunks)
     except Exception as e:  # 记录错误状态供前端展示
@@ -273,7 +274,7 @@ def _bm25_scores(space_id: str, rows: list[dict], query: str) -> list[tuple[int,
     if not q_terms:
         return []
     out = []
-    for i, (tf, dl) in enumerate(zip(index["tfs"], index["lens"])):
+    for i, (tf, dl) in enumerate(zip(index["tfs"], index["lens"], strict=True)):
         s = 0.0
         for t in q_terms:
             f = tf.get(t, 0)

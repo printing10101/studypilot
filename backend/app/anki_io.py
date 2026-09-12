@@ -11,10 +11,9 @@ import re
 import sqlite3
 import tempfile
 import time
-import uuid
 import zipfile
 
-from . import db, fsrs
+from . import db
 
 # Anki 2.1 collection schema 关键表
 # col: 集合元数据
@@ -143,8 +142,9 @@ def import_apkg(file_bytes: bytes, space_id: str) -> dict:
             pending.append({
                 "card": {"front": note["front"], "back": note["back"],
                          "point": note["tags"] or ""},
+                # 与 flashcards 调度 UPDATE 的 10 个绑定一一对应（step 无 Anki 对应物，置 None）
                 "sched": (min(5, max(1, int(stability / 7) + 1)), due_at,
-                          fsrs_state, stability, diff,
+                          fsrs_state, None, stability, diff,
                           now_ts - (ivl * 86400 if ivl > 0 else 0), reps, lapses),
             })
 
@@ -155,7 +155,8 @@ def import_apkg(file_bytes: bytes, space_id: str) -> dict:
             c2.executemany(
                 "UPDATE flashcards SET box=?, due_at=?, state=?, step=?, "
                 "stability=?, difficulty=?, last_review=?, reps=?, lapses=? WHERE id=?",
-                [(*p["sched"], fid) for p, fid in zip(pending, (s["id"] for s in saved))])
+                [(*p["sched"], fid)
+                 for p, fid in zip(pending, (s["id"] for s in saved), strict=True)])
             c2.commit()
             imported = len(saved)
         else:

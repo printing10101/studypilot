@@ -49,6 +49,19 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8178
 cd frontend && pnpm install && pnpm dev   # http://localhost:5173
 ```
 
+## 代码质量门禁
+
+- **后端结构**：`app/main.py` 只做 app 装配（中间件 / 启动钩子 / 路由注册 / 静态托管），
+  路由按领域实现在 `app/routers/`（profile、audit、campus、library、spaces、chat、
+  skills、study、insights、career、admin），共享工具在 `app/routers/common.py`。
+  新增端点请落到对应领域模块，不要回填 main.py。
+- **Lint**：后端 `uvx ruff check .`（配置在 `backend/pyproject.toml`）；
+  前端 `pnpm lint`（配置在 `frontend/eslint.config.js`）。
+- **测试**：`cd backend && uv run pytest`——单测只覆盖确定性逻辑（规则/解析/存储/调度），
+  不调模型；数据库/上传目录由 `tests/conftest.py` 重定向到一次性临时目录。
+- **CI**：`.github/workflows/ci.yml` 在 GitHub 上跑 ruff + ESLint + 前端构建；
+  pytest 因依赖体积（torch）作为本地提交前门禁。
+
 ## 使用闭环
 
 1. 新建课程空间（如"清华普通物理"）

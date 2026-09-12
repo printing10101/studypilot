@@ -12,7 +12,7 @@
 import difflib
 import json
 
-from . import db, experts, handbook, llm, syllabus
+from . import db, handbook, llm, syllabus
 
 GOALS = {
     "保研": "保持排名冲击推免资格：绩点保卫、夏令营材料、科研竞赛加成、九月推免与统考兜底",

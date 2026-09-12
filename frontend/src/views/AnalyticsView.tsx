@@ -215,7 +215,6 @@ function forceLayout(nodes: GraphNode[], edges: GraphEdge[]) {
 }
 
 function GraphCard({ sid, data, onGoto }: { sid: string; data: GraphData | null; onGoto: (t: string, extra?: NavExtra) => void }) {
-  const { toast } = useUX()
   const [sel, setSel] = useState('')
   useEffect(() => { setSel('') }, [data])
 
