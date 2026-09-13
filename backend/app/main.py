@@ -1,7 +1,7 @@
 """FastAPI 入口：app 装配（中间件 / 启动钩子 / 路由注册 / 静态托管）。
 
 路由实现按领域拆在 app/routers/ 下：profile、audit、campus、library、spaces、
-chat、skills、study、insights、career、admin；共享工具在 routers/common.py。
+chat、skills、study、insights、career、notify、admin；共享工具在 routers/common.py。
 """
 import logging
 import pathlib
@@ -11,7 +11,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import connectors, db, library, note_review
-from .routers import admin, audit, campus, career, chat, insights, profile, skills, spaces, study
+from .routers import admin, audit, campus, career, chat, insights, notify, profile, skills, spaces, study
 from .routers import library as library_routes
 
 app = FastAPI(title="StudyPilot", version="0.1.0")
@@ -52,6 +52,12 @@ def _start_campus_sync():
 
 
 @app.on_event("startup")
+def _start_notify_push():
+    from . import notify
+    notify.start_background_loop()
+
+
+@app.on_event("startup")
 def _startup_migrations():
     note_review.ensure_doc_fsrs_columns()
     n = db.reset_stale_pending()
@@ -63,7 +69,7 @@ def _startup_migrations():
 
 # ---------- 路由注册 ----------
 
-for _r in (profile, audit, campus, library_routes, spaces, chat, skills, study, insights, career, admin):
+for _r in (profile, audit, campus, library_routes, spaces, chat, skills, study, insights, career, notify, admin):
     app.include_router(_r.router)
 
 # ---------- 桌面模式：托管前端构建产物（SPA） ----------

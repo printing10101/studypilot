@@ -267,8 +267,12 @@ export interface CampusItem {
   id: number; source: string; title: string; url: string
   published: string; fetched_at: number
 }
-export interface CampusStatus {
-  network: {
+export interface NotifyCfg {
+  enabled: boolean; channel: string
+  serverchan_sendkey: string; wecom_webhook: string; push_hour: number
+}
+export interface NotifyStatus { config: NotifyCfg; last_push_date: string; last_error: string }
+export interface CampusStatus {  network: {
     state: 'campus' | 'campus_likely' | 'public' | 'offline'
     label: string; detail: string
     latency_campus_ms: number | null; latency_external_ms: number | null
@@ -577,6 +581,16 @@ export const api = {
     j<CampusStatus>(fetch(`${BASE}/api/campus/config`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
     })),
+  // ---- 外部推送提醒 ----
+  notifyStatus: () => j<NotifyStatus>(fetch(`${BASE}/api/notify`)),
+  saveNotify: (patch: Partial<NotifyCfg>) =>
+    j<{ config: NotifyCfg }>(fetch(`${BASE}/api/notify`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
+    })),
+  testNotify: () => j<{ ok: boolean; error?: string }>(
+    fetch(`${BASE}/api/notify/test`, { method: 'POST' })),
+  pushNotify: () => j<{ pushed: boolean; reason: string }>(
+    fetch(`${BASE}/api/notify/push`, { method: 'POST' })),
 }
 
 // SSE 帧解析（chatStream / runSkillStream 共用）：按 \n\n 分帧可抗 chunk 分包截断，

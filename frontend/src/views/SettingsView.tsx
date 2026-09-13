@@ -1,6 +1,6 @@
-// 模型设置：本地/云端双通道路由 + MCP 连接器 + LLM 用量仪表盘 + 专家团/技能/课程图谱
+// 模型设置：本地/云端双通道路由 + MCP 连接器 + LLM 用量仪表盘 + 专家团/技能/课程图谱 + 推送提醒
 import { useEffect, useState } from 'react'
-import { api, CurriculumMeta, LlmStatus, UsageDashboard } from '../api'
+import { api, CurriculumMeta, LlmStatus, NotifyStatus, UsageDashboard } from '../api'
 import { Icon } from '../ui'
 import { useUX } from '../ux'
 
@@ -278,6 +278,116 @@ export function SettingsView() {
           ))}
           {!curricula.length && <span className="sub">暂无内置课程图谱数据</span>}
         </div>
+      </div>
+
+      <NotifyCard />
+    </div>
+  )
+}
+
+// ---------- 外部推送提醒（Server酱 / 企业微信群机器人） ----------
+
+function NotifyCard() {
+  const { toast } = useUX()
+  const [st, setSt] = useState<NotifyStatus | null>(null)
+  const [enabled, setEnabled] = useState(false)
+  const [channel, setChannel] = useState('serverchan')
+  const [sendkey, setSendkey] = useState('')
+  const [webhook, setWebhook] = useState('')
+  const [pushHour, setPushHour] = useState(8)
+  const [busy, setBusy] = useState('')
+  const loaded = !!st
+
+  const refresh = () => api.notifyStatus().then((s) => {
+    setSt(s)
+    setEnabled(s.config.enabled)
+    setChannel(s.config.channel)
+    setSendkey(s.config.serverchan_sendkey)   // 掩码值：原样回填，保存时服务端会忽略
+    setWebhook(s.config.wecom_webhook)
+    setPushHour(s.config.push_hour)
+  }).catch(() => {})
+  useEffect(() => { refresh() }, [])
+
+  const save = async () => {
+    setBusy('save')
+    try {
+      await api.saveNotify({ enabled, channel, serverchan_sendkey: sendkey,
+        wecom_webhook: webhook, push_hour: pushHour })
+      toast('success', '推送配置已保存')
+      refresh()
+    } catch (e: any) { toast('error', '保存失败：' + (e.message || '未知错误')) }
+    setBusy('')
+  }
+  const test = async () => {
+    setBusy('test')
+    try {
+      const r = await api.testNotify()
+      if (r.ok) toast('success', '测试消息已发送，去微信看看')
+      else toast('error', '测试失败：' + (r.error || '未知错误'))
+    } catch (e: any) { toast('error', e.message) }
+    setBusy('')
+  }
+  const pushNow = async () => {
+    setBusy('push')
+    try {
+      const r = await api.pushNotify()
+      toast(r.pushed ? 'success' : 'info',
+        r.pushed ? '今日摘要已推送' : `未推送（${r.reason}）`)
+    } catch (e: any) { toast('error', e.message) }
+    setBusy('')
+  }
+
+  return (
+    <div className="card" style={{ marginBottom: 18 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        <h3 style={{ margin: 0 }}>推送提醒 · 人不在电脑前也不漏复习</h3>
+        {st?.last_push_date && <span className="badge">上次推送 {st.last_push_date}</span>}
+      </div>
+      <p className="sub" style={{ marginTop: 6 }}>
+        每天最多推 1 次：首次发现「有到期知识点 / 闪卡 / 逾期任务」时，把跨空间摘要推到微信。
+        Server酱（sctapi.ftqq.com 免费申请 SendKey，推到微信服务号）或企业微信群机器人 webhook 二选一。
+      </p>
+      <div style={{ display: 'grid', gap: 10, maxWidth: 640, margin: '14px 0' }}>
+        <label style={{ display: 'flex', gap: 10, alignItems: 'center', cursor: 'pointer' }}>
+          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+          <b>启用每日推送</b>
+        </label>
+        <div style={{ display: 'flex', gap: 12 }}>
+          <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }}>
+            <input type="radio" name="notify-ch" checked={channel === 'serverchan'} onChange={() => setChannel('serverchan')} />
+            <span>Server酱（微信）</span>
+          </label>
+          <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }}>
+            <input type="radio" name="notify-ch" checked={channel === 'wecom_webhook'} onChange={() => setChannel('wecom_webhook')} />
+            <span>企业微信群机器人</span>
+          </label>
+        </div>
+        {channel === 'serverchan' ? (
+          <input type="password" placeholder={st?.config.serverchan_sendkey || 'Server酱 SendKey（SCT 开头）'}
+            value={sendkey} onChange={(e) => setSendkey(e.target.value)} />
+        ) : (
+          <input type="text" placeholder={st?.config.wecom_webhook || '企业微信群机器人 webhook 地址（qyapi.weixin.qq.com/…）'}
+            value={webhook} onChange={(e) => setWebhook(e.target.value)} />
+        )}
+        <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13 }}>
+          不早于
+          <input type="number" min={0} max={23} value={pushHour} style={{ width: 70 }}
+            onChange={(e) => setPushHour(Number(e.target.value))} /> 点推送
+        </label>
+      </div>
+      {st?.last_error && (
+        <p style={{ color: 'var(--red)', fontSize: 12, margin: '0 0 10px' }}>上次错误：{st.last_error}</p>
+      )}
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+        <button className="btn" disabled={!loaded || !!busy} onClick={save}>
+          {busy === 'save' ? <><span className="spin" /> 保存中</> : '保存配置'}
+        </button>
+        <button className="btn ghost" disabled={!!busy} onClick={test}>
+          {busy === 'test' ? <><span className="spin" /> 发送中</> : '测试推送'}
+        </button>
+        <button className="btn ghost" disabled={!!busy} onClick={pushNow}>
+          {busy === 'push' ? <><span className="spin" /> 推送中</> : '立即推送今日摘要'}
+        </button>
       </div>
     </div>
   )
