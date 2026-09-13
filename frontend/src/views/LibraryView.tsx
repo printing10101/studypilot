@@ -26,13 +26,14 @@ export function LibraryView({ spaces, currentSid }: { spaces: Space[]; currentSi
 // ---------- 上：本空间讲义（RAG） ----------
 
 function SpaceDocsCard({ sid, spaceName }: { sid: string; spaceName: string }) {
-  const { toast, confirm: uxConfirm } = useUX()
+  const { toast, confirm: uxConfirm, prompt: uxPrompt } = useUX()
   const [docs, setDocs] = useState<Doc[]>([])
   const [busy, setBusy] = useState(false)
   const [prog, setProg] = useState({ done: 0, total: 0 })
   const [loadErr, setLoadErr] = useState(false)
   const [lastErrors, setLastErrors] = useState<string[]>([])  // 批量导入失败清单：toast 3 秒读不完，改为常驻可关闭
   const [reindexing, setReindexing] = useState('')
+  const [importing, setImporting] = useState(false)
   const seq = useRef(0)
   const refresh = () => {
     const id = ++seq.current
@@ -83,6 +84,22 @@ function SpaceDocsCard({ sid, spaceName }: { sid: string; spaceName: string }) {
     setReindexing('')
   }
 
+  // B站视频字幕导入：有 CC/AI 字幕的视频转写为时间戳文档参与检索
+  const importVideo = async () => {
+    const url = await uxPrompt({
+      title: '导入 B 站视频字幕', label: '粘贴视频链接或 BV 号',
+      placeholder: 'https://www.bilibili.com/video/BV… 或 BV1xx411c7mD',
+    })
+    if (url === null || !url.trim()) return
+    setImporting(true)
+    try {
+      const r = await api.importVideo(sid, url.trim())
+      toast('success', `已导入《${r.title}》字幕（${r.chunks} 个分块），答疑引用自带时间戳`)
+      refresh()
+    } catch (e: any) { toast('error', '视频导入失败：' + (e.message || '未知错误')) }
+    setImporting(false)
+  }
+
   const removeDoc = async (d: Doc) => {
     if (!(await uxConfirm({ title: '删除讲义', message: `删除《${d.filename}》？向量与上传文件会一并清理。`, confirmText: '删除', danger: true }))) return
     try {
@@ -102,6 +119,10 @@ function SpaceDocsCard({ sid, spaceName }: { sid: string; spaceName: string }) {
           <input type="file" multiple accept={ACCEPT} style={{ display: 'none' }}
             onChange={(e) => upload(e.target.files)} disabled={busy} />
         </label>
+        <button className="btn ghost" disabled={busy || importing} onClick={importVideo}
+          title="拉取 B 站 CC/AI 字幕，转写为带 [mm:ss] 时间戳的文档参与答疑检索">
+          {importing ? <><span className="spin" /> 正在导入…</> : '导入B站视频'}
+        </button>
       </div>
       <p className="sub" style={{ marginTop: 6 }}>
         上传后自动解析建立语义索引，答疑/出题时检索引用并标注来源。支持 PDF / PPTX 课件（含讲者备注）/

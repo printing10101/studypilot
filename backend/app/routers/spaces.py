@@ -6,7 +6,7 @@ import tempfile
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from .. import db, ingest, rag
+from .. import db, ingest, rag, video
 from .common import MAX_UPLOAD_BYTES, UPLOAD_ROOT, display_name, file_sha256, save_upload_capped, space_or_404
 
 router = APIRouter()
@@ -15,6 +15,10 @@ router = APIRouter()
 class SpaceIn(BaseModel):
     name: str
     description: str = ""
+
+
+class VideoImportIn(BaseModel):
+    url: str
 
 
 @router.get("/api/spaces")
@@ -128,6 +132,19 @@ def api_reindex_document(sid: str, did: str):
             db.update_document(did, status="ready", error="")
             raise HTTPException(400, f"重新索引失败（原索引未受影响，仍可正常检索）: {e}") from e
         raise HTTPException(400, f"重新索引失败: {e}") from e
+
+
+@router.post("/api/spaces/{sid}/video/import")
+def api_import_video(sid: str, body: VideoImportIn):
+    """B站视频字幕导入：拉取 CC/AI 字幕，转写为带 [mm:ss] 时间戳的文档参与 RAG。
+    无字幕/网络失败给可读错误；域名白名单限定 B 站官方接口与 CDN。"""
+    space_or_404(sid)
+    try:
+        return video.ingest_video(sid, body.url)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        raise HTTPException(502, f"视频导入失败: {str(e)[:200]}") from e
 
 
 @router.delete("/api/spaces/{sid}/documents/{did}")

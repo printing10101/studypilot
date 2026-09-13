@@ -338,6 +338,12 @@ export const api = {
   reindexDoc: (sid: string, did: string) =>
     j<{ id: string; status: string; chunks: number }>(
       fetch(`${BASE}/api/spaces/${sid}/documents/${did}/reindex`, { method: 'POST' })),
+  // B站视频字幕导入：拉 CC/AI 字幕转写为带 [mm:ss] 时间戳的文档参与 RAG
+  importVideo: (sid: string, url: string) =>
+    j<{ id: string; bvid: string; title: string; subtitle_lan: string; status: string; chunks: number; note?: string }>(
+      fetch(`${BASE}/api/spaces/${sid}/video/import`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }),
+      })),
   listMessages: (sid: string, opts: { limit?: number; before?: number } = {}) =>
     j<{ messages: Msg[]; has_more: boolean }>(
       fetch(`${BASE}/api/spaces/${sid}/messages?limit=${opts.limit ?? 200}${opts.before != null ? `&before=${opts.before}` : ''}`)),
