@@ -62,6 +62,16 @@ def api_mastery_history(sid: str, limit: int = 500):
     return db.list_mastery_history(sid, limit=min(max(limit, 10), 5000))
 
 
+@router.get("/api/spaces/{sid}/mastery/evidence")
+def api_point_evidence(sid: str, point: str):
+    """知识点判定溯源：掌握度现状 + 判卷/反馈证据时间线（可检视记忆）。"""
+    space_or_404(sid)
+    r = db.point_evidence(sid, point)
+    if not r:
+        raise HTTPException(404, "未找到该知识点的掌握度记录")
+    return r
+
+
 # ---------- 错题本 ----------
 
 @router.get("/api/spaces/{sid}/wrong-questions")

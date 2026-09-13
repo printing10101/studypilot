@@ -1,4 +1,5 @@
 """SQLite 持久化层：项目空间、文档、消息、测验、三层记忆、向量。"""
+import difflib
 import json
 import logging
 import os
@@ -1100,6 +1101,63 @@ def list_mastery_history(space_id: str, limit: int = 500) -> list[dict[str, Any]
         "  ORDER BY created_at DESC LIMIT ?"
         ") ORDER BY created_at", (space_id, max(1, limit))).fetchall()
     return rows_to_dicts(rows)
+
+
+_POINT_MATCH_RATIO = 0.65  # 与 defects._error_stats_bulk 同一阈值：避免「导数应用/导数定义」互相串扰
+
+
+def point_evidence(space_id: str, point: str, limit: int = 60) -> dict[str, Any] | None:
+    """知识点判定溯源（DeepTutor 式 evidence↔synthesis）：掌握度现状 + 证据时间线。
+
+    证据两类来源合并成一条时间线：
+    - quiz_records：判卷答案中 knowledge_point 与该点模糊匹配（阈值同缺陷诊断），
+      关联到具体卷子（topic/verdict/作答/错因），并就近吸附 mastery_history 的调分结果——
+      学生能看到「哪次练习把掌握度调到了多少」；
+    - mastery_history 剩余行：无对应卷子的调整（对话反馈「没听懂」、讲解检验等）单列。
+    """
+    point = (point or "").strip()
+    if not point:
+        return None
+    mastery = get_mastery_point(space_id, point)
+    if not mastery:
+        return None
+    hist = [h for h in list_mastery_history(space_id, limit=2000) if h["point"] == point]
+    hist_used: set[int] = set()
+    events: list[dict[str, Any]] = []
+    for q in list_quizzes(space_id):
+        for a in q["answers"]:
+            kp = str(a.get("knowledge_point") or "").strip()
+            if not kp or not a.get("verdict"):
+                continue
+            if not (kp == point or kp in point or point in kp
+                    or difflib.SequenceMatcher(None, kp, point).ratio() >= _POINT_MATCH_RATIO):
+                continue
+            ts = q["created_at"] or 0
+            # 就近吸附同一时刻的调分行（判卷 → adjust_mastery → history 间隔毫秒级）
+            score_after, hit = None, None
+            for i, h in enumerate(hist):
+                if i in hist_used:
+                    continue
+                if abs((h["created_at"] or 0) - ts) < 3.0 and h["verdict"]:
+                    score_after, hit = h["score"], i
+                    break
+            if hit is not None:
+                hist_used.add(hit)
+            events.append({
+                "ts": ts, "kind": "quiz", "topic": q.get("topic") or "",
+                "verdict": a.get("verdict"),
+                "user_answer": str(a.get("user_answer") or "")[:120],
+                "analysis": str(a.get("analysis") or "")[:200],
+                "error_type": str(a.get("error_type") or ""),
+                "score_after": score_after,
+            })
+    for i, h in enumerate(hist):
+        if i in hist_used:
+            continue
+        events.append({"ts": h["created_at"] or 0, "kind": "adjust",
+                       "verdict": h["verdict"], "score_after": h["score"]})
+    events.sort(key=lambda e: e["ts"])
+    return {"point": point, "mastery": mastery, "events": events[-limit:]}
 
 
 def get_mastery_point(space_id: str, point: str) -> dict[str, Any] | None:

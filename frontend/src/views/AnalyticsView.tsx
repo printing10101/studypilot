@@ -1,7 +1,7 @@
 // 学习分析：薄弱诊断（缺陷 + 依赖图谱）· 掌握度趋势（含 BKT 个性化拟合）· 记忆档案（L1/L2/L3）
 // 原名「记忆图谱」，一页塞了四件事；现按用途拆成三个子页签，构建图谱按钮只保留一个
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { api, BktParam, DefectDiag, GraphData, GraphEdge, GraphNode, MasteryData, MasteryHistoryPoint, MemoryData, NavExtra, runSkillStream } from '../api'
+import { api, BktParam, DefectDiag, EvidenceData, GraphData, GraphEdge, GraphNode, MasteryData, MasteryHistoryPoint, MemoryData, NavExtra, runSkillStream } from '../api'
 import { downloadMd, Icon, SubTabs } from '../ui'
 import { Md } from '../md'
 import { useUX } from '../ux'
@@ -307,6 +307,7 @@ function GraphCard({ sid, data, onGoto }: { sid: string; data: GraphData | null;
             <span className="sub">
               前置：{ups.join('、') || '（无）'}　→　后继：{downs.join('、') || '（无）'}
             </span>
+            <EvidenceSection sid={sid} point={nd.point} />
           </div>
         )
       })()}
@@ -315,6 +316,59 @@ function GraphCard({ sid, data, onGoto }: { sid: string; data: GraphData | null;
 }
 
 // ---------- 子页 2：掌握度趋势（知识点掌握 + 折线 + BKT 个性化拟合） ----------
+
+const VERDICT_CN: Record<string, string> = {
+  对: '答对', 部分对: '部分对', 错: '答错',
+  correct: '答对', partial: '部分对', wrong: '答错',
+  confused: '没听懂', progress: '讲解有进步',
+}
+
+// 证据溯源：点开看这个掌握度是怎么一步步来的（哪次练习/反馈调的分）
+function EvidenceSection({ sid, point }: { sid: string; point: string }) {
+  const [data, setData] = useState<EvidenceData | null>(null)
+  const [loading, setLoading] = useState(false)
+  const toggle = async () => {
+    if (data) { setData(null); return }
+    setLoading(true)
+    try { setData(await api.pointEvidence(sid, point)) }
+    catch { setData(null) }  // 无记录/加载失败都静默收起：溯源是辅助信息，不打断主流程
+    setLoading(false)
+  }
+  return (
+    <div style={{ display: 'grid', gap: 6 }}>
+      <div>
+        <button className="btn ghost small" disabled={loading} onClick={toggle}>
+          {loading ? <><span className="spin" /> 加载中</> : data ? '收起溯源' : '证据溯源'}
+        </button>
+        <span className="sub" style={{ marginLeft: 8 }}>这个掌握度是怎么一步步来的</span>
+      </div>
+      {data && (
+        <div style={{ maxHeight: 240, overflowY: 'auto', display: 'grid', gap: 4, fontSize: 12.5 }}>
+          {!data.events.length && <span className="sub">还没有作答或反馈记录</span>}
+          {data.events.slice().reverse().map((e, i) => (
+            <div key={i} style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+              <span className="sub" style={{ flexShrink: 0 }}>
+                {new Date(e.ts * 1000).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+              </span>
+              {e.kind === 'quiz' ? (
+                <span>
+                  测验《{e.topic || '未命名'}》{VERDICT_CN[e.verdict] || e.verdict}
+                  {e.error_type && <span className="badge expert" style={{ marginLeft: 6 }}>{e.error_type}</span>}
+                  {e.score_after != null && <b style={{ marginLeft: 6 }}>→ {Math.round(e.score_after * 100)}%</b>}
+                  {e.analysis && <span className="sub">　{e.analysis}</span>}
+                </span>
+              ) : (
+                <span>反馈调整{e.verdict ? `（${VERDICT_CN[e.verdict] || e.verdict}）` : ''}
+                  {e.score_after != null && <b style={{ marginLeft: 6 }}>→ {Math.round(e.score_after * 100)}%</b>}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
 
 // 「出 N 题练它」：流式端点带阶段进度与取消（同步版是约 1 分钟的黑盒长请求，
 // 此前连点会连出多份卷，现在有 busy 态 + 阶段提示）

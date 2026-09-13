@@ -138,6 +138,15 @@ export interface GraphNode {
 export interface GraphEdge { from_point: string; to_point: string; source: string }
 export interface GraphData { nodes: GraphNode[]; edges: GraphEdge[] }
 export interface MasteryHistoryPoint { point: string; score: number; verdict: string; created_at: number }
+export interface EvidenceEvent {
+  ts: number; kind: 'quiz' | 'adjust'; verdict: string; score_after: number | null
+  topic?: string; user_answer?: string; analysis?: string; error_type?: string
+}
+export interface EvidenceData {
+  point: string
+  mastery: MasteryPoint
+  events: EvidenceEvent[]
+}
 export interface TeachResult {
   verdict: string; missed: string[]; wrong: string[]
   analysis: string; knowledge_point: string
@@ -454,6 +463,9 @@ export const api = {
     j<AuditResult>(fetch(`${BASE}/api/audit/run?school=${encodeURIComponent(school)}&major=${encodeURIComponent(major)}`)),
   graph: (sid: string) => j<GraphData>(fetch(`${BASE}/api/spaces/${sid}/graph`)),
   masteryHistory: (sid: string) => j<MasteryHistoryPoint[]>(fetch(`${BASE}/api/spaces/${sid}/mastery/history`)),
+  // 知识点判定溯源：掌握度现状 + 判卷/反馈证据时间线
+  pointEvidence: (sid: string, point: string) =>
+    j<EvidenceData>(fetch(`${BASE}/api/spaces/${sid}/mastery/evidence?point=${encodeURIComponent(point)}`)),
   importUrl: (url: string, title: string) =>
     j<{ id: string; title: string; chars: number }>(fetch(`${BASE}/api/library/url`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url, title }),
