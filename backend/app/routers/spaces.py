@@ -105,21 +105,28 @@ def api_upload(sid: str, file: UploadFile = File(...)):
 @router.post("/api/spaces/{sid}/documents/{did}/reindex")
 def api_reindex_document(sid: str, did: str):
     """重新索引失败/中断的文档：磁盘原文件还在时不必删掉重传整个文件。
-    此前索引失败只有一个出口——删除后重传，大文件代价很高。"""
+    此前索引失败只有一个出口——删除后重传，大文件代价很高。
+
+    向量写入是原子换版（db.replace_vectors）：不再预先 clear_vectors，
+    重新索引失败时已索引文档的旧向量原样保留、检索不受影响。"""
     space_or_404(sid)
     doc = db.get_document(did)
     if not doc or doc["space_id"] != sid:
         raise HTTPException(404, "文档不存在")
     if not doc["path"] or not os.path.exists(doc["path"]):
         raise HTTPException(400, "原文件已丢失，请删除该讲义后重新上传")
+    prev_status = doc["status"]
     db.update_document(did, status="pending", error="")
-    db.clear_vectors(did)
     try:
         n = rag.index_document(sid, did)
         return {"id": did, "status": "ready", "chunks": n}
     except HTTPException:
         raise
     except Exception as e:
+        # 旧索引还在（原子换版保证）：已索引文档恢复 ready，学生可继续用旧索引检索
+        if prev_status == "ready" and any(r["document_id"] == did for r in db.space_chunks(sid)):
+            db.update_document(did, status="ready", error="")
+            raise HTTPException(400, f"重新索引失败（原索引未受影响，仍可正常检索）: {e}") from e
         raise HTTPException(400, f"重新索引失败: {e}") from e
 
 

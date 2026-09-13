@@ -268,6 +268,16 @@ CREATE TABLE IF NOT EXISTS campus_items(
   fetched_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_campus_source ON campus_items(source, published);
+CREATE TABLE IF NOT EXISTS visuals(
+  id TEXT PRIMARY KEY,
+  space_id TEXT NOT NULL,
+  topic TEXT NOT NULL,             -- 可视化的知识点/主题
+  title TEXT DEFAULT '',           -- 展示标题
+  summary TEXT DEFAULT '',         -- 一句话直觉解释
+  spec TEXT NOT NULL,              -- json 结构化可视化规格（steps/analogy/formula）
+  created_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_vis_space ON visuals(space_id);
 """
 
 _local = threading.local()  # 线程本地连接：FastAPI 线程池并发共享单连接会触发 sqlite3 InterfaceError
@@ -702,6 +712,26 @@ def insert_vectors(rows: list[tuple[str, str, int, str, list[float]]]) -> None:
     c.commit()
 
 
+def replace_vectors(document_id: str, rows: list[tuple[str, str, int, str, list[float]]]) -> None:
+    """原子换版重索引：单事务内「删旧向量 + 写新向量」一起提交（DeepTutor 版本化思路的库内适配）。
+
+    此前 reindex 是「先 clear_vectors 再逐条 INSERT」，中途失败会留下
+    「旧索引已删、新索引未写」的空窗——原本能检索的文档反而彻底不可检索。
+    换版语义：新向量全部构建成功后才落库替换，失败时旧索引原样保留。"""
+    import struct
+    c = get_conn()
+    try:
+        c.execute("DELETE FROM vectors WHERE document_id=?", (document_id,))
+        c.executemany(
+            "INSERT OR REPLACE INTO vectors(id,space_id,document_id,chunk_index,text,embedding) VALUES(?,?,?,?,?,?)",
+            [(new_id(), sid, did, idx, text, struct.pack(f"{len(emb)}f", *emb))
+             for sid, did, idx, text, emb in rows])
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+
+
 def search_vectors(space_id: str, query_emb: list[float], top_k: int = 6) -> list[dict[str, Any]]:
     import numpy as np
     rows = get_conn().execute(
@@ -735,6 +765,41 @@ def space_chunks(space_id: str) -> list[dict[str, Any]]:
 def doc_filename(document_id: str) -> str:
     r = get_conn().execute("SELECT filename FROM documents WHERE id=?", (document_id,)).fetchone()
     return r["filename"] if r else "unknown"
+
+
+# ---------- 概念可视化 ----------
+
+def save_visual(space_id: str, topic: str, title: str, summary: str, spec: dict) -> str:
+    c = get_conn()
+    vid = new_id()
+    c.execute("INSERT INTO visuals(id,space_id,topic,title,summary,spec,created_at) VALUES(?,?,?,?,?,?,?)",
+              (vid, space_id, topic, title, summary,
+               json.dumps(spec, ensure_ascii=False), now()))
+    c.commit()
+    return vid
+
+
+def list_visuals(space_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    """可视化存档列表（不含 spec 大字段，列表页只展示标题/摘要）。"""
+    rows = get_conn().execute(
+        "SELECT id,topic,title,summary,created_at FROM visuals WHERE space_id=? ORDER BY created_at DESC LIMIT ?",
+        (space_id, limit)).fetchall()
+    return rows_to_dicts(rows)
+
+
+def get_visual(vid: str) -> dict[str, Any] | None:
+    r = get_conn().execute("SELECT * FROM visuals WHERE id=?", (vid,)).fetchone()
+    if not r:
+        return None
+    d = dict(r)
+    d["spec"] = _safe_json(d.get("spec"), {})
+    return d
+
+
+def delete_visual(vid: str) -> None:
+    c = get_conn()
+    c.execute("DELETE FROM visuals WHERE id=?", (vid,))
+    c.commit()
 
 
 # ---------- 教材书库 ----------

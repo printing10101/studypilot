@@ -194,7 +194,10 @@ def chunk_text(text: str) -> list[str]:
 
 
 def index_document(space_id: str, document_id: str) -> int:
-    """解析并向量化一个已上传文档，返回 chunk 数。"""
+    """解析并向量化一个已上传文档，返回 chunk 数。
+
+    向量写入走 db.replace_vectors 原子换版：解析/嵌入全部成功后才替换旧索引，
+    中途失败时已索引文档的旧向量原样保留（重新索引不再有"删了旧的、新的没写上"的空窗）。"""
     doc = db.get_document(document_id)
     if not doc:
         raise ValueError("文档不存在")
@@ -204,8 +207,9 @@ def index_document(space_id: str, document_id: str) -> int:
         if not chunks:
             raise ValueError("未解析到文本内容")
         vecs = llm.embed(chunks)
-        db.insert_vectors([(space_id, document_id, i, c, v)
-                          for i, (c, v) in enumerate(zip(chunks, vecs, strict=True))])
+        rows = [(space_id, document_id, i, c, v)
+                for i, (c, v) in enumerate(zip(chunks, vecs, strict=True))]
+        db.replace_vectors(document_id, rows)
         db.update_document(document_id, status="ready", chunks=len(chunks))
         return len(chunks)
     except Exception as e:  # 记录错误状态供前端展示
