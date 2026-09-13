@@ -16,6 +16,7 @@ export function ChatView({ sid, llmOk = true, onOpenSettings }: {
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState('')
+  const [viz, setViz] = useState<{ title: string; html: string } | null>(null)
   const [fbGiven, setFbGiven] = useState<Record<string, string>>({})
   const bottom = useRef<HTMLDivElement>(null)
   const nearBottom = useRef(true)
@@ -164,6 +165,21 @@ export function ChatView({ sid, llmOk = true, onOpenSettings }: {
     setBusy(false)
   }
 
+  // 概念可视化：抽象知识点 → 交互式讲解页（后端模板渲染，sandbox iframe 展示）
+  const makeViz = async () => {
+    const topic = await uxPrompt({
+      title: '概念可视化', label: '输入想「看见」的知识点',
+      placeholder: '如：傅里叶变换 / 高斯定理 / 弯矩图',
+    })
+    if (topic === null || !topic.trim()) return
+    setBusy(true); setViz(null)
+    try {
+      const r = await api.runSkill(sid, 'concept.visualize', { topic: topic.trim() })
+      setViz({ title: r.title || topic, html: r.html })
+    } catch (e: any) { toast('error', '可视化失败：' + (e.message || '未知错误')) }
+    setBusy(false)
+  }
+
   return (
     <>
       <div className="content" ref={scrollRef} onScroll={(e) => {
@@ -219,6 +235,10 @@ export function ChatView({ sid, llmOk = true, onOpenSettings }: {
               💡 引导模式 {guide ? '已开启' : '已关闭'}
             </button>
           )}
+          <button className="btn ghost small" disabled={busy} onClick={makeViz}
+            title="把抽象知识点变成可交互的分步讲解图（DeepTutor Visualize 式）">
+            <Icon name="spark" size={13} /> 概念可视化
+          </button>
           <button className="btn ghost small" disabled={busy} onClick={makeNote}><Icon name="spark" size={13} /> 讲义总结技能</button>
         </div>
 
@@ -274,6 +294,20 @@ export function ChatView({ sid, llmOk = true, onOpenSettings }: {
               <span>讲义总结</span><span className="badge">CRAFT</span>
             </div>
             <div className="bubble"><Md>{note}</Md></div>
+          </div>
+        )}
+        {viz && (
+          <div className="msg assistant">
+            <div className="who">
+              <span className="avatar ai"><Icon name="spark" size={13} /></span>
+              <span>概念可视化 · {viz.title}</span><span className="badge">CRAFT</span>
+              <div style={{ flex: 1 }} />
+              <button className="fb-btn" onClick={() => setViz(null)}>关闭</button>
+            </div>
+            {/* sandbox（无 allow-same-origin）：讲解页脚本在透明源运行，无法触碰应用与会话数据 */}
+            <iframe className="bubble" title={viz.title} sandbox="allow-scripts"
+              srcDoc={viz.html}
+              style={{ width: '100%', minHeight: 420, border: 'none', borderRadius: 12, padding: 0, background: '#fafafa' }} />
           </div>
         )}
         <div ref={bottom} />

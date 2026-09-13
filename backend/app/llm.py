@@ -42,6 +42,7 @@ TASK_ROUTING: dict[str, dict] = {
     "handbook": {"priority": "cloud", "temp": 0.3, "max_tokens": 2600},
     "competition": {"priority": "cloud", "temp": 0.4, "max_tokens": 1800},
     "syllabus": {"priority": "cloud", "temp": 0.1, "max_tokens": 1600},
+    "visualize": {"priority": "cloud", "temp": 0.4, "max_tokens": 2600},
     # 轻量 / 延迟敏感 → 本地
     "chat":    {"priority": "local", "temp": 0.6,  "max_tokens": 2048},
     "summary": {"priority": "local", "temp": 0.3,  "max_tokens": 500},

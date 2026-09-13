@@ -5,7 +5,7 @@ import logging
 import re
 import time
 
-from . import bkt_fit, db, difficulty, experts, learning_methods, llm, rag, velocity
+from . import bkt_fit, db, difficulty, experts, learning_methods, llm, rag, velocity, visual
 
 log = logging.getLogger("studypilot.skills")
 
@@ -621,4 +621,5 @@ SKILLS = {
     "teach.check": {"name": "费曼检验", "fn": teach_check},
     "graph.build": {"name": "构建知识图谱", "fn": graph_build},
     "daily.question": {"name": "今日一题", "fn": daily_question},
+    "concept.visualize": {"name": "概念可视化", "fn": visual.concept_visualize},
 }

@@ -51,6 +51,7 @@ def _clean_db():
     conn.execute("DELETE FROM syllabus_custom")
     conn.execute("DELETE FROM taken_courses")
     conn.execute("DELETE FROM campus_items")
+    conn.execute("DELETE FROM visuals")
     conn.execute("DELETE FROM spaces")
     try:
         conn.execute("DELETE FROM llm_calls")

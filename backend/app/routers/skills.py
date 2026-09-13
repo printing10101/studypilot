@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from .. import db, skills
+from .. import db, skills, visual
 
 router = APIRouter()
 
@@ -68,6 +68,8 @@ def dispatch_skill(skill: str, sid: str, p: dict, progress=None):
     if skill == "daily.question":
         # 此前 SKILLS 目录广播了 12 个技能、分发器只认 11 个，通用端点调用必 400
         return skills.daily_question(sid)
+    if skill == "concept.visualize":
+        return visual.concept_visualize(sid, p.get("topic", ""), progress=progress)
     raise KeyError(skill)
 
 
@@ -121,3 +123,35 @@ def api_quizzes(sid: str):
     for q in quizzes:
         q["questions"] = skills._public_questions(q.get("questions") or [])
     return quizzes
+
+
+# ---------- 概念可视化存档 ----------
+
+@router.get("/api/spaces/{sid}/visuals")
+def api_list_visuals(sid: str):
+    return db.list_visuals(sid)
+
+
+@router.get("/api/spaces/{sid}/visuals/{vid}")
+def api_get_visual(sid: str, vid: str):
+    """可视化详情：按当前模板版本从规格实时渲染 HTML（库里只存小规格，
+    模板升级后旧存档也能吃到新样式）。"""
+    v = db.get_visual(vid)
+    if not v or v["space_id"] != sid:
+        raise HTTPException(404, "可视化存档不存在")
+    try:
+        v["html"] = visual.render_visual_html(v["spec"])
+    except Exception:
+        # 规格意外损坏时不让详情页 500：给一个可读的错误页
+        v["html"] = ("<html><body><p>该存档的规格数据损坏，无法渲染。"
+                     "</p><p>建议删除后重新生成。</p></body></html>")
+    return v
+
+
+@router.delete("/api/spaces/{sid}/visuals/{vid}")
+def api_delete_visual(sid: str, vid: str):
+    v = db.get_visual(vid)
+    if not v or v["space_id"] != sid:
+        raise HTTPException(404, "可视化存档不存在")
+    db.delete_visual(vid)
+    return {"ok": True}
