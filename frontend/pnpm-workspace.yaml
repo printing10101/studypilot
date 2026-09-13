@@ -1,4 +1,5 @@
-# pnpm 11 起设置统一放这里（package.json 的 pnpm 字段已不再读取）
-# CI 里必须批准 esbuild 的安装脚本，否则 pnpm 10+ 默认拦截并以退出码 1 失败
-onlyBuiltDependencies:
-  - esbuild
+# pnpm 11 起设置统一放这里（package.json 的 pnpm 字段已废弃）
+# 批准 esbuild 的安装脚本：v11 起旧键 onlyBuiltDependencies 已被移除，
+# 未批准的构建脚本在默认 strictDepBuilds 下会直接 ERR_PNPM_IGNORED_BUILDS 退出
+allowBuilds:
+  esbuild: true

@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
-          # 钉住与本地验证一致的版本：11.27 起对被拦截的构建脚本直接报错退出
+          # 钉住已验证的版本，避免 pnpm 行为随 patch 漂移
           version: 11.24.0
       - uses: actions/setup-node@v4
         with:
