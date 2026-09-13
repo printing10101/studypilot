@@ -11,9 +11,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # 全历史扫描
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: gitleaks/setup-gitleaks@v2
+      # 直接用 CLI 扫全量历史：gitleaks-action 按 push 的 before/after SHA 增量扫描，
+      # force-push/历史重写后旧 SHA 不存在会导致其内部 git log 报错退出
+      - run: gitleaks detect --source . --verbose --redact
 
   backend-lint:
     runs-on: ubuntu-latest
