@@ -109,7 +109,7 @@ export function ProgramTab({ school, major, year, onSchoolChange, onMajorChange,
     <>
       <div className="card" style={{ marginBottom: 18 }}>
         <h3>我的学校与专业</h3>
-        <p className="sub">收录全国 985/211 高校（可搜简称如「示例大学」「华科」）；专业覆盖 21 个主流培养方案框架，未覆盖的专业可导入本校培养手册校准。档案在学校/专业/年级变动后可一键写回「个人中心」。</p>
+        <p className="sub">收录全国 985/211 高校（可搜简称如「川大」「华科」）；专业覆盖 21 个主流培养方案框架，未覆盖的专业可导入本校培养手册校准。档案在学校/专业/年级变动后可一键写回「个人中心」。</p>
         {stats && (
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
             <span className="badge">985/211 院校 {stats.schools} 所（985 {stats.schools_985}）</span>
@@ -143,7 +143,7 @@ export function ProgramTab({ school, major, year, onSchoolChange, onMajorChange,
         ) : null}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 12 }}>
           <div>
-            <input type="text" list="sp-schools" placeholder="选择/输入学校（如 示例大学、华科）"
+            <input type="text" list="sp-schools" placeholder="选择/输入学校（如 四川大学、华科）"
               value={school} onChange={(e) => onSchoolChange(e.target.value)} />
             <datalist id="sp-schools">
               {schools.map((s) => <option key={s.name} value={s.name}>{`${s.tier} · ${s.region} · ${s.strong.slice(0, 2).join('/')}`}</option>)}

@@ -29,6 +29,11 @@ class Settings(BaseSettings):
                                   #   cloud=全云端（失败自动回退本地）
     max_context_chars: int = 12000  # 单次请求的 prompt 字符预算，防止超上下文被截断导致降智
 
+    # 校园网模块的本地私有默认值（CAMPUS_SEED_JSON，JSON 字符串，键见 campus_net.DEFAULT_CFG）：
+    # 探测主机 / 校内专用主机 / 出口网段 / 信息源等因校而异，属个人信息，不写入代码库，
+    # 放在 backend/.env 本地配置；DB 中已保存的设置优先级高于此种子层
+    campus_seed_json: str = ""
+
     # RAG 检索：向量 + BM25 词法双通道 RRF 融合（RAG_HYBRID=0 可退回纯向量）
     hybrid_search: bool = True
     # 可选 cross-encoder 精排模型（RERANK_MODEL，如 BAAI/bge-reranker-v2-m3）：

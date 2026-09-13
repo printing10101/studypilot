@@ -87,7 +87,7 @@ export function ProfileView({ spaces, onOpenSpace }: { spaces: Space[]; onOpenSp
           {savedAt > 0 && <span>　上次更新：{new Date(savedAt * 1000).toLocaleString()}</span>}
         </p>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 14 }}>
-          <input type="text" list="pf-schools" placeholder="本科院校（如：示例大学，可搜简称）"
+          <input type="text" list="pf-schools" placeholder="本科院校（如：四川大学，可搜简称）"
             value={form.current_school} onChange={(e) => set('current_school', e.target.value)} />
           <datalist id="pf-schools">
             {schoolList.map((s) => <option key={s.name} value={s.name}>{`${s.tier} · ${s.region}`}</option>)}

@@ -78,7 +78,7 @@ export function CampusView() {
         <h3>校园网 · 状态与自动同步</h3>
         <p className="sub">
           连着校园网时，后台自动抓取全校与学院的学习相关信息：教务处通知（四六级 / 计算机等级 /
-          考试安排 / 选课）、学校通知公告、示例大学新闻网、图书馆资源动态、学院通知与新闻。
+          考试安排 / 选课）、学校通知公告、校园新闻网、图书馆资源动态、学院通知与新闻（信息源在设置里配置）。
           教务成绩、个人借阅等需要登录的内容不做自动抓取。
         </p>
         <div style={{ display: 'flex', gap: 12, alignItems: 'center', margin: '14px 0 6px', flexWrap: 'wrap' }}>
@@ -122,10 +122,19 @@ export function CampusView() {
           </div>
         )}
         <p className="sub" style={{ marginTop: 14 }}>
-          常用入口：<a href="https://findexample.libsp.cn" target="_blank" rel="noopener noreferrer" style={{ textDecoration: 'underline' }}>示例大学馆藏统一检索</a>
-          {' · '}<a href="http://mech.example.edu.cn" target="_blank" rel="noopener noreferrer" style={{ textDecoration: 'underline' }}>机械学院官网</a>
-          {' · '}<a href="http://www.example.edu.cn" target="_blank" rel="noopener noreferrer" style={{ textDecoration: 'underline' }}>示例大学主页</a>
-          {' · '}在校园网内检索馆藏/访问教务前，记得先完成校园网认证
+          {(status?.config.sources || []).length > 0 && (
+            <>
+              常用入口：
+              {(status?.config.sources || []).slice(0, 4).map((s, i) => (
+                <span key={s.id}>
+                  {i > 0 && ' · '}
+                  <a href={s.url} target="_blank" rel="noopener noreferrer" style={{ textDecoration: 'underline' }}>{s.name}</a>
+                </span>
+              ))}
+              {' · '}
+            </>
+          )}
+          在校园网内检索馆藏/访问教务前，记得先完成校园网认证
         </p>
       </div>
 

@@ -143,7 +143,7 @@ def list_schools(query: str = "", region: str = "", tier: str = "") -> list[dict
 
 
 def _abbr_candidates(name: str) -> set[str]:
-    """自动生成中文简称候选：如 示例大学→示例大学、四川大学→川大、华中科技大学→华科/华大…"""
+    """自动生成中文简称候选：如 四川大学→川大、华中科技大学→华科/华大…"""
     base = re.sub(r"(大学|学院|校区)$", "", (name or "").strip())
     base = re.sub(r"[（(].*?[)）]", "", base)
     if len(base) < 2:
@@ -151,7 +151,7 @@ def _abbr_candidates(name: str) -> set[str]:
     cands = {base[0] + base[-1], base[:2]}
     cands |= {base[0] + c for c in base[1:]}
     if (name or "").strip().endswith("大学"):
-        cands.add(base[0] + "大")  # 示例大学/天大/兰大/湖大…
+        cands.add(base[0] + "大")  # 川大/天大/兰大/湖大…
     # 带类别后缀的常见形态：哈工大 / 西电 / 北邮 不完全覆盖，人工 abbr 兜底
     for kw in ("科技", "工业", "理工", "交通", "电子", "师范", "农业", "林业", "海洋", "矿业", "石油", "地质", "财经", "中医药"):
         if kw in base:

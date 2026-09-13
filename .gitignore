@@ -13,9 +13,9 @@ backend/*.log
 backend/desktop.log
 backend/_ocr_test.png
 backend/smoke_*.py
-# 本地调试/直推临时脚本与抓取样本，不入公开仓
+# 本地调试/直推临时脚本与抓取样本，不入公开仓（含本校站点抓样）
 backend/_push_via_api.py
-backend/_example_news.html
+backend/_*news*.html
 # 误从仓库根目录启动服务产生的运行时数据（真实数据在 backend/data/）
 /data/
 /uploads/
@@ -28,17 +28,25 @@ frontend/dist/
 frontend/.vite/
 frontend/tsconfig.tsbuildinfo
 
-# 环境配置（含 API key）
+# 环境配置（含 API key 与 CAMPUS_SEED_JSON 本校私有配置）
 .env
+.env.local
 
 # 工具
 .mimosa/
 .DS_Store
 Thumbs.db
 
-
-# === 公开仓安全边界（2026-09 审计后加固）===
-# 本机绝对路径
+# === 公开仓安全边界（2026-09 审计；2026-09-13 二次加固）===
+# 个人工作备忘/私有笔记
+INSTINCTS.md
+*.local.md
+# 本校私有数据：培养方案官方层、政策文档、防泄漏黑名单
+# （gitignore 只匹配仓库内相对路径；规则不影响已跟踪文件，因此仓库自带的示例仍正常提交，
+#   而新增的本校文件默认不会被跟踪——确要提交共享的用 git add -f）
+backend/app/syllabus/overrides/*.json
+backend/app/policy/*.md
+.private-blocklist
 # 高校/第三方官方全文（版权）
 backend/app/syllabus/handbooks/
 # 无关攻防技能包与爬虫

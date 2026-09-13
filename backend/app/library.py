@@ -20,7 +20,7 @@ import urllib.request
 
 from . import db, ingest, rag
 from .config import settings
-from .library_example import SEED_BOOKS_EXAMPLE
+from .library_program import SEED_BOOKS_PROGRAM
 
 ALLOWED_EXT = ingest.UPLOAD_EXTS  # PDF/PPTX/TXT/Markdown/图片/zip
 MAX_BOOK_BYTES = 300 * 1024 * 1024  # 单本上限 300MB
@@ -274,8 +274,8 @@ SEED_BOOKS = [
     dict(title="肖秀荣精讲精练 + 1000 题 / 肖四肖八", author="肖秀荣", subject="考研公共课",
          publisher="—", status="catalog",
          note="2028.07 起集中备考；需自备正版文件导入"),
-    # ---- 示例大学·机械工程学院培养方案配套（按官网课程映射的 catalog 条目） ----
-    *SEED_BOOKS_EXAMPLE,
+    # ---- 机械类培养方案配套（典型课程结构 × 主流教材的 catalog 条目） ----
+    *SEED_BOOKS_PROGRAM,
 ]
 
 
@@ -384,7 +384,7 @@ def _safe_url(url: str) -> str:
 
 
 def _strip_default_port(url: str) -> str:
-    """显式默认端口规范化（示例大学 WAF 对 https://…:443/ 返回 404），与 campus_net 同款。"""
+    """显式默认端口规范化（部分高校 WAF 对 https://…:443/ 返回 404），与 campus_net 同款。"""
     p = urllib.parse.urlsplit(url)
     try:
         port = p.port

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# 提交前防泄漏门禁：扫描暂存区「新增行」，命中即拒绝提交。
+# 覆盖：常见密钥/令牌格式、个人邮箱、本机绝对路径、.private-blocklist 本地黑名单词。
+# 启用：git config core.hooksPath .githooks
+# 绕过：git commit --no-verify（仅限确认无敏感内容的场景）。
+# 说明：本脚本自身含有检测用的模式字符串，因此内容扫描排除 .githooks/ 目录。
+set -o pipefail
+
+# 允许自定义黑名单文件位置（默认仓库根 .private-blocklist，已被 gitignore）
+BLOCKLIST="${PRIVATE_BLOCKLIST:-.private-blocklist}"
+
+# ---------- 取暂存区「新增行」扫描（排除钩子目录自身） ----------
+# 只看 + 行：删除敏感内容的提交不应被误拦
+added="$(git diff --cached -U0 --diff-filter=ACMR -- . ':(exclude).githooks/**' \
+  | grep -E '^\+[^+]|^\+$')"
+if [ -z "$added" ]; then
+  exit 0
+fi
+
+fail=0
+
+# ---------- 1) 通用密钥/令牌/私钥特征 ----------
+if printf '%s\n' "$added" | grep -InE \
+  '(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}|gho_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{15,}\.eyJ[A-Za-z0-9_-]{15,})' \
+  >/tmp/sp_leak_keys.txt; then
+  echo "✗ 暂存区疑似包含密钥/令牌，禁止提交：" >&2
+  sed 's/^/    /' /tmp/sp_leak_keys.txt | head -5 >&2
+  fail=1
+fi
+
+# ---------- 2) 个人邮箱 / 本机用户路径 ----------
+if printf '%s\n' "$added" | grep -InE \
+  '([0-9]{5,12}@qq\.com|C:.Users.[A-Za-z][A-Za-z0-9_-]+)' \
+  >/tmp/sp_leak_pii.txt; then
+  echo "✗ 暂存区疑似包含个人邮箱或本机用户路径，禁止提交：" >&2
+  sed 's/^/    /' /tmp/sp_leak_pii.txt | head -5 >&2
+  fail=1
+fi
+
+# ---------- 3) 本地黑名单词（学校/域名/网段等，一行一词，# 开头为注释） ----------
+if [ -f "$BLOCKLIST" ]; then
+  # 把黑名单编译成单条 grep -E：词元做正则转义，空名单直接跳过
+  pat="$(grep -vE '^\s*(#|$)' "$BLOCKLIST" | sed 's/[][\.*^$()+?{}|\/]/\\&/g' | paste -sd'|' -)"
+  if [ -n "$pat" ] && printf '%s\n' "$added" | grep -InE "$pat" >/tmp/sp_leak_bl.txt; then
+    echo "✗ 暂存区命中本地黑名单（$BLOCKLIST），禁止提交：" >&2
+    sed 's/^/    /' /tmp/sp_leak_bl.txt | head -5 >&2
+    echo "    （若确属可公开内容，请修改 $BLOCKLIST 或 --no-verify）" >&2
+    fail=1
+  fi
+fi
+
+rm -f /tmp/sp_leak_keys.txt /tmp/sp_leak_pii.txt /tmp/sp_leak_bl.txt
+exit $fail

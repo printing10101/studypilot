@@ -2,21 +2,25 @@
 
 功能边界：
 - 网络状态检测：探测校园站点与外网连通性，区分 已确认校园网 / 校园网内·外网未认证 /
-  公网（示例大学站点公网也可达，默认无法确认是否校园网）/ 离线。若用户配置了
-  internal_hosts（仅校内可达的地址，如认证页）或 public_cidrs（学校公网出口 IP 段），
-  命中即升级为「已确认校园网」。
-- 信息同步：定期抓取信息源列表页（默认示例大学机械工程学院的通知公告/新闻聚焦/科研动态，
-  苏迪 Webplus CMS 的列表格式），解析出条目（标题/链接/日期）入库判重。
+  公网 / 离线。若配置了 internal_hosts（仅校内可达的地址，如认证页/教务）或
+  public_cidrs（学校公网出口 IP 段），命中即升级为「已确认校园网」。
+- 信息同步：定期抓取信息源列表页（常见高校 CMS 的列表格式，如苏迪 Webplus 的
+  /YYYY/MMDD/cNNNaNNN/page.htm 结构），解析出条目（标题/链接/日期）入库判重。
   列表页为公开页面，公网也能访问；配置仅内网可达的源（如教务/内网通知）同样支持，
   只在校园网环境能抓到。
 - 需要登录的校内系统（教务成绩、个人借阅等）不做自动抓取：涉及账号密码，超出本模块
   「抓公开信息」的安全边界。
 
+各校的探测主机/网段/信息源不同，属个人信息，不写入代码库：
+- 代码内置默认全部为空；在 backend/.env 用 CAMPUS_SEED_JSON 提供本校默认值
+  （JSON，键与 DEFAULT_CFG 相同），或首次使用后在「校园」设置里逐项配置（存 DB）。
+- DB 已保存配置 > CAMPUS_SEED_JSON 种子 > 内置空默认，三层合并。
+
 SSRF 边界（与 library._safe_url 一致：只抓公网）：
 - 仅 http/https；解析后的目标 IP 拒绝环回（本机 8178 应用 / 8080 模型服务）、私有网段、
   链路本地（云元数据 169.254.169.254）、组播与保留段；重定向目标逐跳复检。
-- 示例大学各站点（www/jw/lib/news/mech.example.edu.cn）均为公网 IP（203.0.113.x.x 教育网段），
-  其中教务处等仅校园网内可达——可达性正好用作「确认在校园网」的探测信号。
+- 校内站点多为公网 IP（教育网段），其中教务等仅校园网内可达——可达性正好用作
+  「确认在校园网」的探测信号。
 - 信息源配置只能经本机 API（有 Origin 白名单守卫）修改，抓取上限：每源 2MB、10s、
   每轮最多 8 个源，后台线程串行。
 """
@@ -30,35 +34,40 @@ import urllib.parse
 import urllib.request
 
 from . import db
+from .config import settings
 
 UA = "StudyPilot/0.1 (local study assistant; campus info sync)"
-
-_EXAMPLE_MECH = "http://mech.example.edu.cn"
 
 DEFAULT_CFG = {
     "auto_sync": True,
     "interval_min": 30,           # 后台同步间隔（分钟）
     # 校园连通性探测主机（http，公网可达的校内站点）
-    "campus_hosts": ["mech.example.edu.cn", "www.example.edu.cn"],
+    "campus_hosts": [],
     # 仅校园网内可达的公网主机（校外实测连不上）：连通 → 确认在校园网内
-    "internal_hosts": ["jw.example.edu.cn"],
-    # 学校公网出口 IP 段（示例大学教育网段；注意新闻网 203.0.113.13.13 公网可达，不算校内专用信号）
-    "public_cidrs": ["203.0.113.0.0/16"],
+    "internal_hosts": [],
+    # 学校公网出口 IP 段（CIDR）
+    "public_cidrs": [],
     "external_host": "www.baidu.com",
     # 信息源：id 全局唯一，url 为列表页/首页地址；学习相关度优先排序
-    "sources": [
-        # --- 考试与教务（四六级/计算机等级/期末安排/选课） ---
-        {"id": "jw_notice", "name": "教务处·通知公告", "url": "http://jw.example.edu.cn/"},
-        # --- 全校 ---
-        {"id": "example_notice", "name": "学校·通知公告", "url": "http://www.example.edu.cn/635/list.htm"},
-        {"id": "example_news", "name": "示例大学新闻网", "url": "http://news.example.edu.cn/"},
-        {"id": "lib_notice", "name": "图书馆·资源动态", "url": "http://lib.example.edu.cn/zydt/list.htm"},
-        # --- 学院 ---
-        {"id": "mech_notice", "name": "机械学院·通知公告", "url": f"{_EXAMPLE_MECH}/11369/list.htm"},
-        {"id": "mech_news", "name": "机械学院·新闻聚焦", "url": f"{_EXAMPLE_MECH}/11368/list.htm"},
-        {"id": "mech_research", "name": "机械学院·科研动态", "url": f"{_EXAMPLE_MECH}/11412/list.htm"},
-    ],
+    "sources": [],
 }
+
+
+def _seed_cfg() -> dict:
+    """从 CAMPUS_SEED_JSON 读取本校默认值；写错时启动即报错，避免「配了没生效」。"""
+    raw = (settings.campus_seed_json or "").strip()
+    if not raw:
+        return {}
+    try:
+        v = json.loads(raw)
+    except ValueError as e:
+        raise ValueError(f"CAMPUS_SEED_JSON 不是合法 JSON（{e}），请检查 backend/.env") from None
+    if not isinstance(v, dict):
+        raise ValueError("CAMPUS_SEED_JSON 必须是 JSON 对象，键见 campus_net.DEFAULT_CFG")
+    return {k: v for k, v in v.items() if k in DEFAULT_CFG}
+
+
+SEED_CFG = _seed_cfg()
 
 MAX_PAGE_BYTES = 2 * 1024 * 1024   # 单页限读 2MB（只取列表，不抓正文）
 FETCH_TIMEOUT = 10
@@ -130,7 +139,7 @@ def _validate_url(url: str) -> str:
 
 
 def _strip_default_port(url: str) -> str:
-    """示例大学 WAF 对显式默认端口的地址（https://host:443/…）返回 404，重定向前规范化掉。"""
+    """部分高校 WAF 对显式默认端口的地址（https://host:443/…）返回 404，重定向前规范化掉。"""
     p = urllib.parse.urlsplit(url)
     try:
         port = p.port
@@ -173,7 +182,10 @@ def _raw_saved() -> dict:
 
 def get_cfg() -> dict:
     saved = _raw_saved()
-    cfg = {**DEFAULT_CFG, **{k: v for k, v in saved.items() if k in DEFAULT_CFG}}
+    # 三层合并：DB 已保存 > CAMPUS_SEED_JSON 种子 > 内置空默认
+    cfg = {**DEFAULT_CFG,
+           **{k: v for k, v in SEED_CFG.items() if k in DEFAULT_CFG},
+           **{k: v for k, v in saved.items() if k in DEFAULT_CFG}}
     # 只保留默认源与用户新增源，字段补齐
     sources = []
     for s in cfg.get("sources") or []:
@@ -289,6 +301,17 @@ def detect(force: bool = False) -> dict:
                       for h in cfg["internal_hosts"][:3])
 
     state, detail = "offline", "校园站点与外网均不可达"
+    if not (cfg["campus_hosts"] or cfg["internal_hosts"] or cfg["public_cidrs"]):
+        # 未配置任何探测目标：无法判断校园网，给出可操作的提示而不是误报
+        state = "public"
+        detail = ("尚未配置校园探测目标/网段：请在「校园」设置或 backend/.env 的 "
+                  "CAMPUS_SEED_JSON 里添加本校的站点与信息源")
+        result = {"state": state, "label": STATE_LABELS[state], "detail": detail,
+                  "latency_campus_ms": None, "latency_external_ms": external_ms,
+                  "checked_at": time.time()}
+        _detect_cache["ts"] = time.time()
+        _detect_cache["result"] = result
+        return result
     if internal_ok:
         state = "campus"
         detail = "教务处等仅校内可达的站点连通，确认在校园网内"
@@ -296,7 +319,7 @@ def detect(force: bool = False) -> dict:
         ip_hit = _public_ip_in_cidrs(cfg["public_cidrs"]) if external_ms is not None else None
         if ip_hit or (ip_hit is None and external_ms is None):
             state = "campus" if ip_hit else "campus_likely"
-            detail = ("公网出口 IP 命中示例大学网段（203.0.113.0.0/16）" if ip_hit
+            detail = ("公网出口 IP 命中配置的校园网段" if ip_hit
                       else "校内站点可达但外网不通：典型校园网未认证状态，校内信息源仍可同步")
         else:
             state = "public"
